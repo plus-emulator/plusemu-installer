@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{HOTEL_NAME}} – put your hotel online</title>
+<style>
+    :root { --ink: #1d2433; --muted: #5b6475; --line: #e3e7ef; --bg: #f5f7fb; --card: #fff; --accent: #f38020; --ok: #1a8f4c; --warn: #b35c00; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--ink); background: var(--bg); }
+    main { max-width: 820px; margin: 0 auto; padding: 32px 20px 80px; }
+    header { text-align: center; margin-bottom: 28px; }
+    header h1 { font-size: 30px; margin: 0 0 6px; }
+    header p { color: var(--muted); margin: 0; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 22px 26px; margin: 18px 0; }
+    .step { display: flex; gap: 16px; }
+    .num { flex: none; width: 36px; height: 36px; border-radius: 50%; background: var(--accent); color: #fff; font-weight: 700; display: grid; place-items: center; }
+    .step h2 { margin: 4px 0 8px; font-size: 20px; }
+    .step > div { min-width: 0; flex: 1; }
+    ol, ul { padding-left: 22px; }
+    li { margin: 6px 0; }
+    code, .value { font-family: ui-monospace, Consolas, monospace; background: #eef1f7; border-radius: 6px; padding: 2px 7px; font-size: 14px; }
+    table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 15px; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+    th { color: var(--muted); font-weight: 600; font-size: 13px; text-transform: uppercase; }
+    .tip { background: #edf8f1; border-left: 4px solid var(--ok); padding: 10px 14px; border-radius: 8px; margin: 12px 0; }
+    .warn { background: #fff5e8; border-left: 4px solid var(--warn); padding: 10px 14px; border-radius: 8px; margin: 12px 0; }
+    .copy { cursor: pointer; border: 1px solid var(--line); background: #fff; border-radius: 6px; font-size: 12px; padding: 1px 8px; margin-left: 6px; }
+    .done { text-align: center; }
+    .done a.button { display: inline-block; background: var(--accent); color: #fff; text-decoration: none; font-weight: 700; padding: 12px 26px; border-radius: 10px; margin-top: 6px; }
+    details { margin: 10px 0; }
+    summary { cursor: pointer; font-weight: 600; }
+    h3 { margin: 18px 0 6px; font-size: 17px; }
+</style>
+</head>
+<body>
+<main>
+<header>
+    <h1>🎉 {{HOTEL_NAME}} is installed!</h1>
+    <p>Your emulator, game client and website are running on this server.<br>
+       Now connect your domain <b>{{DOMAIN}}</b> through Cloudflare. It takes about 5 minutes.</p>
+</header>
+
+<div class="card">
+    <b>Keep these two values handy:</b>
+    <table>
+        <tr><td>Your domain</td><td><span class="value">{{DOMAIN}}</span><button class="copy" data-copy="{{DOMAIN}}">copy</button></td></tr>
+        <tr><td>Your server IP</td><td><span class="value">{{SERVER_IP}}</span><button class="copy" data-copy="{{SERVER_IP}}">copy</button></td></tr>
+    </table>
+    Cloudflare is free. It hides your server's IP address, protects you against attacks and gives your hotel a padlock (HTTPS).
+</div>
+
+<div class="card step">
+    <div class="num">1</div>
+    <div>
+        <h2>Add your domain to Cloudflare</h2>
+        <ol>
+            <li>Go to <a href="https://dash.cloudflare.com/sign-up" target="_blank" rel="noopener">dash.cloudflare.com</a> and create a free account (or log in).</li>
+            <li>Click <b>Add a domain</b> (sometimes called <b>Add a site</b>), type <code>{{DOMAIN}}</code> and click <b>Continue</b>.</li>
+            <li>Choose the <b>Free</b> plan at the bottom and click <b>Continue</b>.</li>
+        </ol>
+    </div>
+</div>
+
+<div class="card step">
+    <div class="num">2</div>
+    <div>
+        <h2>Point your domain to Cloudflare</h2>
+        <p>Cloudflare now shows you <b>two nameservers</b> that look like <code>anna.ns.cloudflare.com</code>.
+           Put them in at the company where you bought your domain:</p>
+        <ol>
+            <li>Log in where you bought <code>{{DOMAIN}}</code> (Namecheap, GoDaddy, Porkbun, …).</li>
+            <li>Find your domain's <b>Nameservers</b> setting. On Namecheap: <i>Domain List → Manage → Nameservers → Custom DNS</i>.</li>
+            <li>Remove the old nameservers, paste the two from Cloudflare and save.</li>
+            <li>Back in Cloudflare, click <b>Check nameservers</b>.</li>
+        </ol>
+        <div class="tip">This usually takes 5–30 minutes (rarely up to 24 hours). Cloudflare emails you when your domain is active. You can carry on with the next steps in the meantime.</div>
+    </div>
+</div>
+
+<div class="card step">
+    <div class="num">3</div>
+    <div>
+        <h2>Add your DNS records</h2>
+        <p>In Cloudflare, open your domain and go to <b>DNS → Records</b>.</p>
+        <ol>
+            <li>Delete any existing records named <code>{{DOMAIN}}</code> (or <code>@</code>) and <code>www</code> of type <b>A</b>, <b>AAAA</b> or <b>CNAME</b>. Cloudflare sometimes copies old ones over.</li>
+            <li>Click <b>Add record</b> and add the records below. Leave the <b>Proxy status</b> switch <b>orange (Proxied)</b>.</li>
+        </ol>
+        <table>
+            <tr><th>Type</th><th>Name</th><th>IPv4 address</th><th>Proxy status</th></tr>
+            <tr><td>A</td><td><code>@</code></td><td><code>{{SERVER_IP}}</code></td><td>Proxied (orange cloud)</td></tr>
+            <tr><td>A</td><td><code>www</code></td><td><code>{{SERVER_IP}}</code></td><td>Proxied (orange cloud)</td></tr>
+            {{WS_DNS_ROW}}
+        </table>
+        <div class="warn">The cloud must be <b>orange</b>. A grey cloud shows your server's IP address to everyone and disables the protection.</div>
+    </div>
+</div>
+
+<div class="card step">
+    <div class="num">4</div>
+    <div>
+        <h2>Turn on HTTPS the right way</h2>
+        <ol>
+            <li>Go to <b>SSL/TLS → Overview</b>, click <b>Configure</b> and choose <b>Full</b>. Save.</li>
+            <li>Go to <b>SSL/TLS → Edge Certificates</b> and switch on <b>Always Use HTTPS</b>.</li>
+            <li>Go to <b>Network</b> and check that <b>WebSockets</b> is <b>On</b>. It's on by default, and the game needs it.</li>
+        </ol>
+        <div class="tip">Why “Full”? The installer gave your server its own certificate, so the connection is encrypted all the way.
+            <b>Flexible</b> causes “too many redirects”, and <b>Full (strict)</b> shows error 526.</div>
+    </div>
+</div>
+
+<div class="card step">
+    <div class="num">5</div>
+    <div>
+        <h2>Open your hotel</h2>
+        <ol>
+            <li>Visit <a href="https://{{DOMAIN}}" target="_blank" rel="noopener">https://{{DOMAIN}}</a>. If you see an error, your domain isn't active in Cloudflare yet. Wait a few minutes and refresh.</li>
+            <li>Log in with the admin username and password the installer showed you. They're also saved in <code>{{CREDENTIALS_FILE}}</code>.</li>
+            <li>Change your password under <b>Settings → Password</b>.</li>
+            <li>Click <b>Enter hotel</b>. Have fun! 🏨</li>
+        </ol>
+        <p>Manage your hotel (news, users, ranks, shop) at <a href="https://{{DOMAIN}}/housekeeping" target="_blank" rel="noopener">https://{{DOMAIN}}/housekeeping</a>.</p>
+    </div>
+</div>
+
+<div class="card">
+    <h2 style="margin-top:0">Good to know</h2>
+    <h3>Everyday commands</h3>
+    <table>
+        <tr><td>Restart the emulator</td><td><code>{{RESTART_COMMAND}}</code></td></tr>
+        <tr><td>Watch the emulator log</td><td><code>{{LOG_COMMAND}}</code></td></tr>
+        <tr><td>Passwords (admin, database)</td><td><code>{{CREDENTIALS_FILE}}</code></td></tr>
+    </table>
+
+    <h3>Something isn't working?</h3>
+    <details><summary>Cloudflare error 521 or 522</summary>
+        Cloudflare can't reach your server. Check that the server is running and that the DNS records point to <code>{{SERVER_IP}}</code>.
+        Some hosting companies also have a firewall in their control panel: allow ports 80 and 443 there.</details>
+    <details><summary>Cloudflare error 526</summary>
+        Set <b>SSL/TLS → Overview</b> to <b>Full</b>, not Full (strict).</details>
+    <details><summary>“Too many redirects”</summary>
+        SSL/TLS is set to Flexible. Change it to <b>Full</b>.</details>
+    <details><summary>The client loads but disconnects, or stays on the loading screen</summary>
+        Check that <b>WebSockets</b> is on in Cloudflare (Network), then restart the emulator: <code>{{RESTART_COMMAND}}</code>.
+        Still stuck? Watch the log while you open the client: <code>{{LOG_COMMAND}}</code>.</details>
+    <details><summary>Asking for help on DevBest</summary>
+        Post what you did, what you see (a screenshot helps) and the last lines of the emulator log. Never post your passwords file.</details>
+</div>
+
+<div class="card done">
+    <b>That's it, your hotel is live.</b><br>
+    <a class="button" href="https://{{DOMAIN}}" target="_blank" rel="noopener">Open {{DOMAIN}}</a>
+</div>
+</main>
+<script>
+    document.querySelectorAll('.copy').forEach(function (button) {
+        button.addEventListener('click', function () {
+            navigator.clipboard.writeText(button.dataset.copy).then(function () {
+                button.textContent = 'copied';
+                setTimeout(function () { button.textContent = 'copy'; }, 1500);
+            });
+        });
+    });
+</script>
+</body>
+</html>
