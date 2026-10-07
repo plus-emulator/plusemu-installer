@@ -1,7 +1,7 @@
 # PlusEMU hotel installer for Windows Server 2019/2022/2025 (IIS).
 #
 #   Open PowerShell as Administrator and run:
-#   irm https://raw.githubusercontent.com/DennisObject/plusemu-installer/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.ps1 | iex
 #
 # Installs and wires together: PlusEMU (emulator, as a Windows service) and Octane
 # (client) from their latest GitHub releases, Atom CMS (website), MariaDB, PHP,
@@ -16,11 +16,11 @@ function Get-Setting($Name, $Default) {
     if ($value) { return $value } else { return $Default }
 }
 
-$InstallerRepo   = Get-Setting 'INSTALLER_REPO' 'DennisObject/plusemu-installer'
+$InstallerRepo   = Get-Setting 'INSTALLER_REPO' 'plus-emulator/plusemu-installer'
 $InstallerRef    = Get-Setting 'INSTALLER_REF' 'main'
-$AssetPackUrl    = Get-Setting 'ASSET_PACK_URL' 'https://github.com/DennisObject/plusemu-installer/releases/latest/download/hotel-files.tar.gz'
-$EmulatorUrl     = Get-Setting 'EMULATOR_URL' 'https://github.com/DennisObject/PlusEMU/releases/latest/download/plusemu-win-x64.zip'
-$ClientUrl       = Get-Setting 'CLIENT_URL' 'https://github.com/DennisObject/Octane/releases/latest/download/octane-client.zip'
+$AssetPackUrl    = Get-Setting 'ASSET_PACK_URL' 'https://github.com/plus-emulator/plusemu-installer/releases/latest/download/hotel-files.tar.gz'
+$EmulatorUrl     = Get-Setting 'EMULATOR_URL' 'https://github.com/plus-emulator/PlusEMU/releases/latest/download/plusemu-win-x64.zip'
+$ClientUrl       = Get-Setting 'CLIENT_URL' 'https://github.com/plus-emulator/Octane/releases/latest/download/octane-client.zip'
 $AtomRepo        = Get-Setting 'ATOM_REPO' 'https://github.com/atom-projects/atom-cms.git'
 $AtomBranch      = Get-Setting 'ATOM_BRANCH' 'dev'
 

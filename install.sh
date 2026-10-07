@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PlusEMU hotel installer for Debian 12/13 and Ubuntu 22.04/24.04/26.04.
 #
-#   curl -fsSL https://raw.githubusercontent.com/DennisObject/plusemu-installer/main/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash
 #
 # Installs and wires together: PlusEMU (emulator) and Octane (client) from their
 # latest GitHub releases, Atom CMS (website), MariaDB, PHP, nginx and the hotel
@@ -13,11 +13,11 @@
 set -Eeuo pipefail
 shopt -u patsub_replacement 2> /dev/null || true # bash 5.2 would expand "&" in template values
 
-INSTALLER_REPO=${INSTALLER_REPO:-DennisObject/plusemu-installer}
+INSTALLER_REPO=${INSTALLER_REPO:-plus-emulator/plusemu-installer}
 INSTALLER_REF=${INSTALLER_REF:-main}
-ASSET_PACK_URL=${ASSET_PACK_URL:-https://github.com/DennisObject/plusemu-installer/releases/latest/download/hotel-files.tar.gz}
-EMULATOR_URL=${EMULATOR_URL:-https://github.com/DennisObject/PlusEMU/releases/latest/download/plusemu-linux-ARCH.tar.gz}
-CLIENT_URL=${CLIENT_URL:-https://github.com/DennisObject/Octane/releases/latest/download/octane-client.zip}
+ASSET_PACK_URL=${ASSET_PACK_URL:-https://github.com/plus-emulator/plusemu-installer/releases/latest/download/hotel-files.tar.gz}
+EMULATOR_URL=${EMULATOR_URL:-https://github.com/plus-emulator/PlusEMU/releases/latest/download/plusemu-linux-ARCH.tar.gz}
+CLIENT_URL=${CLIENT_URL:-https://github.com/plus-emulator/Octane/releases/latest/download/octane-client.zip}
 ATOM_REPO=${ATOM_REPO:-https://github.com/atom-projects/atom-cms.git}
 ATOM_BRANCH=${ATOM_BRANCH:-dev}
 
