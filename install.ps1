@@ -305,7 +305,7 @@ function Install-Toolchains {
     New-Item -ItemType Directory -Force -Path "$PhpDir\extras\ssl" | Out-Null
     if (-not (Test-Path "$PhpDir\extras\ssl\cacert.pem")) { Download 'https://curl.se/ca/cacert.pem' "$PhpDir\extras\ssl\cacert.pem" }
     $ini = $ini -replace ';extension_dir = "ext"', 'extension_dir = "ext"'
-    $ini += "`r`n[PlusEMU]`r`nmemory_limit = 512M`r`nupload_max_filesize = 20M`r`npost_max_size = 20M`r`nopcache.enable = 1`r`n" +
+    $ini += "`r`n[PlusEMU]`r`nmemory_limit = 512M`r`nupload_max_filesize = 20M`r`npost_max_size = 20M`r`nopcache.enable = 1`r`nexpose_php = Off`r`n" +
             "curl.cainfo = `"$PhpDir\extras\ssl\cacert.pem`"`r`nopenssl.cafile = `"$PhpDir\extras\ssl\cacert.pem`"`r`n"
     Set-Content "$PhpDir\php.ini" $ini -Encoding ASCII
     Add-MachinePath $PhpDir
@@ -397,7 +397,9 @@ function Get-HotelFiles {
     if (Test-Path $files) { Remove-Item $files -Recurse -Force }
     New-Item -ItemType Directory -Path $files | Out-Null
     $archive = Join-Path $env:TEMP 'hotel-files.tar.gz'
+    $ErrorActionPreference = 'Continue'   # the progress bar is written to stderr
     & curl.exe -fL --retry 3 --progress-bar -o $archive $AssetPackUrl
+    $ErrorActionPreference = 'Stop'
     if ($LASTEXITCODE -ne 0) { throw "Downloading the hotel files failed: $AssetPackUrl" }
     Run tar.exe -xzf $archive -C $files
     Remove-Item $archive
@@ -422,29 +424,23 @@ function Start-Emulator {
     $nlog = "$out\Config\nlog.config"
     Write-Utf8 $nlog ((Get-Content $nlog -Raw) -replace 'minlevel="Trace"', 'minlevel="Info"')
 
-    # WinSW runs the emulator as a Windows service that starts with the server and restarts after a crash.
-    $service = "$out\PlusEMU-service.exe"
-    if (-not (Test-Path $service)) { Download 'https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe' $service }
-    Write-Utf8 "$out\PlusEMU-service.xml" @"
-<service>
-  <id>PlusEMU</id>
-  <name>PlusEMU hotel emulator</name>
-  <description>The PlusEMU game server for your hotel.</description>
-  <executable>$out\Plus Emulator.exe</executable>
-  <workingdirectory>$out</workingdirectory>
-  <depend>MariaDB</depend>
-  <startmode>Automatic</startmode>
-  <onfailure action="restart" delay="5 sec"/>
-  <logpath>$out\logs</logpath>
-  <log mode="roll-by-size"><sizeThreshold>10240</sizeThreshold><keepFiles>5</keepFiles></log>
-</service>
-"@
-    if (-not (Get-Service PlusEMU -ErrorAction SilentlyContinue)) { Run $service install } else { Run $service refresh }
-    Start-Service PlusEMU
+    # Shawl runs the emulator as a Windows service: it starts with the server, restarts after a
+    # crash, and on stop sends Ctrl+C so the emulator saves rooms and inventories before exiting.
+    $shawl = "$out\service\shawl.exe"
+    if (-not (Test-Path $shawl)) {
+        $downloads = Join-Path $env:TEMP 'plusemu-downloads'
+        Download 'https://github.com/mtkennerly/shawl/releases/download/v1.9.0/shawl-v1.9.0-win64.zip' "$downloads\shawl.zip"
+        Expand-Archive "$downloads\shawl.zip" "$out\service" -Force
+    }
+    if (-not (Get-Service PlusEMU -ErrorAction SilentlyContinue)) {
+        Run $shawl add --name PlusEMU --cwd $out --stop-timeout 30000 '--' "$out\Plus Emulator.exe"
+        Run sc.exe config PlusEMU start= auto depend= MariaDB DisplayName= 'PlusEMU hotel emulator'
+    }
+    Restart-Service PlusEMU
     for ($i = 0; $i -lt 60; $i++) {
         try { Invoke-RestMethod 'http://127.0.0.1:8080/api/health' -TimeoutSec 2 | Out-Null; Ok 'The emulator is running (service: PlusEMU)'; return } catch { Start-Sleep 2 }
     }
-    throw "The emulator didn't start. See $out\logs\PlusEMU-service.out.log"
+    throw "The emulator didn't start. See $out\service\shawl_for_PlusEMU_rCURRENT.log"
 }
 
 function Install-Cms {
@@ -531,7 +527,9 @@ function Set-IisSite {
             Add-WebConfiguration -PSPath $apphost -Filter 'system.webServer/staticContent' -Value @{ fileExtension = $type[0]; mimeType = $type[1] }
         }
     }
-    Remove-WebConfigurationProperty -PSPath $apphost -Filter 'system.webServer/httpProtocol/customHeaders' -Name '.' -AtElement @{ name = 'X-Powered-By' } -ErrorAction SilentlyContinue
+    if (Get-WebConfiguration -PSPath $apphost -Filter "system.webServer/httpProtocol/customHeaders/add[@name='X-Powered-By']") {
+        Remove-WebConfigurationProperty -PSPath $apphost -Filter 'system.webServer/httpProtocol/customHeaders' -Name 'collection' -AtElement @{ name = 'X-Powered-By' }
+    }
 
     # Requests by IP address (before Cloudflare is set up) show the setup guide.
     if (Get-Website -Name 'Default Web Site' -ErrorAction SilentlyContinue) { Remove-Website -Name 'Default Web Site' }
@@ -544,6 +542,9 @@ function Set-IisSite {
     Set-ItemProperty "IIS:\AppPools\$pool" -Name managedRuntimeVersion -Value ''
     if (-not (Get-Website -Name $site -ErrorAction SilentlyContinue)) {
         New-Website -Name $site -PhysicalPath "$HotelRoot\cms\public" -ApplicationPool $pool -HostHeader $domain -Port 80 | Out-Null
+    }
+    if (-not (Get-WebConfiguration -PSPath $apphost -Location $site -Filter "system.webServer/defaultDocument/files/add[@value='index.php']")) {
+        Add-WebConfigurationProperty -PSPath $apphost -Location $site -Filter 'system.webServer/defaultDocument/files' -Name '.' -Value @{ value = 'index.php' } -AtIndex 0
     }
     $hosts = @($domain, "www.$domain")
     if ($WsHost -ne $domain) { $hosts += $WsHost }
@@ -585,7 +586,9 @@ function Set-IisSite {
     # Global rules run before Atom's own web.config rules: send www to the main
     # domain, and hand the game's WebSocket to the emulator (only from the hotel's own pages).
     $rules = 'system.webServer/rewrite/globalRules'
-    foreach ($name in 'PlusEMU www', 'PlusEMU websocket') { Clear-WebConfiguration -PSPath $apphost -Filter "$rules/rule[@name='$name']" -ErrorAction SilentlyContinue }
+    foreach ($name in 'PlusEMU www', 'PlusEMU websocket') {
+        if (Get-WebConfiguration -PSPath $apphost -Filter "$rules/rule[@name='$name']") { Clear-WebConfiguration -PSPath $apphost -Filter "$rules/rule[@name='$name']" }
+    }
     Add-WebConfigurationProperty -PSPath $apphost -Filter $rules -Name '.' -Value @{ name = 'PlusEMU www'; stopProcessing = 'True' }
     Set-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU www']/match" -Name 'url' -Value '(.*)'
     Add-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU www']/conditions" -Name '.' -Value @{ input = '{HTTP_HOST}'; pattern = "^www\.$([regex]::Escape($domain))$" }
@@ -629,7 +632,7 @@ function Write-Guide {
     Render "$Templates\setup-guide.html" "$HotelRoot\setup-guide\index.html" @{
         DOMAIN = $state.Domain; SERVER_IP = $ServerIp; HOTEL_NAME = $state.HotelName; WS_DNS_ROW = $wsRow
         CREDENTIALS_FILE = $StateFile; RESTART_COMMAND = 'Restart-Service PlusEMU'
-        LOG_COMMAND = "Get-Content $HotelRoot\emulator\logs\PlusEMU-service.out.log -Tail 50 -Wait"
+        LOG_COMMAND = "Get-Content $HotelRoot\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 50 -Wait"
     }
     Copy-Item "$HotelRoot\setup-guide\index.html" "$([Environment]::GetFolderPath('Desktop'))\Hotel setup guide.html" -Force
     Ok 'Guide written (also on your desktop)'
