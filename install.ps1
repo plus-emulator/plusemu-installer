@@ -3,10 +3,11 @@
 #   Open PowerShell as Administrator and run:
 #   irm https://raw.githubusercontent.com/DennisObject/plusemu-installer/main/install.ps1 | iex
 #
-# Installs and wires together: PlusEMU (emulator, as a Windows service), Octane +
-# Octane-Renderer (client, built from source), Atom CMS (website), MariaDB, PHP,
+# Installs and wires together: PlusEMU (emulator, as a Windows service) and Octane
+# (client) from their latest GitHub releases, Atom CMS (website), MariaDB, PHP,
 # IIS and the hotel files. Everything is self-hosted on this server; Cloudflare
-# sits in front. Safe to run again: finished steps are skipped and settings reused.
+# sits in front. Safe to run again: settings are reused, and the emulator and
+# client are updated to their latest releases.
 #
 # Unattended runs can preset the answers: PLUSEMU_DOMAIN, PLUSEMU_WS_URL,
 # PLUSEMU_HOTEL_NAME, PLUSEMU_ADMIN_USER, PLUSEMU_ADMIN_EMAIL, PLUSEMU_YES=1.
@@ -19,12 +20,8 @@ function Get-Setting($Name, $Default) {
 $InstallerRepo   = Get-Setting 'INSTALLER_REPO' 'DennisObject/plusemu-installer'
 $InstallerRef    = Get-Setting 'INSTALLER_REF' 'main'
 $AssetPackUrl    = Get-Setting 'ASSET_PACK_URL' 'https://assets.plusemu.dev/installer/hotel-files.tar.gz'
-$PlusEmuRepo     = Get-Setting 'PLUSEMU_REPO' 'https://github.com/DennisObject/PlusEMU.git'
-$PlusEmuBranch   = Get-Setting 'PLUSEMU_BRANCH' 'master'
-$OctaneRepo      = Get-Setting 'OCTANE_REPO' 'https://github.com/DennisObject/Octane.git'
-$OctaneBranch    = Get-Setting 'OCTANE_BRANCH' 'main'
-$RendererRepo    = Get-Setting 'RENDERER_REPO' 'https://github.com/DennisObject/Octane-Renderer.git'
-$RendererBranch  = Get-Setting 'RENDERER_BRANCH' 'main'
+$EmulatorUrl     = Get-Setting 'EMULATOR_URL' 'https://github.com/DennisObject/PlusEMU/releases/latest/download/plusemu-win-x64.zip'
+$ClientUrl       = Get-Setting 'CLIENT_URL' 'https://github.com/DennisObject/Octane/releases/latest/download/octane-client.zip'
 $AtomRepo        = Get-Setting 'ATOM_REPO' 'https://github.com/atom-projects/atom-cms.git'
 $AtomBranch      = Get-Setting 'ATOM_BRANCH' 'dev'
 
@@ -33,10 +30,9 @@ $StateDir   = 'C:\ProgramData\PlusEMU'
 $StateFile  = "$StateDir\hotel.json"
 $Log        = "$StateDir\install.log"
 $PhpDir     = 'C:\PHP'
-$DotnetDir  = 'C:\Program Files\dotnet'
 $NodeMajor  = 22
 $MariaDbSeries = '11.4'
-$TotalSteps = 11
+$TotalSteps = 10
 $script:Step = 0
 
 $ErrorActionPreference = 'Stop'
@@ -57,6 +53,7 @@ function Step($Text) {
 function Ok($Text) { Say "      + $Text" 'Green' }
 
 function Ask($Question, $Default) {
+    if ((Get-Setting 'PLUSEMU_YES' '0') -eq '1') { return $Default }   # unattended: take the default
     $prompt = "  $Question"
     if ($Default) { $prompt += " [$Default]" }
     $answer = Read-Host $prompt
@@ -168,7 +165,7 @@ function Get-InstallerFiles {
 function Read-Answers {
     Write-Host ''
     Write-Host 'Welcome to the PlusEMU hotel installer!' -ForegroundColor White
-    Write-Host 'This sets up your emulator, client and website on this server in about 15 minutes.'
+    Write-Host 'This sets up your emulator, client and website on this server in about 10 minutes.'
     Write-Host ''
 
     if (Test-Path $StateFile) {
@@ -263,7 +260,7 @@ function Install-WebServer {
 }
 
 function Install-Toolchains {
-    Step "Installing Git, Node.js $NodeMajor, .NET 10, PHP 8.5 and Composer"
+    Step "Installing Git, Node.js $NodeMajor, PHP 8.5 and Composer (for the website)"
     $downloads = Join-Path $env:TEMP 'plusemu-downloads'
     Update-Path
 
@@ -289,13 +286,6 @@ function Install-Toolchains {
         Update-Path
     }
     Ok "Node.js $(& node --version)"
-
-    if (-not (Test-Path "$DotnetDir\dotnet.exe") -or -not ((& "$DotnetDir\dotnet.exe" --list-sdks) -match '^10\.')) {
-        Download 'https://dot.net/v1/dotnet-install.ps1' "$downloads\dotnet-install.ps1"
-        & "$downloads\dotnet-install.ps1" -Channel 10.0 -InstallDir $DotnetDir *>> $Log
-        Add-MachinePath $DotnetDir
-    }
-    Ok ".NET SDK $(& "$DotnetDir\dotnet.exe" --version)"
 
     if (-not (Test-Path "$PhpDir\php-cgi.exe")) {
         # PHP needs the Visual C++ runtime.
@@ -353,16 +343,33 @@ function Install-Database {
     Ok "MariaDB ($(Split-Path (Split-Path (Split-Path $MariaDb)) -Leaf))"
 }
 
-function Get-Sources {
-    Step 'Downloading PlusEMU, Octane, Octane-Renderer and Atom CMS'
-    New-Item -ItemType Directory -Force -Path "$HotelRoot\src" | Out-Null
-    Clone $PlusEmuRepo $PlusEmuBranch "$HotelRoot\src\PlusEMU"
-    Ok "PlusEMU ($PlusEmuBranch)"
-    Clone $OctaneRepo $OctaneBranch "$HotelRoot\src\Octane"
-    Ok "Octane ($OctaneBranch)"
-    # Octane builds against the renderer source in this exact sibling folder.
-    Clone $RendererRepo $RendererBranch "$HotelRoot\src\Octane-Renderer"
-    Ok "Octane-Renderer ($RendererBranch)"
+function Get-Releases {
+    Step 'Downloading PlusEMU, the Octane client and Atom CMS'
+    $downloads = Join-Path $env:TEMP 'plusemu-downloads'
+    New-Item -ItemType Directory -Force -Path $downloads | Out-Null
+
+    $out = "$HotelRoot\emulator"
+    $config = "$out\Config\config.json"
+    $kept = $null
+    if (Test-Path $config) { $kept = Get-Content $config -Raw }   # keep the live config across updates
+    if (Get-Service PlusEMU -ErrorAction SilentlyContinue) { Stop-Service PlusEMU }
+    Download $EmulatorUrl "$downloads\plusemu.zip"
+    Expand-Archive "$downloads\plusemu.zip" $out -Force
+    if ($kept) { Write-Utf8 $config $kept }
+    Ok 'PlusEMU (latest release)'
+
+    $client = "$HotelRoot\client"
+    Download $ClientUrl "$downloads\octane-client.zip"
+    if (Test-Path $client) { Remove-Item $client -Recurse -Force }
+    Expand-Archive "$downloads\octane-client.zip" $client
+    $values = @{ DOMAIN = $state.Domain; SOCKET_URL = $state.WsUrl }
+    foreach ($file in 'renderer-config.json', 'ui-config.json', 'client-mode.json') {
+        Render "$Templates\$file" "$client\configuration\$file" $values
+    }
+    Write-Utf8 "$client\configuration\news.json" '[]'
+    Copy-Item "$client\configuration\adsense.example" "$client\configuration\adsense.json"
+    Ok 'Octane client (latest release)'
+
     Clone $AtomRepo $AtomBranch "$HotelRoot\cms"
     Ok "Atom CMS ($AtomBranch)"
 }
@@ -373,7 +380,7 @@ function Initialize-HotelDatabase {
     Sql "CREATE DATABASE IF NOT EXISTS plus CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; CREATE USER IF NOT EXISTS 'hotel'@'localhost' IDENTIFIED BY '$password'; ALTER USER 'hotel'@'localhost' IDENTIFIED BY '$password'; GRANT ALL PRIVILEGES ON plus.* TO 'hotel'@'localhost'; FLUSH PRIVILEGES;" | Out-Null
     $tables = Sql "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'plus' AND table_name = 'users'"
     if ("$tables".Trim() -eq '0') {
-        $sqlFile = "$HotelRoot\src\PlusEMU\Database\FreshInstall.sql"
+        $sqlFile = "$HotelRoot\emulator\Database\FreshInstall.sql"
         $env:MYSQL_PWD = $state.DbRootPassword
         & cmd.exe /c "`"$MariaDb`" -uroot plus < `"$sqlFile`"" 2>> $Log
         if ($LASTEXITCODE -ne 0) { throw 'Importing the database failed.' }
@@ -384,7 +391,7 @@ function Initialize-HotelDatabase {
 }
 
 function Get-HotelFiles {
-    Step 'Downloading the hotel files (furniture, clothes, badges, texts; about 500 MB)'
+    Step 'Downloading the hotel files (furniture, clothes, badges, texts; about 470 MB)'
     $files = "$HotelRoot\hotel-files"
     if (Test-Path "$files\.complete") { Ok 'Already downloaded'; return }
     if (Test-Path $files) { Remove-Item $files -Recurse -Force }
@@ -398,18 +405,10 @@ function Get-HotelFiles {
     Ok 'Hotel files ready'
 }
 
-function Install-Emulator {
-    Step 'Building the emulator'
+function Start-Emulator {
+    Step 'Starting the emulator'
     $out = "$HotelRoot\emulator"
     $config = "$out\Config\config.json"
-    $kept = $null
-    if (Test-Path $config) { $kept = Get-Content $config -Raw }   # keep the live config across rebuilds
-    if (Get-Service PlusEMU -ErrorAction SilentlyContinue) { Stop-Service PlusEMU }
-    Push-Location "$HotelRoot\src\PlusEMU"
-    $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
-    Run "$DotnetDir\dotnet.exe" publish 'Plus Emulator.csproj' -c Release -o $out
-    Pop-Location
-    if ($kept) { Write-Utf8 $config $kept }
     $json = Get-Content $config -Raw | ConvertFrom-Json
     $json.Database.Hostname = '127.0.0.1'; $json.Database.Port = 3306; $json.Database.Username = 'hotel'
     $json.Database.Password = $state.DbPassword; $json.Database.Name = 'plus'
@@ -431,8 +430,7 @@ function Install-Emulator {
   <id>PlusEMU</id>
   <name>PlusEMU hotel emulator</name>
   <description>The PlusEMU game server for your hotel.</description>
-  <executable>$DotnetDir\dotnet.exe</executable>
-  <arguments>"$out\Plus Emulator.dll"</arguments>
+  <executable>$out\Plus Emulator.exe</executable>
   <workingdirectory>$out</workingdirectory>
   <depend>MariaDB</depend>
   <startmode>Automatic</startmode>
@@ -441,35 +439,12 @@ function Install-Emulator {
   <log mode="roll-by-size"><sizeThreshold>10240</sizeThreshold><keepFiles>5</keepFiles></log>
 </service>
 "@
-    if (-not (Get-Service PlusEMU -ErrorAction SilentlyContinue)) { Run $service install }
+    if (-not (Get-Service PlusEMU -ErrorAction SilentlyContinue)) { Run $service install } else { Run $service refresh }
     Start-Service PlusEMU
     for ($i = 0; $i -lt 60; $i++) {
         try { Invoke-RestMethod 'http://127.0.0.1:8080/api/health' -TimeoutSec 2 | Out-Null; Ok 'The emulator is running (service: PlusEMU)'; return } catch { Start-Sleep 2 }
     }
     throw "The emulator didn't start. See $out\logs\PlusEMU-service.out.log"
-}
-
-function Build-Client {
-    Step 'Building the Octane client (this takes a few minutes)'
-    $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = '0'
-    Run corepack.cmd enable
-    Push-Location "$HotelRoot\src\Octane-Renderer"; Run corepack.cmd yarn install; Pop-Location
-    Push-Location "$HotelRoot\src\Octane"
-    Run corepack.cmd yarn install
-    $env:NODE_OPTIONS = '--max-old-space-size=3072'
-    Run corepack.cmd yarn vite build
-    Remove-Item Env:\NODE_OPTIONS
-    Pop-Location
-    $client = "$HotelRoot\client"
-    if (Test-Path $client) { Remove-Item $client -Recurse -Force }
-    Copy-Item "$HotelRoot\src\Octane\dist" $client -Recurse
-    $values = @{ DOMAIN = $state.Domain; SOCKET_URL = $state.WsUrl }
-    foreach ($file in 'renderer-config.json', 'ui-config.json', 'client-mode.json') {
-        Render "$Templates\$file" "$client\configuration\$file" $values
-    }
-    Write-Utf8 "$client\configuration\news.json" '[]'
-    Copy-Item "$client\configuration\adsense.example" "$client\configuration\adsense.json"
-    Ok 'Client built'
 }
 
 function Install-Cms {
@@ -684,11 +659,10 @@ try {
     Install-WebServer
     Install-Toolchains
     Install-Database
-    Get-Sources
+    Get-Releases
     Initialize-HotelDatabase
     Get-HotelFiles
-    Install-Emulator
-    Build-Client
+    Start-Emulator
     Install-Cms
     Set-IisSite
     Write-Guide

@@ -3,10 +3,11 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/DennisObject/plusemu-installer/main/install.sh | sudo bash
 #
-# Installs and wires together: PlusEMU (emulator), Octane + Octane-Renderer
-# (client, built from source), Atom CMS (website), MariaDB, PHP, nginx and the
-# hotel files. Everything is self-hosted on this server; Cloudflare sits in front.
-# Safe to run again: finished steps are skipped and settings are reused.
+# Installs and wires together: PlusEMU (emulator) and Octane (client) from their
+# latest GitHub releases, Atom CMS (website), MariaDB, PHP, nginx and the hotel
+# files. Everything is self-hosted on this server; Cloudflare sits in front.
+# Safe to run again: settings are reused, and the emulator and client are
+# updated to their latest releases.
 #
 # Unattended runs can preset the answers: PLUSEMU_DOMAIN, PLUSEMU_WS_URL,
 # PLUSEMU_HOTEL_NAME, PLUSEMU_ADMIN_USER, PLUSEMU_ADMIN_EMAIL, PLUSEMU_YES=1.
@@ -16,12 +17,8 @@ shopt -u patsub_replacement 2> /dev/null || true # bash 5.2 would expand "&" in 
 INSTALLER_REPO=${INSTALLER_REPO:-DennisObject/plusemu-installer}
 INSTALLER_REF=${INSTALLER_REF:-main}
 ASSET_PACK_URL=${ASSET_PACK_URL:-https://assets.plusemu.dev/installer/hotel-files.tar.gz}
-PLUSEMU_REPO=${PLUSEMU_REPO:-https://github.com/DennisObject/PlusEMU.git}
-PLUSEMU_BRANCH=${PLUSEMU_BRANCH:-master}
-OCTANE_REPO=${OCTANE_REPO:-https://github.com/DennisObject/Octane.git}
-OCTANE_BRANCH=${OCTANE_BRANCH:-main}
-RENDERER_REPO=${RENDERER_REPO:-https://github.com/DennisObject/Octane-Renderer.git}
-RENDERER_BRANCH=${RENDERER_BRANCH:-main}
+EMULATOR_URL=${EMULATOR_URL:-https://github.com/DennisObject/PlusEMU/releases/latest/download/plusemu-linux-ARCH.tar.gz}
+CLIENT_URL=${CLIENT_URL:-https://github.com/DennisObject/Octane/releases/latest/download/octane-client.zip}
 ATOM_REPO=${ATOM_REPO:-https://github.com/atom-projects/atom-cms.git}
 ATOM_BRANCH=${ATOM_BRANCH:-dev}
 
@@ -30,7 +27,7 @@ STATE_FILE=/etc/plusemu/hotel.env
 LOG=/var/log/plusemu-install.log
 PHP=8.5
 NODE_MAJOR=22
-TOTAL_STEPS=10
+TOTAL_STEPS=9
 STEP=0
 
 # ---------------------------------------------------------------- output
@@ -258,8 +255,8 @@ install_packages() {
 
     local mem_mb
     mem_mb=$(awk '/MemTotal/ {print int($2 / 1024)}' /proc/meminfo)
-    if [ "$mem_mb" -lt 3500 ] && ! swapon --show | grep -q .; then
-        # Building the client needs more memory than small servers have.
+    if [ "$mem_mb" -lt 2500 ] && ! swapon --show | grep -q .; then
+        # Building the website's theme needs more memory than small servers have.
         fallocate -l 4G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=4096
         chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
         grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
@@ -268,7 +265,7 @@ install_packages() {
 }
 
 install_toolchains() {
-    step "Installing Node.js $NODE_MAJOR, .NET 10 and Composer"
+    step "Installing Node.js $NODE_MAJOR and Composer (for the website)"
     if ! node --version 2>/dev/null | grep -q "^v$NODE_MAJOR\."; then
         local base=https://nodejs.org/dist/latest-v$NODE_MAJOR.x file
         file=$(curl -fsSL "$base/SHASUMS256.txt" | awk "/node-v.*-linux-$ARCH.tar.xz\$/ {print \$2}")
@@ -281,14 +278,6 @@ install_toolchains() {
     fi
     ok "Node.js $(node --version)"
 
-    if ! /opt/dotnet/dotnet --list-sdks 2>/dev/null | grep -q '^10\.'; then
-        curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
-        bash /tmp/dotnet-install.sh --channel 10.0 --install-dir /opt/dotnet
-        rm -f /tmp/dotnet-install.sh
-        ln -sf /opt/dotnet/dotnet /usr/local/bin/dotnet
-    fi
-    ok ".NET SDK $(/opt/dotnet/dotnet --version)"
-
     if ! command -v composer > /dev/null; then
         local expected
         expected=$(curl -fsSL https://composer.github.io/installer.sig)
@@ -300,16 +289,35 @@ install_toolchains() {
     ok "Composer $(COMPOSER_ALLOW_SUPERUSER=1 composer --version 2>/dev/null | awk '{print $3}')"
 }
 
-download_sources() {
-    step "Downloading PlusEMU, Octane, Octane-Renderer and Atom CMS"
-    mkdir -p "$HOTEL_ROOT/src"
-    clone "$PLUSEMU_REPO" "$PLUSEMU_BRANCH" "$HOTEL_ROOT/src/PlusEMU"
-    ok "PlusEMU ($PLUSEMU_BRANCH)"
-    clone "$OCTANE_REPO" "$OCTANE_BRANCH" "$HOTEL_ROOT/src/Octane"
-    ok "Octane ($OCTANE_BRANCH)"
-    # Octane builds against the renderer source in this exact sibling folder.
-    clone "$RENDERER_REPO" "$RENDERER_BRANCH" "$HOTEL_ROOT/src/Octane-Renderer"
-    ok "Octane-Renderer ($RENDERER_BRANCH)"
+download_releases() {
+    step "Downloading PlusEMU, the Octane client and Atom CMS"
+    local out=$HOTEL_ROOT/emulator keep
+    keep=$(mktemp)
+    # Keep the live config across updates.
+    if [ -f "$out/Config/config.json" ]; then cp "$out/Config/config.json" "$keep"; fi
+    mkdir -p "$out"
+    curl -fsSL --retry 3 "${EMULATOR_URL//ARCH/$ARCH}" | tar xz --no-same-owner -C "$out"
+    if [ -s "$keep" ]; then cp "$keep" "$out/Config/config.json"; fi
+    rm -f "$keep"
+    ok "PlusEMU (latest release)"
+
+    local client=$HOTEL_ROOT/client zip
+    zip=$(mktemp)
+    curl -fsSL --retry 3 "$CLIENT_URL" -o "$zip"
+    rm -rf "$client.new" && mkdir -p "$client.new"
+    unzip -q "$zip" -d "$client.new"
+    rm -f "$zip"
+    render "$TEMPLATES/renderer-config.json" "$client.new/configuration/renderer-config.json"
+    render "$TEMPLATES/ui-config.json" "$client.new/configuration/ui-config.json"
+    render "$TEMPLATES/client-mode.json" "$client.new/configuration/client-mode.json"
+    echo '[]' > "$client.new/configuration/news.json"
+    cp "$client.new/configuration/adsense.example" "$client.new/configuration/adsense.json"
+    rm -rf "$client.old"
+    if [ -d "$client" ]; then mv "$client" "$client.old"; fi
+    mv "$client.new" "$client"
+    rm -rf "$client.old"
+    ok "Octane client (latest release)"
+
     clone "$ATOM_REPO" "$ATOM_BRANCH" "$HOTEL_ROOT/cms"
     ok "Atom CMS ($ATOM_BRANCH)"
 }
@@ -325,7 +333,7 @@ GRANT ALL PRIVILEGES ON plus.* TO 'hotel'@'localhost';
 FLUSH PRIVILEGES;
 EOF
     if [ "$(sql -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'plus' AND table_name = 'users'")" = 0 ]; then
-        sql plus < "$HOTEL_ROOT/src/PlusEMU/Database/FreshInstall.sql"
+        sql plus < "$HOTEL_ROOT/emulator/Database/FreshInstall.sql"
         ok "Imported the PlusEMU database ($(sql -N plus -e 'SELECT COUNT(*) FROM catalog_items') catalog items)"
     else
         ok "The database already exists; kept it as it is"
@@ -333,7 +341,7 @@ EOF
 }
 
 download_hotel_files() {
-    step "Downloading the hotel files (furniture, clothes, badges, texts; about 650 MB)"
+    step "Downloading the hotel files (furniture, clothes, badges, texts; about 470 MB)"
     local files=$HOTEL_ROOT/hotel-files
     if [ -f "$files/.complete" ]; then
         ok "Already downloaded"
@@ -347,18 +355,10 @@ download_hotel_files() {
     ok "Hotel files ready ($(du -sh "$files" | cut -f1))"
 }
 
-build_emulator() {
-    step "Building the emulator"
+start_emulator() {
+    step "Starting the emulator"
     id plusemu > /dev/null 2>&1 || useradd --system --home-dir "$HOTEL_ROOT/emulator" --shell /usr/sbin/nologin plusemu
-    local out=$HOTEL_ROOT/emulator config
-    local keep
-    keep=$(mktemp)
-    # Keep the live config (and photos) across rebuilds.
-    [ -f "$out/Config/config.json" ] && cp "$out/Config/config.json" "$keep"
-    (cd "$HOTEL_ROOT/src/PlusEMU" && DOTNET_CLI_TELEMETRY_OPTOUT=1 /opt/dotnet/dotnet publish "Plus Emulator.csproj" -c Release -o "$out")
-    config=$out/Config/config.json
-    if [ -s "$keep" ]; then cp "$keep" "$config"; fi
-    rm -f "$keep"
+    local out=$HOTEL_ROOT/emulator config=$HOTEL_ROOT/emulator/Config/config.json
     sed -i '1s/^\xEF\xBB\xBF//' "$config"
     # Every packet is logged at Trace level by default, which floods the journal.
     sed -i 's/minlevel="Trace"/minlevel="Info"/' "$out/Config/nlog.config"
@@ -385,8 +385,7 @@ Requires=mariadb.service
 [Service]
 User=plusemu
 WorkingDirectory=$out
-ExecStart=/opt/dotnet/dotnet "$out/Plus Emulator.dll"
-Environment=DOTNET_ROOT=/opt/dotnet DOTNET_CLI_TELEMETRY_OPTOUT=1
+ExecStart="$out/Plus Emulator"
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
@@ -409,27 +408,6 @@ EOF
     done
     journalctl -u plusemu -n 40 --no-pager
     die "The emulator didn't start. See: journalctl -u plusemu -n 100"
-}
-
-build_client() {
-    step "Building the Octane client (this takes a few minutes)"
-    export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
-    corepack enable
-    (cd "$HOTEL_ROOT/src/Octane-Renderer" && corepack yarn install)
-    (cd "$HOTEL_ROOT/src/Octane" && corepack yarn install && NODE_OPTIONS=--max-old-space-size=3072 corepack yarn vite build)
-    local client=$HOTEL_ROOT/client
-    rm -rf "$client.new"
-    cp -a "$HOTEL_ROOT/src/Octane/dist" "$client.new"
-    render "$TEMPLATES/renderer-config.json" "$client.new/configuration/renderer-config.json"
-    render "$TEMPLATES/ui-config.json" "$client.new/configuration/ui-config.json"
-    render "$TEMPLATES/client-mode.json" "$client.new/configuration/client-mode.json"
-    echo '[]' > "$client.new/configuration/news.json"
-    cp "$client.new/configuration/adsense.example" "$client.new/configuration/adsense.json"
-    rm -rf "$client.old"
-    if [ -d "$client" ]; then mv "$client" "$client.old"; fi
-    mv "$client.new" "$client"
-    rm -rf "$client.old"
-    ok "Client built"
 }
 
 install_cms() {
@@ -712,11 +690,10 @@ main() {
     derive_settings
     install_packages
     install_toolchains
-    download_sources
+    download_releases
     setup_database
     download_hotel_files
-    build_emulator
-    build_client
+    start_emulator
     install_cms
     configure_web
     write_guide
