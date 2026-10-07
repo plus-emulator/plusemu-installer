@@ -352,7 +352,7 @@ EOF
     if [ "$imported" = 0 ]; then
         sql -e "DROP DATABASE plus; CREATE DATABASE plus CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
         sql plus < "$HOTEL_ROOT/emulator/Database/FreshInstall.sql"
-        ok "Imported the PlusEMU database ($(sql -N plus -e 'SELECT COUNT(*) FROM catalog_items') catalog items)"
+        ok "Imported the PlusEMU database ($(sql -N plus -e 'SELECT COUNT(*) FROM furniture') furniture types)"
     else
         ok "The database already exists; kept it as it is"
     fi

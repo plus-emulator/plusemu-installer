@@ -409,7 +409,7 @@ function Initialize-HotelDatabase {
         $code = $LASTEXITCODE
         Remove-Item Env:\MYSQL_PWD
         if ($code -ne 0) { throw 'Importing the database failed.' }
-        Ok "Imported the PlusEMU database ($("$(Sql 'SELECT COUNT(*) FROM catalog_items' 'plus')".Trim()) catalog items)"
+        Ok "Imported the PlusEMU database ($("$(Sql 'SELECT COUNT(*) FROM furniture' 'plus')".Trim()) furniture types)"
     } else {
         Ok 'The database already exists; kept it as it is'
     }
