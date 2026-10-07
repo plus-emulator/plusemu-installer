@@ -6,8 +6,7 @@
 # Installs and wires together: PlusEMU (emulator, as a Windows service) and Octane
 # (client) from their latest GitHub releases, Atom CMS (website), MariaDB, PHP,
 # IIS and the hotel files. Everything is self-hosted on this server; Cloudflare
-# sits in front. Safe to run again: settings are reused, and the emulator and
-# client are updated to their latest releases.
+# sits in front. Safe to run again: settings are reused and finished steps are kept.
 #
 # Unattended runs can preset the answers: PLUSEMU_DOMAIN, PLUSEMU_WS_URL,
 # PLUSEMU_HOTEL_NAME, PLUSEMU_ADMIN_USER, PLUSEMU_ADMIN_EMAIL, PLUSEMU_YES=1.
@@ -19,7 +18,7 @@ function Get-Setting($Name, $Default) {
 
 $InstallerRepo   = Get-Setting 'INSTALLER_REPO' 'DennisObject/plusemu-installer'
 $InstallerRef    = Get-Setting 'INSTALLER_REF' 'main'
-$AssetPackUrl    = Get-Setting 'ASSET_PACK_URL' 'https://assets.plusemu.dev/installer/hotel-files.tar.gz'
+$AssetPackUrl    = Get-Setting 'ASSET_PACK_URL' 'https://github.com/DennisObject/plusemu-installer/releases/latest/download/hotel-files.tar.gz'
 $EmulatorUrl     = Get-Setting 'EMULATOR_URL' 'https://github.com/DennisObject/PlusEMU/releases/latest/download/plusemu-win-x64.zip'
 $ClientUrl       = Get-Setting 'CLIENT_URL' 'https://github.com/DennisObject/Octane/releases/latest/download/octane-client.zip'
 $AtomRepo        = Get-Setting 'ATOM_REPO' 'https://github.com/atom-projects/atom-cms.git'
@@ -28,6 +27,7 @@ $AtomBranch      = Get-Setting 'ATOM_BRANCH' 'dev'
 $HotelRoot  = 'C:\Hotel'
 $StateDir   = 'C:\ProgramData\PlusEMU'
 $StateFile  = "$StateDir\hotel.json"
+$Downloads  = Join-Path $env:TEMP 'plusemu-downloads'
 $Log        = "$StateDir\install.log"
 $PhpDir     = 'C:\PHP'
 $NodeMajor  = 22
@@ -35,6 +35,8 @@ $MariaDbSeries = '11.4'
 $TotalSteps = 10
 $script:Step = 0
 
+# `irm | iex` runs in the user's own session, so these are restored at the end.
+$SessionPreferences = @{ ErrorAction = $ErrorActionPreference; Progress = $ProgressPreference }
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest is very slow with its progress bar
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -53,7 +55,10 @@ function Step($Text) {
 function Ok($Text) { Say "      + $Text" 'Green' }
 
 function Ask($Question, $Default) {
-    if ((Get-Setting 'PLUSEMU_YES' '0') -eq '1') { return $Default }   # unattended: take the default
+    if ((Get-Setting 'PLUSEMU_YES' '0') -eq '1') {   # unattended: take the default
+        if (-not $Default) { throw "No answer for `"$Question`". Preset the PLUSEMU_* answers for an unattended run." }
+        return $Default
+    }
     $prompt = "  $Question"
     if ($Default) { $prompt += " [$Default]" }
     $answer = Read-Host $prompt
@@ -128,10 +133,16 @@ function Clone($Repo, $Branch, $Dir) {
 }
 
 function Sql([string]$Query, [string]$Database = '') {
-    $env:MYSQL_PWD = $state.DbRootPassword
     $arguments = @('-uroot', '-N', '-e', $Query)
     if ($Database) { $arguments += $Database }
-    return (& $script:MariaDb @arguments 2>> $Log)
+    $env:MYSQL_PWD = $state.DbRootPassword
+    $ErrorActionPreference = 'Continue'   # native stderr is not an error by itself
+    $result = & $script:MariaDb @arguments 2>> $Log
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    Remove-Item Env:\MYSQL_PWD
+    if ($code -ne 0) { throw "A database command failed (exit code $code). See $Log" }
+    return $result
 }
 
 # ---------------------------------------------------------------- steps
@@ -143,7 +154,10 @@ function Test-Prerequisites {
     if ([Environment]::OSVersion.Version.Build -lt 17763) { throw 'Windows Server 2019 or newer is required.' }
     $free = (Get-PSDrive C).Free / 1GB
     if ($free -lt 15) { throw "Not enough disk space on C: ($([int]$free) GB free, at least 15 GB needed)." }
-    New-Item -ItemType Directory -Force -Path $StateDir, $HotelRoot | Out-Null
+    New-Item -ItemType Directory -Force -Path $StateDir, $HotelRoot, $Downloads | Out-Null
+    # Only administrators may read the passwords and the log.
+    & icacls.exe $StateDir /inheritance:r /grant:r 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not protect $StateDir." }
     Set-Content -Path $Log -Value "PlusEMU installer log $(Get-Date -Format s)" -Encoding UTF8
 }
 
@@ -188,12 +202,18 @@ function Read-Answers {
     Write-Host '  address on your own domain (no extra Cloudflare setup), or type your own,'
     Write-Host "  for example ws.$domain."
     $ws = Get-Setting 'PLUSEMU_WS_URL' ''
-    if (-not $ws) { $ws = Ask 'WebSocket address' "wss://$domain/ws" }
-    $ws = 'wss://' + ($ws -replace '^[a-z]+://', '')
+    while ($true) {
+        if (-not $ws) { $ws = Ask 'WebSocket address' "wss://$domain/ws" }
+        $ws = 'wss://' + ($ws -replace '^[a-zA-Z]+://', '')
+        if ($ws -match '^wss://[A-Za-z0-9.-]+\.[A-Za-z]{2,}(/[A-Za-z0-9._/-]*)?$') { break }
+        Write-Host "  Type it like wss://$domain/ws or ws.$domain (no port)." -ForegroundColor Yellow
+        $ws = ''
+    }
 
     $suggested = (Get-Culture).TextInfo.ToTitleCase($domain.Split('.')[0])
     $name = Get-Setting 'PLUSEMU_HOTEL_NAME' ''
     if (-not $name) { $name = Ask 'Hotel name' $suggested }
+    $name = $name -replace '[<>"`$\\'']', ''
 
     $user = Get-Setting 'PLUSEMU_ADMIN_USER' ''
     while ($true) {
@@ -221,12 +241,10 @@ function Read-Answers {
     }
 
     $script:state = [pscustomobject]@{
-        Domain = $domain; WsUrl = $ws; HotelName = $name.Replace("'", ''); AdminUser = $user; AdminEmail = $mail
+        Domain = $domain; WsUrl = $ws; HotelName = $name; AdminUser = $user; AdminEmail = $mail
         AdminPassword = New-Secret 16; DbPassword = New-Secret 32; DbRootPassword = New-Secret 32
     }
     $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
-    # Only administrators may read the passwords file.
-    Run icacls.exe $StateDir /inheritance:r /grant:r 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F'
 }
 
 function Get-Derived {
@@ -244,15 +262,13 @@ function Install-WebServer {
     $result = Install-WindowsFeature -Name $features
     if (-not $result.Success) { throw 'Installing IIS failed.' }
     Import-Module WebAdministration
-    $downloads = Join-Path $env:TEMP 'plusemu-downloads'
-    New-Item -ItemType Directory -Force -Path $downloads | Out-Null
     if (-not (Test-Path "$env:windir\System32\inetsrv\rewrite.dll")) {
-        Download 'https://download.microsoft.com/download/1/2/8/128E2E22-C1B9-44A4-BE2A-5859ED1D4592/rewrite_amd64_en-US.msi' "$downloads\rewrite.msi"
-        Install-Msi "$downloads\rewrite.msi"
+        Download 'https://download.microsoft.com/download/1/2/8/128E2E22-C1B9-44A4-BE2A-5859ED1D4592/rewrite_amd64_en-US.msi' "$Downloads\rewrite.msi"
+        Install-Msi "$Downloads\rewrite.msi"
     }
     if (-not (Test-Path "$env:ProgramFiles\IIS\Application Request Routing")) {
-        Download 'https://download.microsoft.com/download/E/9/8/E9849D6A-020E-47E4-9FD0-A023E99B54EB/requestRouter_amd64.msi' "$downloads\arr.msi"
-        Install-Msi "$downloads\arr.msi"
+        Download 'https://download.microsoft.com/download/E/9/8/E9849D6A-020E-47E4-9FD0-A023E99B54EB/requestRouter_amd64.msi' "$Downloads\arr.msi"
+        Install-Msi "$Downloads\arr.msi"
     }
     # The game's WebSocket is handed to the emulator through IIS's reverse proxy.
     Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter 'system.webServer/proxy' -Name 'enabled' -Value 'True'
@@ -261,14 +277,13 @@ function Install-WebServer {
 
 function Install-Toolchains {
     Step "Installing Git, Node.js $NodeMajor, PHP 8.5 and Composer (for the website)"
-    $downloads = Join-Path $env:TEMP 'plusemu-downloads'
     Update-Path
 
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
         $release = Invoke-RestMethod 'https://api.github.com/repos/git-for-windows/git/releases/latest'
         $asset = $release.assets | Where-Object { $_.name -match '^Git-[\d.]+-64-bit\.exe$' } | Select-Object -First 1
-        Download $asset.browser_download_url "$downloads\git.exe"
-        $process = Start-Process "$downloads\git.exe" -ArgumentList '/VERYSILENT', '/NORESTART', '/NOCANCEL', '/SP-', '/SUPPRESSMSGBOXES' -Wait -PassThru
+        Download $asset.browser_download_url "$Downloads\git.exe"
+        $process = Start-Process "$Downloads\git.exe" -ArgumentList '/VERYSILENT', '/NORESTART', '/NOCANCEL', '/SP-', '/SUPPRESSMSGBOXES' -Wait -PassThru
         if ($process.ExitCode -ne 0) { throw 'Installing Git failed.' }
         Update-Path
     }
@@ -280,23 +295,23 @@ function Install-Toolchains {
         $sums = (Invoke-WebRequest "$base/SHASUMS256.txt" -UseBasicParsing).Content -split "`n"
         $line = $sums | Where-Object { $_ -match 'node-v[\d.]+-x64\.msi$' } | Select-Object -First 1
         $hash, $file = $line -split '\s+'
-        Download "$base/$file" "$downloads\$file"
-        if ((Get-FileHash "$downloads\$file" -Algorithm SHA256).Hash -ne $hash.ToUpper()) { throw 'The Node.js download is damaged. Run the installer again.' }
-        Install-Msi "$downloads\$file"
+        Download "$base/$file" "$Downloads\$file"
+        if ((Get-FileHash "$Downloads\$file" -Algorithm SHA256).Hash -ne $hash.ToUpper()) { throw 'The Node.js download is damaged. Run the installer again.' }
+        Install-Msi "$Downloads\$file"
         Update-Path
     }
     Ok "Node.js $(& node --version)"
 
     if (-not (Test-Path "$PhpDir\php-cgi.exe")) {
         # PHP needs the Visual C++ runtime.
-        Download 'https://aka.ms/vs/17/release/vc_redist.x64.exe' "$downloads\vc_redist.x64.exe"
-        $process = Start-Process "$downloads\vc_redist.x64.exe" -ArgumentList '/install', '/quiet', '/norestart' -Wait -PassThru
+        Download 'https://aka.ms/vs/17/release/vc_redist.x64.exe' "$Downloads\vc_redist.x64.exe"
+        $process = Start-Process "$Downloads\vc_redist.x64.exe" -ArgumentList '/install', '/quiet', '/norestart' -Wait -PassThru
         if ($process.ExitCode -notin 0, 1638, 3010) { throw 'Installing the Visual C++ runtime failed.' }
         $releases = Invoke-RestMethod 'https://downloads.php.net/~windows/releases/releases.json'
         $build = $releases.'8.5'.'nts-vs17-x64'.zip
-        Download "https://downloads.php.net/~windows/releases/$($build.path)" "$downloads\php.zip"
-        if ((Get-FileHash "$downloads\php.zip" -Algorithm SHA256).Hash -ne $build.sha256.ToUpper()) { throw 'The PHP download is damaged. Run the installer again.' }
-        Expand-Archive "$downloads\php.zip" $PhpDir -Force
+        Download "https://downloads.php.net/~windows/releases/$($build.path)" "$Downloads\php.zip"
+        if ((Get-FileHash "$Downloads\php.zip" -Algorithm SHA256).Hash -ne $build.sha256.ToUpper()) { throw 'The PHP download is damaged. Run the installer again.' }
+        Expand-Archive "$Downloads\php.zip" $PhpDir -Force
     }
     $ini = Get-Content "$PhpDir\php.ini-production" -Raw
     foreach ($extension in 'curl', 'fileinfo', 'gd', 'intl', 'mbstring', 'openssl', 'pdo_mysql', 'sockets', 'zip', 'sodium') {
@@ -324,13 +339,12 @@ function Install-Database {
     Step "Installing MariaDB $MariaDbSeries"
     $script:MariaDb = Get-ChildItem "$env:ProgramFiles\MariaDB*\bin\mariadb.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
     if (-not $MariaDb) {
-        $downloads = Join-Path $env:TEMP 'plusemu-downloads'
         $latest = Invoke-RestMethod "https://downloads.mariadb.org/rest-api/mariadb/$MariaDbSeries/latest/"
         $release = $latest.releases.PSObject.Properties | Select-Object -First 1
         $msi = $release.Value.files | Where-Object { $_.file_name -match 'winx64\.msi$' } | Select-Object -First 1
-        Download ($msi.file_download_url -replace '^http:', 'https:') "$downloads\mariadb.msi"
-        if ($msi.checksum.sha256sum -and (Get-FileHash "$downloads\mariadb.msi" -Algorithm SHA256).Hash -ne $msi.checksum.sha256sum.ToUpper()) { throw 'The MariaDB download is damaged. Run the installer again.' }
-        Install-Msi "$downloads\mariadb.msi" @("PASSWORD=$($state.DbRootPassword)", 'SERVICENAME=MariaDB', 'PORT=3306', 'UTF8=1')
+        Download ($msi.file_download_url -replace '^http:', 'https:') "$Downloads\mariadb.msi"
+        if ($msi.checksum.sha256sum -and (Get-FileHash "$Downloads\mariadb.msi" -Algorithm SHA256).Hash -ne $msi.checksum.sha256sum.ToUpper()) { throw 'The MariaDB download is damaged. Run the installer again.' }
+        Install-Msi "$Downloads\mariadb.msi" @("PASSWORD=$($state.DbRootPassword)", 'SERVICENAME=MariaDB', 'PORT=3306', 'UTF8=1')
         $script:MariaDb = Get-ChildItem "$env:ProgramFiles\MariaDB*\bin\mariadb.exe" | Select-Object -First 1 -ExpandProperty FullName
         # Only programs on this server may reach the database.
         $ini = Join-Path (Split-Path (Split-Path $MariaDb)) 'data\my.ini'
@@ -345,23 +359,27 @@ function Install-Database {
 
 function Get-Releases {
     Step 'Downloading PlusEMU, the Octane client and Atom CMS'
-    $downloads = Join-Path $env:TEMP 'plusemu-downloads'
-    New-Item -ItemType Directory -Force -Path $downloads | Out-Null
-
+    # A re-run repairs and keeps the installed releases: a newer emulator may need
+    # database changes this installer does not apply.
     $out = "$HotelRoot\emulator"
-    $config = "$out\Config\config.json"
-    $kept = $null
-    if (Test-Path $config) { $kept = Get-Content $config -Raw }   # keep the live config across updates
-    if (Get-Service PlusEMU -ErrorAction SilentlyContinue) { Stop-Service PlusEMU }
-    Download $EmulatorUrl "$downloads\plusemu.zip"
-    Expand-Archive "$downloads\plusemu.zip" $out -Force
-    if ($kept) { Write-Utf8 $config $kept }
-    Ok 'PlusEMU (latest release)'
+    if (Test-Path "$out\Plus Emulator.exe") {
+        Ok 'PlusEMU (already installed)'
+    } else {
+        Download $EmulatorUrl "$Downloads\plusemu.zip"
+        Expand-Archive "$Downloads\plusemu.zip" $out -Force
+        Ok 'PlusEMU (latest release)'
+    }
 
     $client = "$HotelRoot\client"
-    Download $ClientUrl "$downloads\octane-client.zip"
+    if (Test-Path "$client\index.html") {
+        Ok 'Octane client (already installed)'
+        Clone $AtomRepo $AtomBranch "$HotelRoot\cms"
+        Ok "Atom CMS ($AtomBranch)"
+        return
+    }
+    Download $ClientUrl "$Downloads\octane-client.zip"
     if (Test-Path $client) { Remove-Item $client -Recurse -Force }
-    Expand-Archive "$downloads\octane-client.zip" $client
+    Expand-Archive "$Downloads\octane-client.zip" $client
     $values = @{ DOMAIN = $state.Domain; SOCKET_URL = $state.WsUrl }
     foreach ($file in 'renderer-config.json', 'ui-config.json', 'client-mode.json') {
         Render "$Templates\$file" "$client\configuration\$file" $values
@@ -378,12 +396,19 @@ function Initialize-HotelDatabase {
     Step 'Creating the hotel database'
     $password = $state.DbPassword
     Sql "CREATE DATABASE IF NOT EXISTS plus CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; CREATE USER IF NOT EXISTS 'hotel'@'localhost' IDENTIFIED BY '$password'; ALTER USER 'hotel'@'localhost' IDENTIFIED BY '$password'; GRANT ALL PRIVILEGES ON plus.* TO 'hotel'@'localhost'; FLUSH PRIVILEGES;" | Out-Null
-    $tables = Sql "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'plus' AND table_name = 'users'"
-    if ("$tables".Trim() -eq '0') {
+    # The import ends by filling server_status, so a missing or empty one means it never finished.
+    $imported = '0'
+    if ("$(Sql "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'plus' AND table_name = 'server_status'")".Trim() -eq '1') {
+        $imported = "$(Sql 'SELECT COUNT(*) FROM server_status' 'plus')".Trim()
+    }
+    if ($imported -eq '0') {
+        Sql 'DROP DATABASE plus; CREATE DATABASE plus CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;' | Out-Null
         $sqlFile = "$HotelRoot\emulator\Database\FreshInstall.sql"
         $env:MYSQL_PWD = $state.DbRootPassword
-        & cmd.exe /c "`"$MariaDb`" -uroot plus < `"$sqlFile`"" 2>> $Log
-        if ($LASTEXITCODE -ne 0) { throw 'Importing the database failed.' }
+        & cmd.exe /c "`"$MariaDb`" -uroot plus < `"$sqlFile`" 2>> `"$Log`""
+        $code = $LASTEXITCODE
+        Remove-Item Env:\MYSQL_PWD
+        if ($code -ne 0) { throw 'Importing the database failed.' }
         Ok "Imported the PlusEMU database ($("$(Sql 'SELECT COUNT(*) FROM catalog_items' 'plus')".Trim()) catalog items)"
     } else {
         Ok 'The database already exists; kept it as it is'
@@ -428,9 +453,8 @@ function Start-Emulator {
     # crash, and on stop sends Ctrl+C so the emulator saves rooms and inventories before exiting.
     $shawl = "$out\service\shawl.exe"
     if (-not (Test-Path $shawl)) {
-        $downloads = Join-Path $env:TEMP 'plusemu-downloads'
-        Download 'https://github.com/mtkennerly/shawl/releases/download/v1.9.0/shawl-v1.9.0-win64.zip' "$downloads\shawl.zip"
-        Expand-Archive "$downloads\shawl.zip" "$out\service" -Force
+        Download 'https://github.com/mtkennerly/shawl/releases/download/v1.9.0/shawl-v1.9.0-win64.zip' "$Downloads\shawl.zip"
+        Expand-Archive "$Downloads\shawl.zip" "$out\service" -Force
     }
     if (-not (Get-Service PlusEMU -ErrorAction SilentlyContinue)) {
         Run $shawl add --name PlusEMU --cwd $out --stop-timeout 30000 '--' "$out\Plus Emulator.exe"
@@ -451,7 +475,12 @@ function Install-Cms {
     Push-Location $cms
     if (-not (Test-Path $envFile)) { Copy-Item .env.example $envFile }
     # Laravel trusts the visitor address Cloudflare forwards, but only from Cloudflare itself.
-    $cloudflare = try { ((Invoke-WebRequest 'https://www.cloudflare.com/ips-v4' -UseBasicParsing).Content.Trim() -split '\s+') + ((Invoke-WebRequest 'https://www.cloudflare.com/ips-v6' -UseBasicParsing).Content.Trim() -split '\s+') } catch { @('*') }
+    $cloudflare = try { ((Invoke-WebRequest 'https://www.cloudflare.com/ips-v4' -UseBasicParsing).Content.Trim() -split '\s+') + ((Invoke-WebRequest 'https://www.cloudflare.com/ips-v6' -UseBasicParsing).Content.Trim() -split '\s+') }
+    catch {
+        @('173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20',
+          '188.114.96.0/20', '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13', '104.24.0.0/14', '172.64.0.0/13',
+          '131.0.72.0/22', '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32', '2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32')
+    }
     $settings = [ordered]@{
         APP_NAME = $state.HotelName; APP_ENV = 'production'; APP_DEBUG = 'false'; APP_URL = "https://$domain"; LOG_LEVEL = 'warning'
         DB_CONNECTION = 'mariadb'; DB_HOST = '127.0.0.1'; DB_PORT = '3306'; DB_DATABASE = 'plus'; DB_USERNAME = 'hotel'; DB_PASSWORD = $state.DbPassword
@@ -531,12 +560,8 @@ function Set-IisSite {
         Remove-WebConfigurationProperty -PSPath $apphost -Filter 'system.webServer/httpProtocol/customHeaders' -Name 'collection' -AtElement @{ name = 'X-Powered-By' }
     }
 
-    # Requests by IP address (before Cloudflare is set up) show the setup guide.
+    # Without a site for bare IP requests, IIS answers them with an error instead of a page.
     if (Get-Website -Name 'Default Web Site' -ErrorAction SilentlyContinue) { Remove-Website -Name 'Default Web Site' }
-    New-Item -ItemType Directory -Force -Path "$HotelRoot\setup-guide" | Out-Null
-    if (-not (Get-Website -Name 'Setup guide' -ErrorAction SilentlyContinue)) {
-        New-Website -Name 'Setup guide' -PhysicalPath "$HotelRoot\setup-guide" -Port 80 | Out-Null
-    }
 
     if (-not (Test-Path "IIS:\AppPools\$pool")) { New-WebAppPool -Name $pool | Out-Null }
     Set-ItemProperty "IIS:\AppPools\$pool" -Name managedRuntimeVersion -Value ''
@@ -606,7 +631,7 @@ function Set-IisSite {
     Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'url' -Value 'http://127.0.0.1:2096/'
 
     # IIS needs to read the website and client, and write Atom's storage and cache.
-    foreach ($dir in 'cms', 'client', 'hotel-files', 'setup-guide') { Run icacls.exe "$HotelRoot\$dir" /grant 'IIS_IUSRS:(OI)(CI)RX' 'IUSR:(OI)(CI)RX' /Q }
+    foreach ($dir in 'cms', 'client', 'hotel-files') { Run icacls.exe "$HotelRoot\$dir" /grant 'IIS_IUSRS:(OI)(CI)RX' 'IUSR:(OI)(CI)RX' /Q }
     foreach ($dir in "$HotelRoot\cms\storage", "$HotelRoot\cms\bootstrap\cache") { Run icacls.exe $dir /grant "IIS AppPool\$($pool):(OI)(CI)M" /T /Q }
     Run icacls.exe "$HotelRoot\cms\.env" /inheritance:r /grant:r 'Administrators:F' 'SYSTEM:F' "IIS AppPool\$($pool):R"
     Run icacls.exe "$HotelRoot\emulator\Config" /inheritance:r /grant:r 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F'
@@ -626,9 +651,10 @@ function Write-Guide {
     Step 'Writing your setup guide'
     $wsRow = ''
     if ($WsHost -ne $state.Domain) {
-        $label = $WsHost.Substring(0, $WsHost.Length - $state.Domain.Length - 1)
+        $label = if ($WsHost.EndsWith(".$($state.Domain)")) { $WsHost.Substring(0, $WsHost.Length - $state.Domain.Length - 1) } else { $WsHost }
         $wsRow = "<tr><td>A</td><td><code>$label</code></td><td><code>$ServerIp</code></td><td>Proxied (orange cloud)</td></tr>"
     }
+    New-Item -ItemType Directory -Force -Path "$HotelRoot\setup-guide" | Out-Null
     Render "$Templates\setup-guide.html" "$HotelRoot\setup-guide\index.html" @{
         DOMAIN = $state.Domain; SERVER_IP = $ServerIp; HOTEL_NAME = $state.HotelName; WS_DNS_ROW = $wsRow
         CREDENTIALS_FILE = $StateFile; RESTART_COMMAND = 'Restart-Service PlusEMU'
@@ -682,4 +708,8 @@ try {
     Write-Host "  Full log: $Log"
     Write-Host '  Fix the problem (or ask for help on DevBest with the log), then run the installer again.'
     Write-Host '  It continues where it stopped.'
+} finally {
+    foreach ($name in 'MYSQL_PWD', 'ATOM_ADMIN_PASSWORD', 'ADMIN_PASSWORD') { Remove-Item "Env:\$name" -ErrorAction SilentlyContinue }
+    $ErrorActionPreference = $SessionPreferences.ErrorAction
+    $ProgressPreference = $SessionPreferences.Progress
 }

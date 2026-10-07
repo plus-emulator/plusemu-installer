@@ -6,8 +6,7 @@
 # Installs and wires together: PlusEMU (emulator) and Octane (client) from their
 # latest GitHub releases, Atom CMS (website), MariaDB, PHP, nginx and the hotel
 # files. Everything is self-hosted on this server; Cloudflare sits in front.
-# Safe to run again: settings are reused, and the emulator and client are
-# updated to their latest releases.
+# Safe to run again: settings are reused and finished steps are kept.
 #
 # Unattended runs can preset the answers: PLUSEMU_DOMAIN, PLUSEMU_WS_URL,
 # PLUSEMU_HOTEL_NAME, PLUSEMU_ADMIN_USER, PLUSEMU_ADMIN_EMAIL, PLUSEMU_YES=1.
@@ -16,7 +15,7 @@ shopt -u patsub_replacement 2> /dev/null || true # bash 5.2 would expand "&" in 
 
 INSTALLER_REPO=${INSTALLER_REPO:-DennisObject/plusemu-installer}
 INSTALLER_REF=${INSTALLER_REF:-main}
-ASSET_PACK_URL=${ASSET_PACK_URL:-https://assets.plusemu.dev/installer/hotel-files.tar.gz}
+ASSET_PACK_URL=${ASSET_PACK_URL:-https://github.com/DennisObject/plusemu-installer/releases/latest/download/hotel-files.tar.gz}
 EMULATOR_URL=${EMULATOR_URL:-https://github.com/DennisObject/PlusEMU/releases/latest/download/plusemu-linux-ARCH.tar.gz}
 CLIENT_URL=${CLIENT_URL:-https://github.com/DennisObject/Octane/releases/latest/download/octane-client.zip}
 ATOM_REPO=${ATOM_REPO:-https://github.com/atom-projects/atom-cms.git}
@@ -60,7 +59,10 @@ ask() { # ask <variable> <question> [default]
     local var=$1 question=$2 default=${3:-} answer
     if [ -n "$default" ]; then question="$question ${bold}[$default]${reset}"; fi
     printf '  %s: ' "$question" >&3
-    read -r answer < /dev/tty || true
+    if ! read -r answer < /dev/tty 2> /dev/null; then
+        # No terminal (an unattended run): only questions with a default can be answered.
+        [ -n "$default" ] || die "No answer for \"$2\". Run the installer in a terminal, or preset the PLUSEMU_* answers."
+    fi
     printf -v "$var" '%s' "${answer:-$default}"
 }
 
@@ -111,6 +113,7 @@ ADMIN_USER='$ADMIN_USER'
 ADMIN_EMAIL='$ADMIN_EMAIL'
 ADMIN_PASSWORD='$ADMIN_PASSWORD'
 DB_PASSWORD='$DB_PASSWORD'
+GUIDE_TOKEN='$GUIDE_TOKEN'
 EOF
     umask 022
 }
@@ -162,6 +165,7 @@ ask_questions() {
     if [ -f "$STATE_FILE" ]; then
         # shellcheck disable=SC1090
         . "$STATE_FILE"
+        if [ -z "${GUIDE_TOKEN:-}" ]; then GUIDE_TOKEN=$(random_secret 12) && save_state; fi
         say "Found the settings of an earlier run for ${bold}$DOMAIN${reset}; continuing that installation."
         return
     fi
@@ -180,13 +184,13 @@ ask_questions() {
     say "  address on your own domain (no extra Cloudflare setup), or type your own,"
     say "  for example ws.$DOMAIN."
     WS_URL=${PLUSEMU_WS_URL:-}
-    [ -n "$WS_URL" ] || ask WS_URL "WebSocket address" "wss://$DOMAIN/ws"
-    case "$WS_URL" in
-        wss://*) ;;
-        ws://*) WS_URL="wss://${WS_URL#ws://}" ;;
-        *://*) WS_URL="wss://${WS_URL#*://}" ;;
-        *) WS_URL="wss://$WS_URL" ;;
-    esac
+    while true; do
+        [ -n "$WS_URL" ] || ask WS_URL "WebSocket address" "wss://$DOMAIN/ws"
+        WS_URL="wss://$(printf '%s' "$WS_URL" | sed -E 's#^[a-zA-Z]+://##')"
+        if [[ $WS_URL =~ ^wss://[A-Za-z0-9.-]+\.[A-Za-z]{2,}(/[A-Za-z0-9._/-]*)?$ ]]; then break; fi
+        say "  ${yellow}Type it like wss://$DOMAIN/ws or ws.$DOMAIN (no port).${reset}"
+        WS_URL=
+    done
 
     local suggested=${DOMAIN%%.*}
     HOTEL_NAME=${PLUSEMU_HOTEL_NAME:-}
@@ -208,6 +212,7 @@ ask_questions() {
     done
     ADMIN_PASSWORD=$(random_secret 16)
     DB_PASSWORD=$(random_secret 32)
+    GUIDE_TOKEN=$(random_secret 12)
 
     say ""
     say "  Website:    ${bold}https://$DOMAIN${reset}"
@@ -291,17 +296,24 @@ install_toolchains() {
 
 download_releases() {
     step "Downloading PlusEMU, the Octane client and Atom CMS"
-    local out=$HOTEL_ROOT/emulator keep
-    keep=$(mktemp)
-    # Keep the live config across updates.
-    if [ -f "$out/Config/config.json" ]; then cp "$out/Config/config.json" "$keep"; fi
-    mkdir -p "$out"
-    curl -fsSL --retry 3 "${EMULATOR_URL//ARCH/$ARCH}" | tar xz --no-same-owner -C "$out"
-    if [ -s "$keep" ]; then cp "$keep" "$out/Config/config.json"; fi
-    rm -f "$keep"
-    ok "PlusEMU (latest release)"
+    # A re-run repairs and keeps the installed releases: a newer emulator may need
+    # database changes this installer does not apply.
+    local out=$HOTEL_ROOT/emulator
+    if [ -x "$out/Plus Emulator" ]; then
+        ok "PlusEMU (already installed)"
+    else
+        mkdir -p "$out"
+        curl -fsSL --retry 3 "${EMULATOR_URL//ARCH/$ARCH}" | tar xz --no-same-owner -C "$out"
+        ok "PlusEMU (latest release)"
+    fi
 
     local client=$HOTEL_ROOT/client zip
+    if [ -f "$client/index.html" ]; then
+        ok "Octane client (already installed)"
+        clone "$ATOM_REPO" "$ATOM_BRANCH" "$HOTEL_ROOT/cms"
+        ok "Atom CMS ($ATOM_BRANCH)"
+        return
+    fi
     zip=$(mktemp)
     curl -fsSL --retry 3 "$CLIENT_URL" -o "$zip"
     rm -rf "$client.new" && mkdir -p "$client.new"
@@ -332,7 +344,13 @@ ALTER USER 'hotel'@'localhost' IDENTIFIED BY '$DB_PASSWORD';
 GRANT ALL PRIVILEGES ON plus.* TO 'hotel'@'localhost';
 FLUSH PRIVILEGES;
 EOF
-    if [ "$(sql -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'plus' AND table_name = 'users'")" = 0 ]; then
+    # The import ends by filling server_status, so a missing or empty one means it never finished.
+    local imported=0
+    if [ "$(sql -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'plus' AND table_name = 'server_status'")" = 1 ]; then
+        imported=$(sql -N plus -e 'SELECT COUNT(*) FROM server_status')
+    fi
+    if [ "$imported" = 0 ]; then
+        sql -e "DROP DATABASE plus; CREATE DATABASE plus CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
         sql plus < "$HOTEL_ROOT/emulator/Database/FreshInstall.sql"
         ok "Imported the PlusEMU database ($(sql -N plus -e 'SELECT COUNT(*) FROM catalog_items') catalog items)"
     else
@@ -523,6 +541,15 @@ configure_web() {
     # Added to nginx's own list; .hab and .nitro already fall back to application/octet-stream.
     echo 'types { application/json jsonc; }' > /etc/nginx/conf.d/hotel-mime.conf
 
+    # nginx 1.25.1 replaced "listen ... http2" with the http2 directive.
+    local ssl_listen="listen 443 ssl http2;
+    listen [::]:443 ssl http2;"
+    if printf '%s\n' 1.25.1 "$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')" | sort -V -C; then
+        ssl_listen="listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;"
+    fi
+
     local ws_main="" ws_server=""
     if [ "$WS_HOST" = "$DOMAIN" ]; then
         ws_main=$(ws_location)
@@ -532,8 +559,7 @@ configure_web() {
 server {
     listen 80;
     listen [::]:80;
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    $ssl_listen
     server_name $WS_HOST;
     ssl_certificate $ssl/cert.pem;
     ssl_certificate_key $ssl/key.pem;
@@ -547,19 +573,18 @@ EOF
     cat > /etc/nginx/sites-available/hotel.conf <<EOF
 # Generated by the PlusEMU installer. Re-running the installer rewrites this file.
 
-# Requests by IP address (before Cloudflare is set up) show the setup guide.
+# Requests by IP address get nothing, except the setup guide at its private address.
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
-    root $HOTEL_ROOT/setup-guide;
-    index index.html;
-    location / { try_files \$uri \$uri/ =404; }
+    location /$GUIDE_TOKEN/ { alias $HOTEL_ROOT/setup-guide/; index index.html; }
+    location / { return 444; }
 }
 
 server {
-    listen 443 ssl http2 default_server;
-    listen [::]:443 ssl http2 default_server;
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
     server_name _;
     ssl_certificate $ssl/cert.pem;
     ssl_certificate_key $ssl/key.pem;
@@ -569,8 +594,7 @@ server {
 server {
     listen 80;
     listen [::]:80;
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    $ssl_listen
     server_name www.$DOMAIN;
     ssl_certificate $ssl/cert.pem;
     ssl_certificate_key $ssl/key.pem;
@@ -580,8 +604,7 @@ server {
 server {
     listen 80;
     listen [::]:80;
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    $ssl_listen
     server_name $DOMAIN;
     ssl_certificate $ssl/cert.pem;
     ssl_certificate_key $ssl/key.pem;
@@ -604,8 +627,8 @@ $ws_main
     location /client/ {
         alias $HOTEL_ROOT/client/;
         index index.html;
-        location ~ ^/client/(src/)?assets/ { expires max; add_header Cache-Control "public, immutable"; }
-        location ~ ^/client/(index\.html|configuration/) { add_header Cache-Control "no-store"; }
+        location ~ ^/client/(src/)?assets/ { expires max; }
+        location ~ ^/client/(index\.html|configuration/) { expires -1; }
     }
     location = /client { return 301 /client/; }
     location = /ads.txt { alias $HOTEL_ROOT/client/ads.txt; }
@@ -671,7 +694,7 @@ finish() {
     say "  One last part: connect your domain through Cloudflare (about 5 minutes)."
     say "  Open this page in your browser for easy step-by-step instructions:"
     say ""
-    say "      ${bold}${cyan}http://$SERVER_IP/${reset}"
+    say "      ${bold}${cyan}http://$SERVER_IP/$GUIDE_TOKEN/${reset}"
     say ""
     say "  Your admin login for https://$DOMAIN (also saved in $STATE_FILE):"
     say "      Username: ${bold}$ADMIN_USER${reset}"
