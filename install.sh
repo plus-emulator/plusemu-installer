@@ -397,18 +397,16 @@ start_emulator() {
     sed -i '1s/^\xEF\xBB\xBF//' "$config"
     # Every packet is logged at Trace level by default, which floods the journal.
     sed -i 's/minlevel="Trace"/minlevel="Info"/' "$out/Config/nlog.config"
-    jq --arg pass "$DB_PASSWORD" --arg furnidata "$HOTEL_ROOT/hotel-files/gamedata/FurnitureData.json" '
+    jq --arg pass "$DB_PASSWORD" '
         .Database.Hostname = "127.0.0.1" | .Database.Port = 3306 | .Database.Username = "hotel"
         | .Database.Password = $pass | .Database.Name = "plus"
         | .Flash.Hostname = "127.0.0.1"
         | .Nitro.Hostname = "127.0.0.1" | .Nitro.Port = 2096 | .Nitro.Name = "Octane"
         | .Rcon.Hostname = "127.0.0.1" | .Rcon.Port = 30001 | .Rcon.AllowedAddresses = ["127.0.0.1", "localhost"]
-        | .AuthApi.Enabled = false | .AuthApi.Hostname = "127.0.0.1"
-        | .FurniEditor.FurnidataPath = $furnidata' "$config" > "$config.new"
+        | .AuthApi.Enabled = false | .AuthApi.Hostname = "127.0.0.1"' "$config" > "$config.new"
     mv "$config.new" "$config"
     chmod 600 "$config"
     chown -R plusemu:plusemu "$out"
-    chown plusemu "$HOTEL_ROOT/hotel-files/gamedata/FurnitureData.json"
 
     cat > /etc/systemd/system/plusemu.service <<EOF
 [Unit]

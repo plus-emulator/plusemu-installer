@@ -135,7 +135,8 @@ function Clone($Repo, $Ref, $Dir) {
 }
 
 function Sql([string]$Query, [string]$Database = '') {
-    $arguments = @('-uroot', '-N', '-e', $Query)
+    # Local connections skip TLS: MariaDB 11.4 verifies the certificate it generated for itself, which expires.
+    $arguments = @('-uroot', '--skip-ssl', '-N', '-e', $Query)
     if ($Database) { $arguments += $Database }
     $env:MYSQL_PWD = $state.DbRootPassword
     $ErrorActionPreference = 'Continue'   # native stderr is not an error by itself
@@ -421,7 +422,7 @@ function Initialize-HotelDatabase {
         Sql 'DROP DATABASE plus; CREATE DATABASE plus CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;' | Out-Null
         $sqlFile = "$HotelRoot\emulator\Database\FreshInstall.sql"
         $env:MYSQL_PWD = $state.DbRootPassword
-        & cmd.exe /c "`"$MariaDb`" -uroot plus < `"$sqlFile`" 2>> `"$Log`""
+        & cmd.exe /c "`"$MariaDb`" -uroot --skip-ssl plus < `"$sqlFile`" 2>> `"$Log`""
         $code = $LASTEXITCODE
         Remove-Item Env:\MYSQL_PWD
         if ($code -ne 0) { throw 'Importing the database failed.' }
@@ -459,7 +460,6 @@ function Start-Emulator {
     $json.Nitro.Hostname = '127.0.0.1'; $json.Nitro.Port = 2096; $json.Nitro.Name = 'Octane'
     $json.Rcon.Hostname = '127.0.0.1'; $json.Rcon.Port = 30001; $json.Rcon.AllowedAddresses = @('127.0.0.1', 'localhost')
     $json.AuthApi.Enabled = $false; $json.AuthApi.Hostname = '127.0.0.1'
-    $json.FurniEditor.FurnidataPath = "$HotelRoot\hotel-files\gamedata\FurnitureData.json"
     Write-Utf8 $config ($json | ConvertTo-Json -Depth 20)
     # Every packet is logged at Trace level by default, which floods the log.
     $nlog = "$out\Config\nlog.config"
@@ -660,7 +660,7 @@ function Set-IisSite {
     Run icacls.exe "$HotelRoot\cms\.env" /inheritance:r /grant:r 'Administrators:F' 'SYSTEM:F' "IIS AppPool\$($pool):R"
     Run icacls.exe "$HotelRoot\emulator\Config" /inheritance:r /grant:r 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F'
     Start-Website -Name $site -ErrorAction SilentlyContinue
-    Restart-WebAppPool -Name $pool -ErrorAction SilentlyContinue
+    if ((Get-WebAppPoolState -Name $pool).Value -eq 'Started') { Restart-WebAppPool -Name $pool } else { Start-WebAppPool -Name $pool }
     Ok "IIS serves https://$domain"
 
     foreach ($port in 80, 443) {
