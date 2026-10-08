@@ -22,7 +22,9 @@ $AssetPackUrl    = Get-Setting 'ASSET_PACK_URL' 'https://github.com/plus-emulato
 $EmulatorUrl     = Get-Setting 'EMULATOR_URL' 'https://github.com/plus-emulator/PlusEMU/releases/latest/download/plusemu-win-x64.zip'
 $ClientUrl       = Get-Setting 'CLIENT_URL' 'https://github.com/plus-emulator/Octane/releases/latest/download/octane-client.zip'
 $AtomRepo        = Get-Setting 'ATOM_REPO' 'https://github.com/atom-projects/atom-cms.git'
-$AtomBranch      = Get-Setting 'ATOM_BRANCH' 'dev'
+# Atom must match the emulator release's schema. This commit predates atom-cms#3 (user_currencies),
+# which needs PlusEMU migration 59; move back to dev once the PlusEMU release includes it.
+$AtomRef         = Get-Setting 'ATOM_REF' 'e9918ed69d4f255511623d69a47e9b2f8e200a28'
 
 $HotelRoot  = 'C:\Hotel'
 $StateDir   = 'C:\ProgramData\PlusEMU'
@@ -122,14 +124,15 @@ function Set-EnvValue($File, $Key, $Value) {
     [IO.File]::WriteAllLines($File, $lines, (New-Object Text.UTF8Encoding $false))
 }
 
-function Clone($Repo, $Branch, $Dir) {
-    if (Test-Path "$Dir\.git") {
-        Run git -C $Dir fetch --depth 1 origin $Branch
-        Run git -C $Dir reset --hard FETCH_HEAD
-    } else {
+function Clone($Repo, $Ref, $Dir) {
+    # Shallow checkout of exactly that branch or commit.
+    if (-not (Test-Path "$Dir\.git")) {
         if (Test-Path $Dir) { Remove-Item $Dir -Recurse -Force }
-        Run git clone --depth 1 --branch $Branch $Repo $Dir
+        Run git init -q $Dir
+        Run git -C $Dir remote add origin $Repo
     }
+    Run git -C $Dir fetch --depth 1 origin $Ref
+    Run git -C $Dir reset -q --hard FETCH_HEAD
 }
 
 function Sql([string]$Query, [string]$Database = '') {
@@ -373,8 +376,8 @@ function Get-Releases {
     $client = "$HotelRoot\client"
     if (Test-Path "$client\index.html") {
         Ok 'Octane client (already installed)'
-        Clone $AtomRepo $AtomBranch "$HotelRoot\cms"
-        Ok "Atom CMS ($AtomBranch)"
+        Clone $AtomRepo $AtomRef "$HotelRoot\cms"
+        Ok "Atom CMS ($($AtomRef.Substring(0, [Math]::Min(12, $AtomRef.Length))))"
         return
     }
     Download $ClientUrl "$Downloads\octane-client.zip"
@@ -388,8 +391,8 @@ function Get-Releases {
     Copy-Item "$client\configuration\adsense.example" "$client\configuration\adsense.json"
     Ok 'Octane client (latest release)'
 
-    Clone $AtomRepo $AtomBranch "$HotelRoot\cms"
-    Ok "Atom CMS ($AtomBranch)"
+    Clone $AtomRepo $AtomRef "$HotelRoot\cms"
+    Ok "Atom CMS ($($AtomRef.Substring(0, [Math]::Min(12, $AtomRef.Length))))"
 }
 
 function Initialize-HotelDatabase {

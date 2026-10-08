@@ -19,7 +19,9 @@ ASSET_PACK_URL=${ASSET_PACK_URL:-https://github.com/plus-emulator/plusemu-instal
 EMULATOR_URL=${EMULATOR_URL:-https://github.com/plus-emulator/PlusEMU/releases/latest/download/plusemu-linux-ARCH.tar.gz}
 CLIENT_URL=${CLIENT_URL:-https://github.com/plus-emulator/Octane/releases/latest/download/octane-client.zip}
 ATOM_REPO=${ATOM_REPO:-https://github.com/atom-projects/atom-cms.git}
-ATOM_BRANCH=${ATOM_BRANCH:-dev}
+# Atom must match the emulator release's schema. This commit predates atom-cms#3 (user_currencies),
+# which needs PlusEMU migration 59; move back to dev once the PlusEMU release includes it.
+ATOM_REF=${ATOM_REF:-e9918ed69d4f255511623d69a47e9b2f8e200a28}
 
 HOTEL_ROOT=/var/www/hotel
 STATE_FILE=/etc/plusemu/hotel.env
@@ -91,13 +93,14 @@ set_env() { # set_env <file> <KEY> <value>: replace or append KEY=value in a .en
     fi
 }
 
-clone() { # clone <repo> <branch> <dir>: fresh shallow clone, or fast-forward an existing one
-    if [ -d "$3/.git" ]; then
-        git -C "$3" fetch --depth 1 origin "$2" && git -C "$3" reset --hard FETCH_HEAD
-    else
+clone() { # clone <repo> <branch or commit> <dir>: shallow checkout of exactly that ref
+    if [ ! -d "$3/.git" ]; then
         rm -rf "$3"
-        git clone --depth 1 --branch "$2" "$1" "$3"
+        git init -q "$3"
+        git -C "$3" remote add origin "$1"
     fi
+    git -C "$3" fetch --depth 1 origin "$2"
+    git -C "$3" reset -q --hard FETCH_HEAD
 }
 
 sql() { mariadb --protocol=socket -uroot "$@"; }
@@ -310,8 +313,8 @@ download_releases() {
     local client=$HOTEL_ROOT/client zip
     if [ -f "$client/index.html" ]; then
         ok "Octane client (already installed)"
-        clone "$ATOM_REPO" "$ATOM_BRANCH" "$HOTEL_ROOT/cms"
-        ok "Atom CMS ($ATOM_BRANCH)"
+        clone "$ATOM_REPO" "$ATOM_REF" "$HOTEL_ROOT/cms"
+        ok "Atom CMS (${ATOM_REF:0:12})"
         return
     fi
     zip=$(mktemp)
@@ -330,8 +333,8 @@ download_releases() {
     rm -rf "$client.old"
     ok "Octane client (latest release)"
 
-    clone "$ATOM_REPO" "$ATOM_BRANCH" "$HOTEL_ROOT/cms"
-    ok "Atom CMS ($ATOM_BRANCH)"
+    clone "$ATOM_REPO" "$ATOM_REF" "$HOTEL_ROOT/cms"
+    ok "Atom CMS (${ATOM_REF:0:12})"
 }
 
 setup_database() {
