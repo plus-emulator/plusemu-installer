@@ -25,7 +25,7 @@
 	"logout.redirect.url": "https://{{DOMAIN}}", 
     "external.texts.translation.url": "${gamedata.url}/text_translate/ExternalTexts_%locale%.json?t=%timestamp%",
     "external.samples.url": "${hof.furni.url}/mp3/sound_machine_sample_%sample%.mp3",
-    "furnidata.url": "${gamedata.url}/FurnitureData.json?t=%timestamp%",
+    "furnidata.url": "{{FURNIDATA_URL}}",
     "furnidata.translation.url": "${gamedata.url}/furniture_translate/FurnitureData_%locale%.json?t=%timestamp%",
     "productdata.url": "${gamedata.url}/ProductData.json?t=%timestamp%",
     "avatar.actions.url": "${gamedata.url}/HabboAvatarActions.json?t=%timestamp%",

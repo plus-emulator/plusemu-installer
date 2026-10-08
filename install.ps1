@@ -22,9 +22,8 @@ $AssetPackUrl    = Get-Setting 'ASSET_PACK_URL' 'https://github.com/plus-emulato
 $EmulatorUrl     = Get-Setting 'EMULATOR_URL' 'https://github.com/plus-emulator/PlusEMU/releases/latest/download/plusemu-win-x64.zip'
 $ClientUrl       = Get-Setting 'CLIENT_URL' 'https://github.com/plus-emulator/Octane/releases/latest/download/octane-client.zip'
 $AtomRepo        = Get-Setting 'ATOM_REPO' 'https://github.com/atom-projects/atom-cms.git'
-# Atom must match the emulator release's schema. This commit predates atom-cms#3 (user_currencies),
-# which needs PlusEMU migration 59; move back to dev once the PlusEMU release includes it.
-$AtomRef         = Get-Setting 'ATOM_REF' 'e9918ed69d4f255511623d69a47e9b2f8e200a28'
+# "auto" picks the Atom CMS that matches the downloaded emulator's database (see Get-Releases).
+$AtomRef         = Get-Setting 'ATOM_REF' 'auto'
 
 $HotelRoot  = 'C:\Hotel'
 $StateDir   = 'C:\ProgramData\PlusEMU'
@@ -376,23 +375,37 @@ function Get-Releases {
     $client = "$HotelRoot\client"
     if (Test-Path "$client\index.html") {
         Ok 'Octane client (already installed)'
-        Clone $AtomRepo $AtomRef "$HotelRoot\cms"
-        Ok "Atom CMS ($($AtomRef.Substring(0, [Math]::Min(12, $AtomRef.Length))))"
-        return
+    } else {
+        Download $ClientUrl "$Downloads\octane-client.zip"
+        if (Test-Path $client) { Remove-Item $client -Recurse -Force }
+        Expand-Archive "$Downloads\octane-client.zip" $client
+        Write-Utf8 "$client\configuration\news.json" '[]'
+        Copy-Item "$client\configuration\adsense.example" "$client\configuration\adsense.json"
+        Ok 'Octane client (latest release)'
     }
-    Download $ClientUrl "$Downloads\octane-client.zip"
-    if (Test-Path $client) { Remove-Item $client -Recurse -Force }
-    Expand-Archive "$Downloads\octane-client.zip" $client
-    $values = @{ DOMAIN = $state.Domain; SOCKET_URL = $state.WsUrl }
-    foreach ($file in 'renderer-config.json', 'ui-config.json', 'client-mode.json') {
-        Render "$Templates\$file" "$client\configuration\$file" $values
-    }
-    Write-Utf8 "$client\configuration\news.json" '[]'
-    Copy-Item "$client\configuration\adsense.example" "$client\configuration\adsense.json"
-    Ok 'Octane client (latest release)'
 
-    Clone $AtomRepo $AtomRef "$HotelRoot\cms"
-    Ok "Atom CMS ($($AtomRef.Substring(0, [Math]::Min(12, $AtomRef.Length))))"
+    $atom = $AtomRef
+    if ($atom -eq 'auto') {
+        # Atom's dev branch reads user_currencies (PlusEMU migration 59); older emulator
+        # releases need the last Atom commit before that.
+        $atom = 'e9918ed69d4f255511623d69a47e9b2f8e200a28'
+        if (Select-String -Path "$out\Database\FreshInstall.sql" -Pattern 'CREATE TABLE `user_currencies`' -SimpleMatch -Quiet) { $atom = 'dev' }
+    }
+    Clone $AtomRepo $atom "$HotelRoot\cms"
+    Ok "Atom CMS ($($atom.Substring(0, [Math]::Min(12, $atom.Length))))"
+}
+
+function Write-ClientConfig {
+    # Newer emulators build FurnitureData.json from the furniture table; older ones need the static file.
+    $furnidata = '${gamedata.url}/FurnitureData.json?t=%timestamp%'
+    try {
+        Invoke-WebRequest 'http://127.0.0.1:8080/api/gamedata/furnidata' -UseBasicParsing -TimeoutSec 30 | Out-Null
+        $furnidata = "https://$($state.Domain)/api/gamedata/furnidata"
+    } catch { }
+    $values = @{ DOMAIN = $state.Domain; SOCKET_URL = $state.WsUrl; FURNIDATA_URL = $furnidata }
+    foreach ($file in 'renderer-config.json', 'ui-config.json', 'client-mode.json') {
+        Render "$Templates\$file" "$HotelRoot\client\configuration\$file" $values
+    }
 }
 
 function Initialize-HotelDatabase {
@@ -612,9 +625,10 @@ function Set-IisSite {
 '@
 
     # Global rules run before Atom's own web.config rules: send www to the main
-    # domain, and hand the game's WebSocket to the emulator (only from the hotel's own pages).
+    # domain, and hand the game's WebSocket and the emulator's two web endpoints
+    # (furnidata built from the furniture table, badge rarity) to the emulator.
     $rules = 'system.webServer/rewrite/globalRules'
-    foreach ($name in 'PlusEMU www', 'PlusEMU websocket') {
+    foreach ($name in 'PlusEMU www', 'PlusEMU websocket', 'PlusEMU endpoints') {
         if (Get-WebConfiguration -PSPath $apphost -Filter "$rules/rule[@name='$name']") { Clear-WebConfiguration -PSPath $apphost -Filter "$rules/rule[@name='$name']" }
     }
     Add-WebConfigurationProperty -PSPath $apphost -Filter $rules -Name '.' -Value @{ name = 'PlusEMU www'; stopProcessing = 'True' }
@@ -632,6 +646,13 @@ function Set-IisSite {
     $action = "$rules/rule[@name='PlusEMU websocket']/action"
     Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'type' -Value 'Rewrite'
     Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'url' -Value 'http://127.0.0.1:2096/'
+
+    Add-WebConfigurationProperty -PSPath $apphost -Filter $rules -Name '.' -Value @{ name = 'PlusEMU endpoints'; stopProcessing = 'True' }
+    Set-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU endpoints']/match" -Name 'url' -Value '^api/(gamedata/furnidata|badges/leaderboard)$'
+    Add-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU endpoints']/conditions" -Name '.' -Value @{ input = '{HTTP_HOST}'; pattern = "^$([regex]::Escape($domain))$" }
+    $action = "$rules/rule[@name='PlusEMU endpoints']/action"
+    Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'type' -Value 'Rewrite'
+    Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'url' -Value 'http://127.0.0.1:8080/api/{R:1}'
 
     # IIS needs to read the website and client, and write Atom's storage and cache.
     foreach ($dir in 'cms', 'client', 'hotel-files') { Run icacls.exe "$HotelRoot\$dir" /grant 'IIS_IUSRS:(OI)(CI)RX' 'IUSR:(OI)(CI)RX' /Q }
@@ -695,6 +716,7 @@ try {
     Initialize-HotelDatabase
     Get-HotelFiles
     Start-Emulator
+    Write-ClientConfig
     Install-Cms
     Set-IisSite
     Write-Guide

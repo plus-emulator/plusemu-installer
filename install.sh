@@ -19,9 +19,8 @@ ASSET_PACK_URL=${ASSET_PACK_URL:-https://github.com/plus-emulator/plusemu-instal
 EMULATOR_URL=${EMULATOR_URL:-https://github.com/plus-emulator/PlusEMU/releases/latest/download/plusemu-linux-ARCH.tar.gz}
 CLIENT_URL=${CLIENT_URL:-https://github.com/plus-emulator/Octane/releases/latest/download/octane-client.zip}
 ATOM_REPO=${ATOM_REPO:-https://github.com/atom-projects/atom-cms.git}
-# Atom must match the emulator release's schema. This commit predates atom-cms#3 (user_currencies),
-# which needs PlusEMU migration 59; move back to dev once the PlusEMU release includes it.
-ATOM_REF=${ATOM_REF:-e9918ed69d4f255511623d69a47e9b2f8e200a28}
+# "auto" picks the Atom CMS that matches the downloaded emulator's database (see download_releases).
+ATOM_REF=${ATOM_REF:-auto}
 
 HOTEL_ROOT=/var/www/hotel
 STATE_FILE=/etc/plusemu/hotel.env
@@ -75,7 +74,7 @@ random_secret() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "${1:-32}" || true
 render() { # render <template> <output>: replace {{KEY}} with the shell variable KEY
     local content key
     content=$(< "$1")
-    for key in DOMAIN SOCKET_URL SERVER_IP WS_HOST HOTEL_NAME ADMIN_USER ADMIN_EMAIL \
+    for key in DOMAIN SOCKET_URL FURNIDATA_URL SERVER_IP WS_HOST HOTEL_NAME ADMIN_USER ADMIN_EMAIL \
         CREDENTIALS_FILE RESTART_COMMAND LOG_COMMAND WS_DNS_ROW; do
         content=${content//"{{$key}}"/${!key-}}
     done
@@ -313,28 +312,43 @@ download_releases() {
     local client=$HOTEL_ROOT/client zip
     if [ -f "$client/index.html" ]; then
         ok "Octane client (already installed)"
-        clone "$ATOM_REPO" "$ATOM_REF" "$HOTEL_ROOT/cms"
-        ok "Atom CMS (${ATOM_REF:0:12})"
-        return
+    else
+        zip=$(mktemp)
+        curl -fsSL --retry 3 "$CLIENT_URL" -o "$zip"
+        rm -rf "$client.new" && mkdir -p "$client.new"
+        unzip -q "$zip" -d "$client.new"
+        rm -f "$zip"
+        echo '[]' > "$client.new/configuration/news.json"
+        cp "$client.new/configuration/adsense.example" "$client.new/configuration/adsense.json"
+        rm -rf "$client.old"
+        if [ -d "$client" ]; then mv "$client" "$client.old"; fi
+        mv "$client.new" "$client"
+        rm -rf "$client.old"
+        ok "Octane client (latest release)"
     fi
-    zip=$(mktemp)
-    curl -fsSL --retry 3 "$CLIENT_URL" -o "$zip"
-    rm -rf "$client.new" && mkdir -p "$client.new"
-    unzip -q "$zip" -d "$client.new"
-    rm -f "$zip"
-    render "$TEMPLATES/renderer-config.json" "$client.new/configuration/renderer-config.json"
-    render "$TEMPLATES/ui-config.json" "$client.new/configuration/ui-config.json"
-    render "$TEMPLATES/client-mode.json" "$client.new/configuration/client-mode.json"
-    echo '[]' > "$client.new/configuration/news.json"
-    cp "$client.new/configuration/adsense.example" "$client.new/configuration/adsense.json"
-    rm -rf "$client.old"
-    if [ -d "$client" ]; then mv "$client" "$client.old"; fi
-    mv "$client.new" "$client"
-    rm -rf "$client.old"
-    ok "Octane client (latest release)"
 
-    clone "$ATOM_REPO" "$ATOM_REF" "$HOTEL_ROOT/cms"
-    ok "Atom CMS (${ATOM_REF:0:12})"
+    local atom=$ATOM_REF
+    if [ "$atom" = auto ]; then
+        # Atom's dev branch reads user_currencies (PlusEMU migration 59); older emulator
+        # releases need the last Atom commit before that.
+        atom=e9918ed69d4f255511623d69a47e9b2f8e200a28
+        if grep -q 'CREATE TABLE `user_currencies`' "$out/Database/FreshInstall.sql"; then atom=dev; fi
+    fi
+    clone "$ATOM_REPO" "$atom" "$HOTEL_ROOT/cms"
+    ok "Atom CMS (${atom:0:12})"
+}
+
+# shellcheck disable=SC2034 # the {{KEY}} values are read by render() through ${!key}
+write_client_config() {
+    # Newer emulators build FurnitureData.json from the furniture table; older ones need the static file.
+    FURNIDATA_URL='${gamedata.url}/FurnitureData.json?t=%timestamp%'
+    if curl -fsS -o /dev/null http://127.0.0.1:8080/api/gamedata/furnidata; then
+        FURNIDATA_URL="https://$DOMAIN/api/gamedata/furnidata"
+    fi
+    local config=$HOTEL_ROOT/client/configuration file
+    for file in renderer-config.json ui-config.json client-mode.json; do
+        render "$TEMPLATES/$file" "$config/$file"
+    done
 }
 
 setup_database() {
@@ -636,6 +650,10 @@ $ws_main
     location = /client { return 301 /client/; }
     location = /ads.txt { alias $HOTEL_ROOT/client/ads.txt; }
 
+    # Answered by the emulator: FurnitureData.json built from the furniture table, and badge rarity.
+    location = /api/gamedata/furnidata { proxy_pass http://127.0.0.1:8080; }
+    location = /api/badges/leaderboard { proxy_pass http://127.0.0.1:8080; }
+
     # Furniture, clothes, badges and texts.
     location /hotel-files/ {
         alias $HOTEL_ROOT/hotel-files/;
@@ -720,6 +738,7 @@ main() {
     setup_database
     download_hotel_files
     start_emulator
+    write_client_config
     install_cms
     configure_web
     write_guide
