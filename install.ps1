@@ -382,8 +382,6 @@ function Get-Releases {
         try { Download $ClientUrl "$Downloads\volt-client.zip" } catch { Download $LegacyClientUrl "$Downloads\volt-client.zip" }
         if (Test-Path $client) { Remove-Item $client -Recurse -Force }
         Expand-Archive "$Downloads\volt-client.zip" $client
-        Write-Utf8 "$client\configuration\news.json" '[]'
-        Copy-Item "$client\configuration\adsense.example" "$client\configuration\adsense.json"
         Ok 'Volt client (latest release)'
     }
 
@@ -461,7 +459,6 @@ function Start-Emulator {
     $json.Flash.Hostname = '127.0.0.1'
     $json.Nitro.Hostname = '127.0.0.1'; $json.Nitro.Port = 2096; $json.Nitro.Name = 'Volt'
     $json.Rcon.Hostname = '127.0.0.1'; $json.Rcon.Port = 30001; $json.Rcon.AllowedAddresses = @('127.0.0.1', 'localhost')
-    $json.AuthApi.Enabled = $false; $json.AuthApi.Hostname = '127.0.0.1'
     Write-Utf8 $config ($json | ConvertTo-Json -Depth 20)
     # Every packet is logged at Trace level by default, which floods the log.
     $nlog = "$out\Config\nlog.config"

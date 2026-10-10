@@ -1,4 +1,8 @@
 {
+    "landing.view.background_gradient_top.uri": "",
+    "landing.view.background_gradient.uri": "",
+    "landing.view.background_left.uri": "",
+    "landing.view.background_right.uri": "",
     "currencyiconstyle.big.101.combo": 55,
     "currencyiconstyle.big.102.combo": 40,
     "currencyiconstyle.big.104.combo": 48,
@@ -72,7 +76,6 @@
     "seasonalcurrencyindicator.currency": 101,
     "seasonalcurrencyindicator.enabled": true,
     "seasonalcurrencyindicator.page": "mar26sc",
-    "auth.enabled": false,
     "image.library.notifications.url": "${image.library.url}notifications/%image%.png",
     "achievements.images.url": "${image.library.url}Quests/%image%.png",
     "camera.url": "http://localhost:3000/camera/photo/",
@@ -124,67 +127,12 @@
     "games.highscores.windowSize": 50,
     "snowstorm.settings.show_user_names": true,
     "hotel_alert_animated": false,
-    "radio_ui.enabled": false,
     "guides.enabled": true,
-    "housekeeping.enabled": true,
     "buildersclub.enabled": true,
     "toolbar.hide.quests": true,
     "toolbar.buildersclub.enabled": true,
-    "toolbar.rarevalues.enabled": true,
     "show.google.ads": false,
     "catalog.classic.style": false,
-    "loginview": {
-        "images": {
-            "background": "${asset.url}/c_images/reception/stretch_blue.png",
-            "background.colour": "#6eadc8",
-            "sun": "${asset.url}/c_images/reception/sun.png",
-            "drape": "${asset.url}/c_images/reception/drape.png",
-            "left": "${asset.url}/c_images/reception/ts.png",
-            "right": "${asset.url}/c_images/reception/US_right.png",
-            "right.repeat": "${asset.url}/c_images/reception/US_top_right.png"
-        }
-    },
-    "hotelview": {
-        "room.pool": "791",
-        "room.picnic": "2193",
-        "room.rooftop": "",
-        "room.rooftop.pool": "",
-        "room.peaceful": "",
-        "room.infobus": "5956",
-        "room.lobby": "1450",
-        "show.avatar": true,
-        "widgets": {
-            "slot.1.widget": "",
-            "slot.1.conf": {},
-            "slot.2.widget": "",
-            "slot.2.conf": {
-                "image": "",
-                "texts": "",
-                "btnLink": ""
-            },
-            "slot.3.widget": "",
-            "slot.3.conf": {},
-            "slot.4.widget": "",
-            "slot.4.conf": {},
-            "slot.5.widget": "",
-            "slot.5.conf": {},
-            "slot.6.widget": "",
-            "slot.6.conf": {
-                "campaign": ""
-            },
-            "slot.7.widget": "",
-            "slot.7.conf": {}
-        },
-        "images": {
-            "background": "${asset.url}/images/reception/stretch_blue.png",
-            "background.colour": "#8ee0f0",
-            "sun": "${asset.url}/images/reception/sun.png",
-            "drape": "${asset.url}/images/reception/drape.png",
-            "left": "",
-            "right": "",
-            "right.repeat": ""
-        }
-    },
     "achievements.unseen.ignored": [
         "ACH_AllTimeHotelPresence"
     ],
