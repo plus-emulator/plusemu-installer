@@ -320,8 +320,6 @@ download_releases() {
         rm -rf "$client.new" && mkdir -p "$client.new"
         unzip -q "$zip" -d "$client.new"
         rm -f "$zip"
-        echo '[]' > "$client.new/configuration/news.json"
-        cp "$client.new/configuration/adsense.example" "$client.new/configuration/adsense.json"
         rm -rf "$client.old"
         if [ -d "$client" ]; then mv "$client" "$client.old"; fi
         mv "$client.new" "$client"
@@ -404,8 +402,7 @@ start_emulator() {
         | .Database.Password = $pass | .Database.Name = "plus"
         | .Flash.Hostname = "127.0.0.1"
         | .Nitro.Hostname = "127.0.0.1" | .Nitro.Port = 2096 | .Nitro.Name = "Volt"
-        | .Rcon.Hostname = "127.0.0.1" | .Rcon.Port = 30001 | .Rcon.AllowedAddresses = ["127.0.0.1", "localhost"]
-        | .AuthApi.Enabled = false | .AuthApi.Hostname = "127.0.0.1"' "$config" > "$config.new"
+        | .Rcon.Hostname = "127.0.0.1" | .Rcon.Port = 30001 | .Rcon.AllowedAddresses = ["127.0.0.1", "localhost"]' "$config" > "$config.new"
     mv "$config.new" "$config"
     chmod 600 "$config"
     chown -R plusemu:plusemu "$out"
