@@ -476,8 +476,11 @@ function Start-Emulator {
         Run sc.exe config PlusEMU start= auto depend= MariaDB DisplayName= 'PlusEMU hotel emulator'
     }
     Restart-Service PlusEMU
+    # Any HTTP answer from the emulator's web server means it has started; releases differ in their routes.
     for ($i = 0; $i -lt 60; $i++) {
-        try { Invoke-RestMethod 'http://127.0.0.1:8080/api/health' -TimeoutSec 2 | Out-Null; Ok 'The emulator is running (service: PlusEMU)'; return } catch { Start-Sleep 2 }
+        try { Invoke-WebRequest 'http://127.0.0.1:8080/api/gamedata/furnidata/version' -UseBasicParsing -TimeoutSec 2 | Out-Null; $up = $true } catch { $up = $null -ne $_.Exception.Response }
+        if ($up) { Ok 'The emulator is running (service: PlusEMU)'; return }
+        Start-Sleep 2
     }
     throw "The emulator didn't start. See $out\service\shawl_for_PlusEMU_rCURRENT.log"
 }

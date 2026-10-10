@@ -431,8 +431,9 @@ EOF
     systemctl daemon-reload
     systemctl enable plusemu
     systemctl restart plusemu
+    # Any HTTP answer from the emulator's web server means it has started; releases differ in their routes.
     for _ in $(seq 1 60); do
-        if curl -fsS http://127.0.0.1:8080/api/health > /dev/null 2>&1; then
+        if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/gamedata/furnidata/version)" != 000 ]; then
             ok "The emulator is running (service: plusemu)"
             return
         fi
