@@ -3,7 +3,7 @@
 #   Open PowerShell as Administrator and run:
 #   irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.ps1 | iex
 #
-# Installs and wires together: PlusEMU (emulator, as a Windows service) and Octane
+# Installs and wires together: PlusEMU (emulator, as a Windows service) and Volt
 # (client) from their latest GitHub releases, Atom CMS (website), MariaDB, PHP,
 # IIS and the hotel files. Everything is self-hosted on this server; Cloudflare
 # sits in front. Safe to run again: settings are reused and finished steps are kept.
@@ -20,7 +20,9 @@ $InstallerRepo   = Get-Setting 'INSTALLER_REPO' 'plus-emulator/plusemu-installer
 $InstallerRef    = Get-Setting 'INSTALLER_REF' 'main'
 $AssetPackUrl    = Get-Setting 'ASSET_PACK_URL' 'https://github.com/plus-emulator/plusemu-installer/releases/latest/download/hotel-files.tar.gz'
 $EmulatorUrl     = Get-Setting 'EMULATOR_URL' 'https://github.com/plus-emulator/PlusEMU/releases/latest/download/plusemu-win-x64.zip'
-$ClientUrl       = Get-Setting 'CLIENT_URL' 'https://github.com/plus-emulator/Octane/releases/latest/download/octane-client.zip'
+$ClientUrl       = Get-Setting 'CLIENT_URL' 'https://github.com/plus-emulator/Volt/releases/latest/download/volt-client.zip'
+# Client releases made before the Volt rename ship the same build as octane-client.zip.
+$LegacyClientUrl = 'https://github.com/plus-emulator/Volt/releases/latest/download/octane-client.zip'
 $AtomRepo        = Get-Setting 'ATOM_REPO' 'https://github.com/atom-projects/atom-cms.git'
 # "auto" picks the Atom CMS that matches the downloaded emulator's database (see Get-Releases).
 $AtomRef         = Get-Setting 'ATOM_REF' 'auto'
@@ -361,7 +363,7 @@ function Install-Database {
 }
 
 function Get-Releases {
-    Step 'Downloading PlusEMU, the Octane client and Atom CMS'
+    Step 'Downloading PlusEMU, the Volt client and Atom CMS'
     # A re-run repairs and keeps the installed releases: a newer emulator may need
     # database changes this installer does not apply.
     $out = "$HotelRoot\emulator"
@@ -375,14 +377,14 @@ function Get-Releases {
 
     $client = "$HotelRoot\client"
     if (Test-Path "$client\index.html") {
-        Ok 'Octane client (already installed)'
+        Ok 'Volt client (already installed)'
     } else {
-        Download $ClientUrl "$Downloads\octane-client.zip"
+        try { Download $ClientUrl "$Downloads\volt-client.zip" } catch { Download $LegacyClientUrl "$Downloads\volt-client.zip" }
         if (Test-Path $client) { Remove-Item $client -Recurse -Force }
-        Expand-Archive "$Downloads\octane-client.zip" $client
+        Expand-Archive "$Downloads\volt-client.zip" $client
         Write-Utf8 "$client\configuration\news.json" '[]'
         Copy-Item "$client\configuration\adsense.example" "$client\configuration\adsense.json"
-        Ok 'Octane client (latest release)'
+        Ok 'Volt client (latest release)'
     }
 
     $atom = $AtomRef
@@ -457,7 +459,7 @@ function Start-Emulator {
     $json.Database.Hostname = '127.0.0.1'; $json.Database.Port = 3306; $json.Database.Username = 'hotel'
     $json.Database.Password = $state.DbPassword; $json.Database.Name = 'plus'
     $json.Flash.Hostname = '127.0.0.1'
-    $json.Nitro.Hostname = '127.0.0.1'; $json.Nitro.Port = 2096; $json.Nitro.Name = 'Octane'
+    $json.Nitro.Hostname = '127.0.0.1'; $json.Nitro.Port = 2096; $json.Nitro.Name = 'Volt'
     $json.Rcon.Hostname = '127.0.0.1'; $json.Rcon.Port = 30001; $json.Rcon.AllowedAddresses = @('127.0.0.1', 'localhost')
     $json.AuthApi.Enabled = $false; $json.AuthApi.Hostname = '127.0.0.1'
     Write-Utf8 $config ($json | ConvertTo-Json -Depth 20)

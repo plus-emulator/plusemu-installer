@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash
 #
-# Installs and wires together: PlusEMU (emulator) and Octane (client) from their
+# Installs and wires together: PlusEMU (emulator) and Volt (client) from their
 # latest GitHub releases, Atom CMS (website), MariaDB, PHP, nginx and the hotel
 # files. Everything is self-hosted on this server; Cloudflare sits in front.
 # Safe to run again: settings are reused and finished steps are kept.
@@ -17,7 +17,9 @@ INSTALLER_REPO=${INSTALLER_REPO:-plus-emulator/plusemu-installer}
 INSTALLER_REF=${INSTALLER_REF:-main}
 ASSET_PACK_URL=${ASSET_PACK_URL:-https://github.com/plus-emulator/plusemu-installer/releases/latest/download/hotel-files.tar.gz}
 EMULATOR_URL=${EMULATOR_URL:-https://github.com/plus-emulator/PlusEMU/releases/latest/download/plusemu-linux-ARCH.tar.gz}
-CLIENT_URL=${CLIENT_URL:-https://github.com/plus-emulator/Octane/releases/latest/download/octane-client.zip}
+CLIENT_URL=${CLIENT_URL:-https://github.com/plus-emulator/Volt/releases/latest/download/volt-client.zip}
+# Client releases made before the Volt rename ship the same build as octane-client.zip.
+LEGACY_CLIENT_URL=https://github.com/plus-emulator/Volt/releases/latest/download/octane-client.zip
 ATOM_REPO=${ATOM_REPO:-https://github.com/atom-projects/atom-cms.git}
 # "auto" picks the Atom CMS that matches the downloaded emulator's database (see download_releases).
 ATOM_REF=${ATOM_REF:-auto}
@@ -297,7 +299,7 @@ install_toolchains() {
 }
 
 download_releases() {
-    step "Downloading PlusEMU, the Octane client and Atom CMS"
+    step "Downloading PlusEMU, the Volt client and Atom CMS"
     # A re-run repairs and keeps the installed releases: a newer emulator may need
     # database changes this installer does not apply.
     local out=$HOTEL_ROOT/emulator
@@ -311,10 +313,10 @@ download_releases() {
 
     local client=$HOTEL_ROOT/client zip
     if [ -f "$client/index.html" ]; then
-        ok "Octane client (already installed)"
+        ok "Volt client (already installed)"
     else
         zip=$(mktemp)
-        curl -fsSL --retry 3 "$CLIENT_URL" -o "$zip"
+        curl -fsSL --retry 3 "$CLIENT_URL" -o "$zip" 2> /dev/null || curl -fsSL --retry 3 "$LEGACY_CLIENT_URL" -o "$zip"
         rm -rf "$client.new" && mkdir -p "$client.new"
         unzip -q "$zip" -d "$client.new"
         rm -f "$zip"
@@ -324,7 +326,7 @@ download_releases() {
         if [ -d "$client" ]; then mv "$client" "$client.old"; fi
         mv "$client.new" "$client"
         rm -rf "$client.old"
-        ok "Octane client (latest release)"
+        ok "Volt client (latest release)"
     fi
 
     local atom=$ATOM_REF
@@ -401,7 +403,7 @@ start_emulator() {
         .Database.Hostname = "127.0.0.1" | .Database.Port = 3306 | .Database.Username = "hotel"
         | .Database.Password = $pass | .Database.Name = "plus"
         | .Flash.Hostname = "127.0.0.1"
-        | .Nitro.Hostname = "127.0.0.1" | .Nitro.Port = 2096 | .Nitro.Name = "Octane"
+        | .Nitro.Hostname = "127.0.0.1" | .Nitro.Port = 2096 | .Nitro.Name = "Volt"
         | .Rcon.Hostname = "127.0.0.1" | .Rcon.Port = 30001 | .Rcon.AllowedAddresses = ["127.0.0.1", "localhost"]
         | .AuthApi.Enabled = false | .AuthApi.Hostname = "127.0.0.1"' "$config" > "$config.new"
     mv "$config.new" "$config"
@@ -638,7 +640,7 @@ server {
 
 $ws_main
 
-    # The game client (Octane). Hashed bundles never change; config is re-read every load.
+    # The game client (Volt). Hashed bundles never change; config is re-read every load.
     location /client/ {
         alias $HOTEL_ROOT/client/;
         index index.html;
