@@ -109,6 +109,22 @@ function New-Secret($Length) {
     return -join ($bytes | ForEach-Object { $chars[$_ % $chars.Length] })
 }
 
+# Atom requires at least 12 characters, mixed case, a number and a symbol.
+# Keep the 16 random characters; database passwords remain alphanumeric.
+function New-AdminPassword { return (New-Secret 16) + 'Aa1!' }
+
+function Repair-AdminPassword {
+    # Only called while CMS setup is incomplete; never rotate an installed login.
+    $password = $state.AdminPassword
+    if ($password.Length -lt 12 -or $password -cnotmatch '[A-Z]' -or
+        $password -cnotmatch '[a-z]' -or $password -notmatch '[0-9]' -or
+        $password -notmatch '[^a-zA-Z0-9\s]') {
+        $state.AdminPassword = New-AdminPassword
+        $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
+        Say "  Replaced the saved admin password to meet Atom's requirements. Saved in $StateFile."
+    }
+}
+
 function Write-Utf8($Path, $Text) { [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding $false)) }
 
 function Render($Template, $Output, $Values) {
@@ -247,7 +263,7 @@ function Read-Answers {
 
     $script:state = [pscustomobject]@{
         Domain = $domain; WsUrl = $ws; HotelName = $name; AdminUser = $user; AdminEmail = $mail
-        AdminPassword = New-Secret 16; DbPassword = New-Secret 32; DbRootPassword = New-Secret 32
+        AdminPassword = New-AdminPassword; DbPassword = New-Secret 32; DbRootPassword = New-Secret 32
     }
     $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
 }
@@ -515,6 +531,7 @@ function Install-Cms {
 
     $done = Sql 'SELECT COUNT(*) FROM website_installation WHERE completed = 1' 'plus'
     if ("$done".Trim() -ne '1') {
+        Repair-AdminPassword
         $settingsFile = Join-Path $env:TEMP 'atom-settings.json'
         Write-Utf8 $settingsFile (@{ hotel_name = $state.HotelName } | ConvertTo-Json)
         $env:ATOM_ADMIN_EMAIL = $state.AdminEmail; $env:ATOM_ADMIN_PASSWORD = $state.AdminPassword
@@ -701,7 +718,17 @@ function Complete-Install {
     Write-Host '      Username: ' -NoNewline; Write-Host $state.AdminUser -ForegroundColor White
     Write-Host '      Password: ' -NoNewline; Write-Host $state.AdminPassword -ForegroundColor White
     Write-Host ''
-    Write-Host '  Write the password down somewhere safe and change it after logging in.'
+    Write-Host '  MariaDB connection (on this server, or through an SSH tunnel):'
+    Write-Host '      Host: 127.0.0.1    Port: 3306    Database: plus    Username: hotel'
+    Write-Host '      Password: ' -NoNewline; Write-Host $state.DbPassword -ForegroundColor White
+    Write-Host '      Connect locally with mariadb.exe from the MariaDB bin folder:'
+    Write-Host '        mariadb.exe --host=127.0.0.1 --port=3306 --user=hotel --password plus'
+    Write-Host '      Database root username: root'
+    Write-Host '      Database root password: ' -NoNewline; Write-Host $state.DbRootPassword -ForegroundColor White
+    Write-Host ''
+    Write-Host "  Retrieve saved passwords (Administrator PowerShell): Get-Content $StateFile"
+    Write-Host '  Store passwords somewhere safe. Change the initial admin password after logging in;'
+    Write-Host '  the saved file retains the initial password. Keep passwords out of shared logs and screenshots.'
     Write-Host ''
     if ((Get-Setting 'PLUSEMU_YES' '0') -ne '1') { Start-Process "$HotelRoot\setup-guide\index.html" }
 }
@@ -710,6 +737,7 @@ try {
     Test-Prerequisites
     Get-InstallerFiles
     Read-Answers
+    Say "  Admin and database passwords are saved in $StateFile. Retrieve them in Administrator PowerShell: Get-Content $StateFile"
     Get-Derived
     Install-WebServer
     Install-Toolchains
@@ -733,6 +761,7 @@ try {
     }
     Write-Host ''
     Write-Host "  Full log: $Log"
+    if (Test-Path $StateFile) { Write-Host "  Saved passwords: Get-Content $StateFile (Administrator PowerShell; keep this file private)." }
     Write-Host '  Fix the problem (or ask for help on DevBest with the log), then run the installer again.'
     Write-Host '  It continues where it stopped.'
 } finally {

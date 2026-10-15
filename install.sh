@@ -53,6 +53,9 @@ on_error() {
     printf '%s\n' "$last" | sed 's/^/    /' >&3
     say ""
     say "  Full log: ${bold}$LOG${reset}"
+    if [ -f "$STATE_FILE" ]; then
+        say "  Saved passwords: sudo cat $STATE_FILE (keep this file private)."
+    fi
     say "  Fix the problem (or ask for help on DevBest with the log), then run the installer again."
     say "  It continues where it stopped."
     exit "$code"
@@ -72,6 +75,26 @@ ask() { # ask <variable> <question> [default]
 # ---------------------------------------------------------------- helpers
 
 random_secret() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "${1:-32}" || true; }
+
+# Keep database passwords and URL tokens alphanumeric. Atom requires at least
+# 12 characters, mixed case, a number and a symbol; retain 16 random characters.
+admin_password() {
+    local secret
+    secret=$(random_secret 16)
+    [ "${#secret}" -eq 16 ] || return 1
+    printf '%sAa1!' "$secret"
+}
+
+repair_admin_password() {
+    # Only called while CMS setup is incomplete; never rotate an installed login.
+    if [[ ${#ADMIN_PASSWORD} -lt 12 || $ADMIN_PASSWORD != *[A-Z]* ||
+        $ADMIN_PASSWORD != *[a-z]* || $ADMIN_PASSWORD != *[0-9]* ||
+        $ADMIN_PASSWORD != *[^a-zA-Z0-9[:space:]]* ]]; then
+        ADMIN_PASSWORD=$(admin_password)
+        save_state
+        say "  Replaced the saved admin password to meet Atom's requirements. Saved in $STATE_FILE."
+    fi
+}
 
 render() { # render <template> <output>: replace {{KEY}} with the shell variable KEY
     local content key
@@ -107,7 +130,7 @@ clone() { # clone <repo> <branch or commit> <dir>: shallow checkout of exactly t
 sql() { mariadb --protocol=socket -uroot "$@"; }
 
 save_state() {
-    install -d -m 700 /etc/plusemu
+    install -d -m 700 "$(dirname "$STATE_FILE")"
     umask 077
     cat > "$STATE_FILE" <<EOF
 DOMAIN='$DOMAIN'
@@ -119,6 +142,7 @@ ADMIN_PASSWORD='$ADMIN_PASSWORD'
 DB_PASSWORD='$DB_PASSWORD'
 GUIDE_TOKEN='$GUIDE_TOKEN'
 EOF
+    chmod 600 "$STATE_FILE"
     umask 022
 }
 
@@ -214,7 +238,7 @@ ask_questions() {
         say "  ${yellow}That doesn't look like an email address.${reset}"
         ADMIN_EMAIL=
     done
-    ADMIN_PASSWORD=$(random_secret 16)
+    ADMIN_PASSWORD=$(admin_password)
     DB_PASSWORD=$(random_secret 32)
     GUIDE_TOKEN=$(random_secret 12)
 
@@ -475,6 +499,7 @@ install_cms() {
     php artisan atom:install --emulator=plus --theme=dusk --no-interaction
 
     if [ "$(sql -N plus -e 'SELECT COUNT(*) FROM website_installation WHERE completed = 1' 2>/dev/null || echo 0)" = 0 ]; then
+        repair_admin_password
         local settings
         settings=$(mktemp)
         jq -n --arg name "$HOTEL_NAME" '{hotel_name: $name}' > "$settings"
@@ -717,9 +742,18 @@ finish() {
     say ""
     say "  Your admin login for https://$DOMAIN (also saved in $STATE_FILE):"
     say "      Username: ${bold}$ADMIN_USER${reset}"
-    say "      Password: ${bold}$ADMIN_PASSWORD${reset}"
+    # Passwords go to the operator's terminal, not the log they may share for help.
+    printf '      Password: %s\n' "$ADMIN_PASSWORD" >&3
     say ""
-    say "  Write the password down somewhere safe and change it after logging in."
+    say "  MariaDB connection (on this server, or through an SSH tunnel):"
+    say "      Host: 127.0.0.1    Port: 3306    Database: plus    Username: hotel"
+    printf '      Password: %s\n' "$DB_PASSWORD" >&3
+    say "      Connect locally: mariadb --host=127.0.0.1 --port=3306 --user=hotel --password plus"
+    say "      Database root uses local socket authentication: sudo mariadb (no generated root password)."
+    say ""
+    say "  Retrieve saved passwords: sudo cat $STATE_FILE"
+    say "  Store passwords somewhere safe. Change the initial admin password after logging in;"
+    say "  the saved file retains the initial password. Keep passwords out of shared logs and screenshots."
     say ""
 }
 
@@ -729,6 +763,7 @@ main() {
     exec >> "$LOG" 2>&1
     load_installer_files
     ask_questions
+    say "  Admin and database passwords are saved in $STATE_FILE. Retrieve them with: sudo cat $STATE_FILE"
     derive_settings
     install_packages
     install_toolchains

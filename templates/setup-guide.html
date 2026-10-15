@@ -141,6 +141,11 @@
         <tr><td>Passwords (admin, database)</td><td><code>{{CREDENTIALS_FILE}}</code></td></tr>
     </table>
 
+    <h3>Connect to your database</h3>
+    <p>Your database password was generated automatically. Read <code>{{CREDENTIALS_FILE}}</code> on your server as root or Administrator: use <code>DB_PASSWORD</code> on Linux or <code>DbPassword</code> on Windows.</p>
+    <p>Connect to MariaDB at <code>127.0.0.1:3306</code>, database <code>plus</code>, username <code>hotel</code>. From your computer, use an SSH tunnel to the server with destination <code>127.0.0.1:3306</code>. Keep the database port private.</p>
+    <p>Linux database root uses <code>sudo mariadb</code> with no generated root password. Windows saves its generated root password as <code>DbRootPassword</code> in the same file. Keep this file private; the website password stored there is the initial password, even after you change it.</p>
+
     <h3>Something isn't working?</h3>
     <details><summary>Cloudflare error 521 or 522</summary>
         Cloudflare can't reach your server. Check that the server is running and that the DNS records point to <code>{{SERVER_IP}}</code>.
