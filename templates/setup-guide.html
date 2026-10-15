@@ -14,9 +14,9 @@
     header p { color: var(--muted); margin: 0; }
     .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 22px 26px; margin: 18px 0; }
     .step { display: flex; gap: 16px; }
-    .num { flex: none; width: 36px; height: 36px; border-radius: 50%; background: var(--accent); color: #fff; font-weight: 700; display: grid; place-items: center; }
+    .step > .num { flex: 0 0 36px; width: 36px; height: 36px; border-radius: 50%; background: var(--accent); color: #fff; font-size: 18px; font-weight: 700; line-height: 1; display: inline-grid; place-items: center; }
     .step h2 { margin: 4px 0 8px; font-size: 20px; }
-    .step > div { min-width: 0; flex: 1; }
+    .step > div:not(.num) { min-width: 0; flex: 1 1 auto; }
     ol, ul { padding-left: 22px; }
     li { margin: 6px 0; }
     code, .value { font-family: ui-monospace, Consolas, monospace; background: #eef1f7; border-radius: 6px; padding: 2px 7px; font-size: 14px; }
@@ -31,6 +31,13 @@
     details { margin: 10px 0; }
     summary { cursor: pointer; font-weight: 600; }
     h3 { margin: 18px 0 6px; font-size: 17px; }
+    @media (max-width: 520px) {
+        main { padding: 20px 12px 60px; }
+        .card { padding: 18px 16px; }
+        .step { gap: 12px; }
+        .step > .num { flex-basis: 32px; width: 32px; height: 32px; font-size: 16px; }
+        th, td { padding: 6px; }
+    }
 </style>
 </head>
 <body>
