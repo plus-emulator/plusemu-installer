@@ -52,7 +52,9 @@ After you confirm, the installer runs on its own in about 10 minutes.
 
 ## When it finishes
 
-The installer prints your admin username and password. It also points you to a **setup guide**: a web page with step-by-step instructions for connecting your domain through Cloudflare, which takes about 5 minutes.
+The installer generates passwords automatically and prints your initial admin login and database connection details, including the database password. On Windows it also prints the MariaDB root password. These passwords are saved before installation starts; the installer tells you where to retrieve them even if a later step fails. The final password summary is shown in the terminal, not written to the installer log or browser setup guide.
+
+It also points you to a **setup guide**: a web page with step-by-step instructions for connecting your domain through Cloudflare, which takes about 5 minutes.
 
 - **Linux:** open `http://<your server IP>/<token>/`. The installer prints the exact address. The token is random so that strangers can't find the page.
 - **Windows:** the guide opens in your browser. A copy named *Hotel setup guide* is saved on your desktop.
@@ -107,6 +109,22 @@ The pages the installer generates, such as the setup guide and the client config
 
 Only root (Linux) or Administrators (Windows) can read the file with passwords.
 
+### Retrieve passwords and connect to MariaDB
+
+On Linux, run `sudo cat /etc/plusemu/hotel.env`. `ADMIN_PASSWORD` is the initial website password and `DB_PASSWORD` is the database password. On Windows, run `Get-Content C:\ProgramData\PlusEMU\hotel.json` in an Administrator PowerShell; the fields are `AdminPassword`, `DbPassword` and `DbRootPassword`.
+
+Use host `127.0.0.1`, port `3306`, database `plus`, username `hotel` and the database password. From the server:
+
+```bash
+mariadb --host=127.0.0.1 --port=3306 --user=hotel --password plus
+```
+
+Enter the database password at the prompt. On Windows, use `mariadb.exe` from your MariaDB installation's `bin` folder. For a desktop database client, connect through an SSH tunnel to the server with destination `127.0.0.1:3306`; use your server's SSH address, not the Cloudflare-proxied hotel domain. Keep port 3306 private.
+
+Linux database root uses local socket authentication (`sudo mariadb`); no root password is generated. Windows database root uses the saved `DbRootPassword`.
+
+Change your initial admin password after logging in. The saved file still contains the initial value. Keep the file and terminal password summary private, and remove credentials before sharing logs or screenshots.
+
 ## Unattended installs
 
 To install without questions, set the answers in environment variables:
@@ -133,5 +151,6 @@ Advanced overrides:
 ## Troubleshooting
 
 - **The installer stopped with an error:** read the log lines it printed, fix the cause, then run the command again. It continues where it stopped.
+- **Atom reports that the password needs a symbol:** rerun the current installer. It replaces an invalid saved admin password while CMS setup is incomplete and saves the replacement before retrying. Completed installations keep their existing admin password; database passwords are reused.
 - **Cloudflare errors 521, 522, 526, "too many redirects", or the client won't connect:** see *Something isn't working?* at the bottom of your setup guide.
 - **Still stuck:** ask on DevBest and include the installer log.
