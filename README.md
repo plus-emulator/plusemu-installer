@@ -154,3 +154,7 @@ Advanced overrides:
 - **Atom reports that the password needs a symbol:** rerun the current installer. It replaces an invalid saved admin password while CMS setup is incomplete and saves the replacement before retrying. Completed installations keep their existing admin password; database passwords are reused.
 - **Cloudflare errors 521, 522, 526, "too many redirects", or the client won't connect:** see *Something isn't working?* at the bottom of your setup guide.
 - **Still stuck:** ask on DevBest and include the installer log.
+
+## Licence
+
+Licensed under the GNU General Public License, version 3 only (`GPL-3.0-only`). See [LICENSE](LICENSE).
