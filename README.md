@@ -152,61 +152,48 @@ Linux database root uses local socket authentication (`sudo mariadb`); no root p
 
 Change your initial admin password after logging in. The saved file still contains the initial value. Keep the file and terminal password summary private, and remove credentials before sharing logs or screenshots.
 
-## Update the emulator and the client
+## One-command updates for PlusEMU and Volt
 
-New PlusEMU and Volt releases come out often. To install them, run this on your server:
+Hotels set up with the one-command installer (Linux) can now update the emulator and client without reinstalling.
 
-```bash
-sudo plusemu-update
-```
-
-Hotels installed before this command existed run this once. After that, `sudo plusemu-update` works:
-
+**First time only:**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash -s -- update
 ```
 
-The update shows the installed and the newest versions and asks before it changes anything. Then it:
-
-1. Downloads the new releases and checks them against their published checksums. If a download fails, your hotel keeps running.
-2. Stops the emulator and saves a backup of the database, the emulator and the client in `/var/backups/plusemu/`. The newest 3 backups are kept.
-3. Installs the new emulator and updates the database with the emulator's own migrations, then installs the new client.
-4. Starts the emulator and checks that it answers.
-
-If any step fails, the update restores the backup and starts the previous version.
-
-The update keeps your work:
-
-- Emulator: every file in `Config/` stays as you left it. New settings from the release are added to `config.json`, your values win. Files you added, such as plugins and database backups, stay.
-- Client: every file in `configuration/` stays as you left it. New settings from the installer's templates are added to `renderer-config.json`, `ui-config.json` and `client-mode.json`, your values win. Files you added, such as `ads.txt` or plugins, stay.
-- The website and your passwords are not changed. The hotel files change only with `--with-assets`.
-
-Players are disconnected for about a minute while the emulator restarts. They get the new client when they reload the hotel page.
-
-### Update the hotel files too
-
-If you use the stock hotel files, add `--with-assets` to also get new furniture, clothing, effects, badges and texts:
-
+**After that:**
 ```bash
-sudo plusemu-update --with-assets
+sudo plusemu-update
 ```
 
-- It downloads the newest hotel files pack (about 550 MB) only when it changed, and checks it against its published checksum.
-- Stock files in `/var/www/hotel/hotel-files` are replaced by the new ones. Files you added, such as custom furniture or badges, stay. A stock file you edited is replaced too; the backup keeps your version.
-- The emulator's `Config/figuredata.xml` is replaced by the one from the emulator release, so the emulator accepts the new clothing. The emulator restarts to load it.
-- The backup also contains the hotel files, so a failed update or `--rollback` restores them.
+**What it does**
+- Downloads and checks the new releases before touching anything.
+- Backs up the database, emulator and client to `/var/backups/plusemu/` (newest 3 kept).
+- Installs the new versions and runs the database migrations.
+- Keeps your `Config/` and `configuration/` files and anything you added. (New settings are added, any existing settings with your own values remains)
+- Restores the backup automatically if any step fails.
 
-Without `--with-assets`, the update tells you when new hotel files are available.
+**Options**
+- `--with-assets`: also update the stock hotel files (furniture, clothing, effects, badges, texts, about 550 MB). Your own added files stay.
+- `--check`: show available updates, change nothing.
+- `--rollback`: restore the last backup. The database goes back too, so progress since then is lost.
 
-| Command | What it does |
-|---|---|
-| `sudo plusemu-update` | Update the emulator and the client |
-| `sudo plusemu-update --check` | Show available updates, change nothing |
-| `sudo plusemu-update --yes` | Update without the question |
-| `sudo plusemu-update --with-assets` | Also update the stock hotel files and the clothing data |
-| `sudo plusemu-update --rollback` | Restore the newest backup, database included |
+### Examples
+```bash
+# Also update the stock hotel files (furniture, clothing, effects, badges, texts)
+sudo plusemu-update --with-assets
 
-`--rollback` returns the database to the moment of the backup, so game changes made since then are lost. If that backup contains the hotel files, they go back too. It saves the current state first, so running it again undoes the rollback. The update log is `/var/log/plusemu-update.log`.
+# Only check what is new, change nothing
+sudo plusemu-update --check --with-assets
+
+# Update without the "Update now?" question
+sudo plusemu-update --yes --with-assets
+
+# Undo the last update (the database goes back too)
+sudo plusemu-update --rollback
+```
+
+Log: `/var/log/plusemu-update.log`. Post it here if something breaks (no passwords).
 
 ## Unattended installs
 
