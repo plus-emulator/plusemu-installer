@@ -6,7 +6,7 @@ Set up a complete Habbo hotel on your own server with one command. The installer
 - **Volt**, the game client
 - **Atom CMS**, the website and housekeeping
 - **MariaDB**, **PHP** and a web server (**nginx** on Linux, **IIS** on Windows)
-- The hotel files: furniture, clothes, badges and texts (about 470 MB)
+- The hotel files: furniture, clothes, badges and texts (about 550 MB)
 
 Everything runs on your server. Cloudflare sits in front of it to provide HTTPS and to hide your server's IP address.
 
@@ -179,18 +179,34 @@ The update keeps your work:
 
 - Emulator: every file in `Config/` stays as you left it. New settings from the release are added to `config.json`, your values win. Files you added, such as plugins and database backups, stay.
 - Client: every file in `configuration/` stays as you left it. New settings from the installer's templates are added to `renderer-config.json`, `ui-config.json` and `client-mode.json`, your values win. Files you added, such as `ads.txt` or plugins, stay.
-- The website, the hotel files and your passwords are not changed.
+- The website and your passwords are not changed. The hotel files change only with `--with-assets`.
 
 Players are disconnected for about a minute while the emulator restarts. They get the new client when they reload the hotel page.
+
+### Update the hotel files too
+
+If you use the stock hotel files, add `--with-assets` to also get new furniture, clothing, effects, badges and texts:
+
+```bash
+sudo plusemu-update --with-assets
+```
+
+- It downloads the newest hotel files pack (about 550 MB) only when it changed, and checks it against its published checksum.
+- Stock files in `/var/www/hotel/hotel-files` are replaced by the new ones. Files you added, such as custom furniture or badges, stay. A stock file you edited is replaced too; the backup keeps your version.
+- The emulator's `Config/figuredata.xml` is replaced by the one from the emulator release, so the emulator accepts the new clothing. The emulator restarts to load it.
+- The backup also contains the hotel files, so a failed update or `--rollback` restores them.
+
+Without `--with-assets`, the update tells you when new hotel files are available.
 
 | Command | What it does |
 |---|---|
 | `sudo plusemu-update` | Update the emulator and the client |
 | `sudo plusemu-update --check` | Show available updates, change nothing |
 | `sudo plusemu-update --yes` | Update without the question |
+| `sudo plusemu-update --with-assets` | Also update the stock hotel files and the clothing data |
 | `sudo plusemu-update --rollback` | Restore the newest backup, database included |
 
-`--rollback` returns the database to the moment of the backup, so game changes made since then are lost. It saves the current state first, so running it again undoes the rollback. The update log is `/var/log/plusemu-update.log`.
+`--rollback` returns the database to the moment of the backup, so game changes made since then are lost. If that backup contains the hotel files, they go back too. It saves the current state first, so running it again undoes the rollback. The update log is `/var/log/plusemu-update.log`.
 
 ## Unattended installs
 

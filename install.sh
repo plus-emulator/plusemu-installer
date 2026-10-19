@@ -164,7 +164,7 @@ EOF
 
 save_versions() {
     install -d -m 700 "$(dirname "$VERSIONS_FILE")"
-    printf "EMULATOR_VERSION='%s'\nCLIENT_VERSION='%s'\n" "$EMULATOR_VERSION" "$CLIENT_VERSION" > "$VERSIONS_FILE"
+    printf "EMULATOR_VERSION='%s'\nCLIENT_VERSION='%s'\nASSETS_VERSION='%s'\n" "$EMULATOR_VERSION" "$CLIENT_VERSION" "$ASSETS_VERSION" > "$VERSIONS_FILE"
 }
 
 require_free_space() { # require_free_space <GB> [path]
@@ -184,19 +184,40 @@ release_version() { # release_version <owner/repo> <custom URL>: the tag of the 
     printf '%s' "${url##*/releases/tag/}"
 }
 
-fetch_release() { # fetch_release <owner/repo> <tag> <asset> <file>: checked against SHA256SUMS when the release has one
-    local base=https://github.com/$1/releases/download/$2 sums=$4.sums status expected
-    curl -fsSL --retry 3 "$base/$3" -o "$4" || return 1
+fetch_checked() { # fetch_checked <base URL> <asset> <file>: checked against SHA256SUMS next to it, when there is one
+    local base=$1 sums=$3.sums status expected
+    if [ -t 3 ] && [ "$2" = "${ASSET_PACK_URL##*/}" ]; then
+        curl -fL --retry 3 --progress-bar "$base/$2" -o "$3" 2>&3 || return 1
+    else
+        curl -fsSL --retry 3 "$base/$2" -o "$3" || return 1
+    fi
     status=$(curl -sSL --retry 3 -o "$sums" -w '%{http_code}' "$base/SHA256SUMS") || status=000
     case $status in
-        200) expected=$(awk -v file="$3" '$2 == file || $2 == "*" file {print $1}' "$sums") ;;
+        200) expected=$(awk -v file="$2" '$2 == file || $2 == "*" file {print $1}' "$sums") ;;
         404) rm -f "$sums"; return 0 ;; # older releases publish no checksums
-        *) rm -f "$sums"; die "Could not download the checksums of $2. Nothing was changed. Try again later." ;;
+        *) rm -f "$sums"; die "Could not download the checksums for $2. Nothing was changed. Try again later." ;;
     esac
     rm -f "$sums"
-    if [ -z "$expected" ] || [ "$(sha256sum "$4" | cut -d' ' -f1)" != "$expected" ]; then
-        die "The download of $3 ($2) does not match its published checksum. Nothing was changed. Try again later."
+    if [ -z "$expected" ] || [ "$(sha256sum "$3" | cut -d' ' -f1)" != "$expected" ]; then
+        die "The download of $2 does not match its published checksum. Nothing was changed. Try again later."
     fi
+}
+
+fetch_release() { # fetch_release <owner/repo> <tag> <asset> <file>
+    fetch_checked "https://github.com/$1/releases/download/$2" "$3" "$4"
+}
+
+pack_version() { # the start of the hotel files pack's published checksum, or "custom" when it has none
+    local sums status version
+    sums=$(mktemp)
+    status=$(curl -sSL --retry 3 -o "$sums" -w '%{http_code}' "${ASSET_PACK_URL%/*}/SHA256SUMS") || status=000
+    case $status in
+        200) version=$(awk -v file="${ASSET_PACK_URL##*/}" '$2 == file || $2 == "*" file {print substr($1, 1, 12)}' "$sums") ;;
+        404) version=custom ;;
+    esac
+    rm -f "$sums"
+    [ -n "${version:-}" ] || return 1
+    printf '%s' "$version"
 }
 
 stage_emulator() { # stage_emulator <version> <dir>: unpack the emulator release into a new dir
@@ -246,7 +267,7 @@ install_update_command() {
     cat > "$UPDATE_COMMAND" <<EOF
 #!/usr/bin/env bash
 # Installed by the PlusEMU installer. Updates the emulator and the Volt client with the newest installer:
-#   sudo plusemu-update [--check] [--yes] [--rollback]
+#   sudo plusemu-update [--check] [--yes] [--with-assets] [--rollback]
 set -euo pipefail
 script=\$(mktemp)
 trap 'rm -f "\$script"' EXIT
@@ -447,7 +468,7 @@ download_releases() {
     step "Downloading PlusEMU, the Volt client and Atom CMS"
     # A re-run repairs and keeps the installed releases; `install.sh update` updates them.
     local out=$HOTEL_ROOT/emulator client=$HOTEL_ROOT/client
-    EMULATOR_VERSION=unknown CLIENT_VERSION=unknown
+    EMULATOR_VERSION=unknown CLIENT_VERSION=unknown ASSETS_VERSION=unknown
     # shellcheck disable=SC1090
     if [ -f "$VERSIONS_FILE" ]; then . "$VERSIONS_FILE"; fi
     if [ -x "$out/Plus Emulator" ]; then
@@ -521,17 +542,21 @@ EOF
 }
 
 download_hotel_files() {
-    step "Downloading the hotel files (furniture, clothes, badges, texts; about 470 MB)"
+    step "Downloading the hotel files (furniture, clothes, badges, texts; about 550 MB)"
     local files=$HOTEL_ROOT/hotel-files
     if [ -f "$files/.complete" ]; then
         ok "Already downloaded"
         return
     fi
     rm -rf "$files" && mkdir -p "$files"
-    local progress=-sS
-    if [ -t 3 ]; then progress=--progress-bar; fi
-    curl -fL --retry 3 "$progress" "$ASSET_PACK_URL" 2>&3 | tar xz --no-same-owner -C "$files"
+    local pack
+    pack=$(mktemp -p "$HOTEL_ROOT")
+    ASSETS_VERSION=$(pack_version) || ASSETS_VERSION=unknown
+    fetch_checked "${ASSET_PACK_URL%/*}" "${ASSET_PACK_URL##*/}" "$pack" || die "Could not download the hotel files. Run the installer again."
+    tar xzf "$pack" --no-same-owner -C "$files"
+    rm -f "$pack"
     touch "$files/.complete"
+    save_versions
     ok "Hotel files ready ($(du -sh "$files" | cut -f1))"
 }
 
@@ -922,7 +947,7 @@ keep_client_files() { # keep_client_files <installed dir> <new dir>
     rm -rf "$rendered"
 }
 
-create_snapshot() { # sets SNAPSHOT to a new backup of the database, the emulator, the client and the versions
+create_snapshot() { # create_snapshot [with the hotel files: 0|1]: sets SNAPSHOT to a new backup
     SNAPSHOT=$BACKUP_ROOT/$(date -u +%Y%m%d-%H%M%S-%N)
     local partial=$SNAPSHOT.partial
     install -d -m 700 "$BACKUP_ROOT"
@@ -931,6 +956,7 @@ create_snapshot() { # sets SNAPSHOT to a new backup of the database, the emulato
     # The emulator's own database backups stay in place and are not copied again.
     # Exit code 1 only means a file changed while it was read, for example a log of the running emulator.
     tar -C "$HOTEL_ROOT" --exclude=emulator/backups --warning=no-file-changed -czf "$partial/files.tar.gz" emulator client || [ "$?" = 1 ]
+    if [ "${1:-0}" = 1 ]; then tar -C "$HOTEL_ROOT" -cf "$partial/hotel-files.tar" hotel-files; fi
     if [ -f "$VERSIONS_FILE" ]; then cp "$VERSIONS_FILE" "$partial/versions.env"; fi
     mv "$partial" "$SNAPSHOT"
 }
@@ -940,6 +966,10 @@ restore_snapshot() { # restore_snapshot <backup dir> <restore the database: 0|1>
     systemctl stop plusemu || return 1
     rm -rf "$staging" && mkdir -p "$staging" || return 1
     tar xzf "$snapshot/files.tar.gz" -C "$staging" || return 1
+    if [ -f "$snapshot/hotel-files.tar" ]; then
+        tar xf "$snapshot/hotel-files.tar" -C "$staging" || return 1
+        rm -rf "$HOTEL_ROOT/hotel-files" && mv "$staging/hotel-files" "$HOTEL_ROOT/" || return 1
+    fi
     if [ -d "$HOTEL_ROOT/emulator/backups" ] && [ ! -e "$staging/emulator/backups" ]; then
         mv "$HOTEL_ROOT/emulator/backups" "$staging/emulator/backups" || return 1
     fi
@@ -985,12 +1015,22 @@ finish_update() { # the EXIT trap: undo an unfinished update and remove temporar
     rm -rf "${WORK:-}"
 }
 
-require_update_space() {
+require_update_space() { # require_update_space [with the hotel files: 0|1]
     # Staged copies and the backup of the files, plus two dumps of the database: the backup's and the emulator's own.
-    local files_mb database_mb
+    local files_mb database_mb hotel_files_mb=0
     files_mb=$(du -smc --exclude=emulator/backups "$HOTEL_ROOT/emulator" "$HOTEL_ROOT/client" | tail -1 | cut -f1)
     database_mb=$(sql -N -e "SELECT COALESCE(ROUND(SUM(data_length + index_length) / 1048576), 0) FROM information_schema.tables WHERE table_schema = 'plus'" < /dev/null)
-    require_free_space $(((files_mb * 3 + ${database_mb:-0} * 2) / 1024 + 1)) "$HOTEL_ROOT"
+    # Their backup, the downloaded pack and the files it adds.
+    if [ "${1:-0}" = 1 ] && [ -d "$HOTEL_ROOT/hotel-files" ]; then hotel_files_mb=$(du -sm "$HOTEL_ROOT/hotel-files" | cut -f1); fi
+    require_free_space $(((files_mb * 3 + ${database_mb:-0} * 2 + hotel_files_mb * 3) / 1024 + 1)) "$HOTEL_ROOT"
+}
+
+assets_hint() { # assets_hint <newest hotel files version>
+    if [ -n "$1" ] && [ "$1" != custom ] && [ "$1" != "$ASSETS_VERSION" ]; then
+        say ""
+        say "  The stock hotel files (furniture, clothing, effects, texts) can be updated too:"
+        say "  ${bold}sudo plusemu-update --with-assets${reset}"
+    fi
 }
 
 confirm_update() { # confirm_update <question>
@@ -1001,7 +1041,7 @@ confirm_update() { # confirm_update <question>
 }
 
 rollback_update() {
-    local target name versions="unknown versions"
+    local target name versions="unknown versions" with_hotel_files=0
     target=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' 2> /dev/null | sort | tail -1)
     [ -n "$target" ] || die "No backup found in $BACKUP_ROOT. Nothing was changed."
     name=${target##*/}
@@ -1014,14 +1054,18 @@ rollback_update() {
     say ""
     say "${bold}Restore the backup from ${name:0:4}-${name:4:2}-${name:6:2} ${name:9:2}:${name:11:2} UTC${reset} ($versions)."
     say "  ${yellow}The database goes back to that moment too: game changes made since then are lost.${reset}"
+    if [ -f "$target/hotel-files.tar" ]; then
+        with_hotel_files=1
+        say "  ${yellow}The hotel files go back to that moment as well.${reset}"
+    fi
     confirm_update "Restore this backup?"
 
-    require_update_space
+    require_update_space "$with_hotel_files"
     TOTAL_STEPS=2
     step "Backing up the current state"
     systemctl stop plusemu
     EMULATOR_STOPPED=1
-    create_snapshot
+    create_snapshot "$with_hotel_files"
     ok "Saved in $SNAPSHOT"
     step "Restoring the backup"
     RESTORE_FROM=$SNAPSHOT RESTORE_DATABASE=1
@@ -1035,13 +1079,15 @@ rollback_update() {
 }
 
 update_main() {
-    local check=0 rollback=0 arg latest_emulator latest_client update_emulator=0 update_client=0
+    local check=0 rollback=0 with_assets=0 arg latest_emulator latest_client latest_assets
+    local update_emulator=0 update_client=0 update_assets=0
     for arg in "$@"; do
         case "$arg" in
             --check) check=1 ;;
             --yes) PLUSEMU_YES=1 ;;
+            --with-assets) with_assets=1 ;;
             --rollback) rollback=1 ;;
-            *) die "Unknown option: $arg. Usage: plusemu-update [--check] [--yes] [--rollback]" ;;
+            *) die "Unknown option: $arg. Usage: plusemu-update [--check] [--yes] [--with-assets] [--rollback]" ;;
         esac
     done
     MODE=update
@@ -1058,7 +1104,7 @@ update_main() {
     exec >> "$LOG" 2>&1
     # shellcheck disable=SC1090
     . "$STATE_FILE"
-    EMULATOR_VERSION=unknown CLIENT_VERSION=unknown
+    EMULATOR_VERSION=unknown CLIENT_VERSION=unknown ASSETS_VERSION=unknown
     # shellcheck disable=SC1090
     if [ -f "$VERSIONS_FILE" ]; then . "$VERSIONS_FILE"; fi
     # A closed SSH session does not stop the update; other stop signals restore the previous version.
@@ -1076,10 +1122,19 @@ update_main() {
     latest_client=$(release_version "$CLIENT_REPO" "$CLIENT_URL") || die "Could not find the latest Volt release. Check the server's internet connection."
     if [ "$EMULATOR_VERSION" != "$latest_emulator" ]; then update_emulator=1; fi
     if [ "$CLIENT_VERSION" != "$latest_client" ]; then update_client=1; fi
+    latest_assets=$(pack_version) || latest_assets=
+    if [ "$with_assets" = 1 ]; then
+        [ -n "$latest_assets" ] || die "Could not find the latest hotel files. Check the server's internet connection."
+        if [ "$ASSETS_VERSION" != "$latest_assets" ]; then update_assets=1; fi
+    fi
     say ""
     say "${bold}PlusEMU hotel update${reset}"
     if [ "$update_emulator" = 1 ]; then
         say "  Emulator (PlusEMU): $EMULATOR_VERSION -> ${bold}$latest_emulator${reset}"
+    elif [ "$update_assets" = 1 ]; then
+        # The emulator release carries the clothing data (Config/figuredata.xml) that matches the stock hotel files.
+        update_emulator=1
+        say "  Emulator (PlusEMU): $EMULATOR_VERSION (reinstalled to load the new clothing data)"
     else
         say "  Emulator (PlusEMU): $EMULATOR_VERSION (up to date)"
     fi
@@ -1088,29 +1143,48 @@ update_main() {
     else
         say "  Client (Volt):      $CLIENT_VERSION (up to date)"
     fi
+    if [ "$update_assets" = 1 ]; then
+        say "  Hotel files:        $ASSETS_VERSION -> ${bold}$latest_assets${reset} (about 550 MB)"
+    elif [ "$with_assets" = 1 ]; then
+        say "  Hotel files:        $ASSETS_VERSION (up to date)"
+    fi
     if [ "$update_emulator" = 0 ] && [ "$update_client" = 0 ]; then
         say ""
         say "  ${green}Everything is up to date.${reset}"
+        if [ "$with_assets" = 0 ]; then assets_hint "$latest_assets"; fi
         return
     fi
     if [ "$check" = 1 ]; then
         say ""
-        say "  Install the update with: sudo plusemu-update"
+        if [ "$with_assets" = 1 ]; then
+            say "  Install the update with: sudo plusemu-update --with-assets"
+        else
+            say "  Install the update with: sudo plusemu-update"
+            assets_hint "$latest_assets"
+        fi
         return
     fi
     say ""
     say "  Your settings and added files are kept, and a backup is made first."
+    if [ "$update_assets" = 1 ]; then
+        say "  Stock hotel files are replaced by the new ones. Files you added to hotel-files are kept."
+    fi
     if [ "$update_emulator" = 1 ]; then say "  Players are disconnected for about a minute."; fi
     confirm_update "Update now?"
 
-    require_update_space
+    require_update_space "$update_assets"
     WORK=$(mktemp -d "$HOTEL_ROOT/.update.XXXXXX")
     TOTAL_STEPS=4
 
     step "Downloading the new versions"
     if [ "$update_emulator" = 1 ]; then
         stage_emulator "$latest_emulator" "$WORK/emulator"
+        if [ "$update_assets" = 1 ]; then cp "$WORK/emulator/Config/figuredata.xml" "$WORK/figuredata.xml"; fi
         keep_emulator_files "$HOTEL_ROOT/emulator" "$WORK/emulator"
+        if [ "$update_assets" = 1 ]; then
+            mv "$WORK/figuredata.xml" "$WORK/emulator/Config/figuredata.xml"
+            chown plusemu:plusemu "$WORK/emulator/Config/figuredata.xml"
+        fi
         ok "PlusEMU $latest_emulator (your settings and added files are kept)"
     fi
     if [ "$update_client" = 1 ]; then
@@ -1120,14 +1194,18 @@ update_main() {
         keep_client_files "$HOTEL_ROOT/client" "$WORK/client"
         ok "Volt $latest_client (your configuration and added files are kept)"
     fi
+    if [ "$update_assets" = 1 ]; then
+        fetch_checked "${ASSET_PACK_URL%/*}" "${ASSET_PACK_URL##*/}" "$WORK/hotel-files.tar.gz" || die "Could not download the hotel files. Nothing was changed. Try again later."
+        ok "Hotel files $latest_assets"
+    fi
 
     step "Backing up your hotel"
     if [ "$update_emulator" = 1 ]; then
         systemctl stop plusemu
         EMULATOR_STOPPED=1
     fi
-    create_snapshot
-    ok "Database, emulator and client saved in $SNAPSHOT"
+    create_snapshot "$update_assets"
+    ok "Your hotel is saved in $SNAPSHOT"
     RESTORE_FROM=$SNAPSHOT RESTORE_DATABASE=0
 
     step "Installing the new versions"
@@ -1144,6 +1222,11 @@ update_main() {
         mv "$WORK/client" "$HOTEL_ROOT/client"
         ok "Volt $latest_client installed"
     fi
+    if [ "$update_assets" = 1 ]; then
+        mkdir -p "$HOTEL_ROOT/hotel-files"
+        tar xzf "$WORK/hotel-files.tar.gz" --no-same-owner -C "$HOTEL_ROOT/hotel-files"
+        ok "Hotel files $latest_assets installed"
+    fi
 
     step "Starting the emulator"
     if [ "$update_emulator" = 1 ]; then
@@ -1156,13 +1239,14 @@ update_main() {
     fi
     RESTORE_FROM=
     EMULATOR_VERSION=$latest_emulator CLIENT_VERSION=$latest_client
+    if [ "$update_assets" = 1 ]; then ASSETS_VERSION=$latest_assets; fi
     save_versions
     prune_snapshots
     install_update_command
 
     say ""
     say "${green}${bold}✓ Your hotel is up to date.${reset}"
-    say "  Emulator: $EMULATOR_VERSION    Client: $CLIENT_VERSION"
+    say "  Emulator: $EMULATOR_VERSION    Client: $CLIENT_VERSION    Hotel files: $ASSETS_VERSION"
     say "  Players get the new client when they reload the hotel page."
     say "  Backup of the previous version: $SNAPSHOT"
     say "  Undo this update: sudo plusemu-update --rollback"
