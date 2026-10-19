@@ -10,11 +10,25 @@
 #
 # Unattended runs can preset the answers: PLUSEMU_DOMAIN, PLUSEMU_WS_URL,
 # PLUSEMU_HOTEL_NAME, PLUSEMU_ADMIN_USER, PLUSEMU_ADMIN_EMAIL, PLUSEMU_YES=1.
+# PLUSEMU_GUIDE_MODE=simple|advanced selects the final instructions only.
+
+param([ValidateSet('simple', 'advanced')][string]$GuideMode)
 
 function Get-Setting($Name, $Default) {
     $value = [Environment]::GetEnvironmentVariable($Name)
     if ($value) { return $value } else { return $Default }
 }
+
+function Resolve-GuideMode($SavedMode = 'simple') {
+    $choice = if ($GuideMode) { $GuideMode } else { Get-Setting 'PLUSEMU_GUIDE_MODE' $SavedMode }
+    if (-not $choice) { $choice = 'simple' }
+    if ($choice -notin 'simple', 'advanced') {
+        throw 'Guide mode must be simple or advanced (this selects instructions only).'
+    }
+    return $choice.ToLowerInvariant()
+}
+
+$null = Resolve-GuideMode
 
 $InstallerRepo   = Get-Setting 'INSTALLER_REPO' 'plus-emulator/plusemu-installer'
 $InstallerRef    = Get-Setting 'INSTALLER_REF' 'main'
@@ -127,8 +141,10 @@ function Repair-AdminPassword {
 
 function Write-Utf8($Path, $Text) { [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding $false)) }
 
-function Render($Template, $Output, $Values) {
+function Render($Template, $Output, $Values, $CertificateTemplate = $null) {
     $content = [IO.File]::ReadAllText($Template)
+    $certificateSteps = if ($CertificateTemplate) { [IO.File]::ReadAllText($CertificateTemplate) } else { '' }
+    $content = $content.Replace('{{CERTIFICATE_STEPS}}', $certificateSteps)
     foreach ($key in $Values.Keys) { $content = $content.Replace("{{$key}}", [string]$Values[$key]) }
     Write-Utf8 $Output $content
 }
@@ -198,6 +214,7 @@ function Get-InstallerFiles {
 }
 
 function Read-Answers {
+    $selectedMode = Resolve-GuideMode
     Write-Host ''
     Write-Host 'Welcome to the PlusEMU hotel installer!' -ForegroundColor White
     Write-Host 'This sets up your emulator, client and website on this server in about 10 minutes.'
@@ -205,7 +222,11 @@ function Read-Answers {
 
     if (Test-Path $StateFile) {
         $script:state = Get-Content $StateFile -Raw | ConvertFrom-Json
+        $selectedMode = Resolve-GuideMode $state.GuideMode
+        $state | Add-Member -MemberType NoteProperty -Name GuideMode -Value $selectedMode -Force
+        $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
         Say "Found the settings of an earlier run for $($state.Domain); continuing that installation."
+        Say "  Setup guide: $selectedMode. Selecting this guide does not change SSH, RDP, firewall, updates or backups."
         return
     }
 
@@ -256,6 +277,7 @@ function Read-Answers {
     Write-Host "  WebSocket:  $ws"
     Write-Host "  Hotel name: $name"
     Write-Host "  Admin:      $user ($mail)"
+    Write-Host "  Setup guide: $selectedMode. Selecting this guide does not change SSH, RDP, firewall, updates or backups."
     if ((Get-Setting 'PLUSEMU_YES' '0') -ne '1') {
         $go = Ask 'Start the installation? (y/n)' 'y'
         if ($go -notmatch '^[Yy]') { throw 'Installation cancelled. Nothing was changed.' }
@@ -263,6 +285,7 @@ function Read-Answers {
 
     $script:state = [pscustomobject]@{
         Domain = $domain; WsUrl = $ws; HotelName = $name; AdminUser = $user; AdminEmail = $mail
+        GuideMode = $selectedMode
         AdminPassword = New-AdminPassword; DbPassword = New-Secret 32; DbRootPassword = New-Secret 32
     }
     $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
@@ -608,7 +631,6 @@ function Set-IisSite {
     }
     $hosts = @($domain, "www.$domain")
     if ($WsHost -ne $domain) { $hosts += $WsHost }
-    # Cloudflare (SSL mode "Full") encrypts to this certificate; visitors see Cloudflare's.
     $cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -eq "CN=$domain" } | Select-Object -First 1
     if (-not $cert) {
         $cert = New-SelfSignedCertificate -DnsName $domain, "*.$domain" -CertStoreLocation Cert:\LocalMachine\My -NotAfter (Get-Date).AddYears(10)
@@ -692,6 +714,7 @@ function Set-IisSite {
 
 function Write-Guide {
     Step 'Writing your setup guide'
+    $mode = if ($state.GuideMode) { $state.GuideMode } else { 'simple' }
     $wsRow = ''
     if ($WsHost -ne $state.Domain) {
         $label = if ($WsHost.EndsWith(".$($state.Domain)")) { $WsHost.Substring(0, $WsHost.Length - $state.Domain.Length - 1) } else { $WsHost }
@@ -699,10 +722,12 @@ function Write-Guide {
     }
     New-Item -ItemType Directory -Force -Path "$HotelRoot\setup-guide" | Out-Null
     Render "$Templates\setup-guide.html" "$HotelRoot\setup-guide\index.html" @{
-        DOMAIN = $state.Domain; SERVER_IP = $ServerIp; HOTEL_NAME = $state.HotelName; WS_DNS_ROW = $wsRow
+        DOMAIN = $state.Domain; SERVER_IP = $ServerIp; HOTEL_NAME = $state.HotelName; WS_DNS_ROW = $wsRow; WS_HOST = $WsHost
+        GUIDE_MODE_TITLE = (Get-Culture).TextInfo.ToTitleCase($mode)
+        GUIDE_MODE_DETAILS = [IO.File]::ReadAllText("$Templates\guide-$mode.html")
         CREDENTIALS_FILE = $StateFile; RESTART_COMMAND = 'Restart-Service PlusEMU'
         LOG_COMMAND = "Get-Content $HotelRoot\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 50 -Wait"
-    }
+    } "$Templates\certificate-windows.html"
     Copy-Item "$HotelRoot\setup-guide\index.html" "$([Environment]::GetFolderPath('Desktop'))\Hotel setup guide.html" -Force
     Ok 'Guide written (also on your desktop)'
 }
@@ -711,7 +736,7 @@ function Complete-Install {
     Write-Host ''
     Write-Host 'Your hotel is installed!' -ForegroundColor Green
     Write-Host ''
-    Write-Host '  One last part: connect your domain through Cloudflare (about 5 minutes).'
+    Write-Host '  One last part: connect your domain and install your Cloudflare origin certificate.'
     Write-Host '  The setup guide is opening in your browser now (also on your desktop: "Hotel setup guide").'
     Write-Host ''
     Write-Host "  Your admin login for https://$($state.Domain) (also saved in $StateFile):"

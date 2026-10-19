@@ -1,0 +1,10 @@
+<div class="card">
+    <h2>Advanced setup checklist</h2>
+    <p>Complete the same Cloudflare and certificate steps below, then review these manual administration tasks. <b>Selecting this guide does not change SSH, RDP, firewall, updates or backups.</b></p>
+    <ul>
+        <li><b>Administrator access:</b> verify a named administrator and recovery access. On Linux, verify a separate SSH-key login and sudo before disabling root or password SSH. On Windows, verify your administrator's remote access and recovery method before restricting RDP or SSH.</li>
+        <li><b>Firewall:</b> review public ports and administration access. If you restrict web ingress to Cloudflare, keep its address ranges current and verify both the website and game connection afterward.</li>
+        <li><b>Maintenance:</b> choose update and reboot windows, review logs and disk space, and arrange local database and file backups with retention limits. Test a restore. Local backups cannot recover a lost server.</li>
+    </ul>
+    <p>These tasks are not marked complete by the installer. Keep your existing administration connection open while changing access rules.</p>
+</div>

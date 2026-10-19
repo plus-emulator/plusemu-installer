@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{HOTEL_NAME}} – put your hotel online</title>
+<title>{{HOTEL_NAME}} – {{GUIDE_MODE_TITLE}} setup guide</title>
 <style>
     :root { --ink: #1d2433; --muted: #5b6475; --line: #e3e7ef; --bg: #f5f7fb; --card: #fff; --accent: #f38020; --ok: #1a8f4c; --warn: #b35c00; }
     * { box-sizing: border-box; }
@@ -20,6 +20,9 @@
     ol, ul { padding-left: 22px; }
     li { margin: 6px 0; }
     code, .value { font-family: ui-monospace, Consolas, monospace; background: #eef1f7; border-radius: 6px; padding: 2px 7px; font-size: 14px; }
+    pre { overflow-x: auto; background: #eef1f7; border-radius: 8px; padding: 14px; line-height: 1.5; font-size: 13px; }
+    pre code { background: none; padding: 0; font-size: inherit; }
+    p, li, td { overflow-wrap: anywhere; }
     table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 15px; }
     th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
     th { color: var(--muted); font-weight: 600; font-size: 13px; text-transform: uppercase; }
@@ -44,9 +47,12 @@
 <main>
 <header>
     <h1>🎉 {{HOTEL_NAME}} is installed!</h1>
+    <p>{{GUIDE_MODE_TITLE}} setup guide</p>
     <p>Your emulator, game client and website are running on this server.<br>
-       Now connect your domain <b>{{DOMAIN}}</b> through Cloudflare. It takes about 5 minutes.</p>
+       Now connect <b>{{DOMAIN}}</b> through Cloudflare and install its origin certificate.</p>
 </header>
+
+{{GUIDE_MODE_DETAILS}}
 
 <div class="card">
     <b>Keep these two values handy:</b>
@@ -54,7 +60,7 @@
         <tr><td>Your domain</td><td><span class="value">{{DOMAIN}}</span><button class="copy" data-copy="{{DOMAIN}}">copy</button></td></tr>
         <tr><td>Your server IP</td><td><span class="value">{{SERVER_IP}}</span><button class="copy" data-copy="{{SERVER_IP}}">copy</button></td></tr>
     </table>
-    Cloudflare is free. It hides your server's IP address, protects you against attacks and gives your hotel a padlock (HTTPS).
+    Cloudflare has a free plan. Its proxy protects website traffic and provides HTTPS for visitors. The steps below also secure the connection to your server.
 </div>
 
 <div class="card step">
@@ -100,33 +106,47 @@
             <tr><td>A</td><td><code>www</code></td><td><code>{{SERVER_IP}}</code></td><td>Proxied (orange cloud)</td></tr>
             {{WS_DNS_ROW}}
         </table>
-        <div class="warn">The cloud must be <b>orange</b>. A grey cloud shows your server's IP address to everyone and disables the protection.</div>
+        <div class="warn">Keep these records <b>orange (Proxied)</b>. Visitors connect through Cloudflare; browsers do not directly trust the origin certificate installed below.</div>
     </div>
 </div>
 
 <div class="card step">
     <div class="num">4</div>
     <div>
-        <h2>Turn on HTTPS the right way</h2>
-        <ol>
-            <li>Go to <b>SSL/TLS → Overview</b>, click <b>Configure</b> and choose <b>Full</b>. Save.</li>
-            <li>Go to <b>SSL/TLS → Edge Certificates</b> and switch on <b>Always Use HTTPS</b>.</li>
-            <li>Go to <b>Network</b> and check that <b>WebSockets</b> is <b>On</b>. It's on by default, and the game needs it.</li>
-        </ol>
-        <div class="tip">Why “Full”? The installer gave your server its own certificate, so the connection is encrypted all the way.
-            <b>Flexible</b> causes “too many redirects”, and <b>Full (strict)</b> shows error 526.</div>
+        <h2>Install your Cloudflare origin certificate</h2>
+        <p>The installer starts with a self-signed certificate. Replace it with a Cloudflare Origin CA certificate before enabling <b>Full (strict)</b>.</p>
+        <p>The certificate must cover <code>{{DOMAIN}}</code>, <code>www.{{DOMAIN}}</code>, and your game connection at <code>{{WS_HOST}}</code>. Add each different hostname explicitly.</p>
+        <details><summary>If your game connection uses a different domain</summary>
+            Add its DNS record in that domain's Cloudflare zone. If Cloudflare cannot issue one certificate for all your hostnames, <b>stop before running the single-certificate commands below</b>. You need a separate certificate for each zone. On Linux, use separate certificate and key paths for the game's nginx server block instead of replacing the shared pair. On Windows, install the matching certificate on each hostname's HTTPS binding. Complete both certificates before enabling Full (strict) in both zones. Get help configuring those separate certificates before continuing.</details>
+        {{CERTIFICATE_STEPS}}
+        <p>Record the certificate's expiry date and set yourself a renewal reminder. This manual setup does not renew it automatically.</p>
+        <p><a href="https://developers.cloudflare.com/ssl/origin-configuration/origin-ca/" target="_blank" rel="noopener">Cloudflare Origin CA instructions</a></p>
     </div>
 </div>
 
 <div class="card step">
     <div class="num">5</div>
     <div>
+        <h2>Enable Full (strict)</h2>
+        <ol>
+            <li>After installing and checking the certificate, open <b>SSL/TLS → Overview</b> in Cloudflare. Choose <b>Full (strict)</b> and save.</li>
+            <li>Under <b>SSL/TLS → Edge Certificates</b>, check that the visitor certificate is active. Switch on <b>Always Use HTTPS</b>.</li>
+            <li>Under <b>Network</b>, check that <b>WebSockets</b> is <b>On</b>.</li>
+        </ol>
+        <div class="tip">Cloudflare manages the visitor certificate. The origin certificate you installed protects the connection from Cloudflare to your server. Keep the DNS records proxied.</div>
+        <p>If this Cloudflare zone also serves other websites, check their origin certificates before changing the zone-wide setting.</p>
+    </div>
+</div>
+
+<div class="card step">
+    <div class="num">6</div>
+    <div>
         <h2>Open your hotel</h2>
         <ol>
-            <li>Visit <a href="https://{{DOMAIN}}" target="_blank" rel="noopener">https://{{DOMAIN}}</a>. If you see an error, your domain isn't active in Cloudflare yet. Wait a few minutes and refresh.</li>
+            <li>Visit <a href="https://{{DOMAIN}}" target="_blank" rel="noopener">https://{{DOMAIN}}</a>. Check that the website loads over HTTPS. Also visit <code>https://www.{{DOMAIN}}</code> and confirm it redirects to your hotel. Use the troubleshooting section below if either fails.</li>
             <li>Log in with the admin username and password the installer showed you. They're also saved in <code>{{CREDENTIALS_FILE}}</code>.</li>
             <li>Change your password under <b>Settings → Password</b>.</li>
-            <li>Click <b>Enter hotel</b>. Have fun! 🏨</li>
+            <li>Click <b>Enter hotel</b> and check that the game connects. This also verifies the WebSocket hostname.</li>
         </ol>
         <p>Manage your hotel (news, users, ranks, shop) at <a href="https://{{DOMAIN}}/housekeeping" target="_blank" rel="noopener">https://{{DOMAIN}}/housekeeping</a>.</p>
     </div>
@@ -151,14 +171,14 @@
         Cloudflare can't reach your server. Check that the server is running and that the DNS records point to <code>{{SERVER_IP}}</code>.
         Some hosting companies also have a firewall in their control panel: allow ports 80 and 443 there.</details>
     <details><summary>Cloudflare error 526</summary>
-        Set <b>SSL/TLS → Overview</b> to <b>Full</b>, not Full (strict).</details>
+        Cloudflare cannot validate the origin certificate. Check its expiry and hostname coverage, then confirm nginx or IIS is serving the new certificate for the failing hostname. Check the <code>www</code> and <code>{{WS_HOST}}</code> bindings too. Correct the certificate or binding and keep <b>Full (strict)</b> enabled.</details>
     <details><summary>“Too many redirects”</summary>
-        SSL/TLS is set to Flexible. Change it to <b>Full</b>.</details>
+        If SSL/TLS is set to Flexible, finish the origin-certificate steps and select <b>Full (strict)</b>. If strict mode is already active, check your application redirect settings.</details>
     <details><summary>The client loads but disconnects, or stays on the loading screen</summary>
         Check that <b>WebSockets</b> is on in Cloudflare (Network), then restart the emulator: <code>{{RESTART_COMMAND}}</code>.
         Still stuck? Watch the log while you open the client: <code>{{LOG_COMMAND}}</code>.</details>
     <details><summary>Asking for help on DevBest</summary>
-        Post what you did, what you see (a screenshot helps) and the last lines of the emulator log. Never post your passwords file.</details>
+        Post what you did, what you see (a screenshot helps) and the last lines of the emulator log. Never post your passwords file or private key.</details>
 </div>
 
 <div class="card done">
@@ -168,11 +188,30 @@
 </main>
 <script>
     document.querySelectorAll('.copy').forEach(function (button) {
-        button.addEventListener('click', function () {
-            navigator.clipboard.writeText(button.dataset.copy).then(function () {
-                button.textContent = 'copied';
-                setTimeout(function () { button.textContent = 'copy'; }, 1500);
-            });
+        button.addEventListener('click', async function () {
+            var target = button.dataset.copyTarget && document.getElementById(button.dataset.copyTarget);
+            var value = target ? target.textContent : button.dataset.copy;
+            try {
+                if (!navigator.clipboard) throw new Error('Clipboard unavailable');
+                await navigator.clipboard.writeText(value);
+            } catch (error) {
+                var input = document.createElement('textarea');
+                input.value = value;
+                input.style.position = 'fixed';
+                input.style.opacity = '0';
+                document.body.appendChild(input);
+                input.select();
+                var copied = false;
+                try { copied = document.execCommand('copy'); } catch (error) {}
+                input.remove();
+                button.focus();
+                if (!copied) {
+                    button.textContent = 'select text to copy';
+                    return;
+                }
+            }
+            button.textContent = 'copied';
+            setTimeout(function () { button.textContent = 'copy'; }, 1500);
         });
     });
 </script>

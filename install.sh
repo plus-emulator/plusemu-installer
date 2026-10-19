@@ -10,6 +10,7 @@
 #
 # Unattended runs can preset the answers: PLUSEMU_DOMAIN, PLUSEMU_WS_URL,
 # PLUSEMU_HOTEL_NAME, PLUSEMU_ADMIN_USER, PLUSEMU_ADMIN_EMAIL, PLUSEMU_YES=1.
+# PLUSEMU_GUIDE_MODE=simple|advanced selects the final instructions only.
 set -Eeuo pipefail
 shopt -u patsub_replacement 2> /dev/null || true # bash 5.2 would expand "&" in template values
 
@@ -96,11 +97,13 @@ repair_admin_password() {
     fi
 }
 
-render() { # render <template> <output>: replace {{KEY}} with the shell variable KEY
-    local content key
+render() { # render <template> <output> [certificate fragment]: replace {{KEY}} with shell variable KEY
+    local content key certificate_steps=""
     content=$(< "$1")
+    if [ -n "${3-}" ]; then certificate_steps=$(< "$3"); fi
+    content=${content//"{{CERTIFICATE_STEPS}}"/"$certificate_steps"}
     for key in DOMAIN SOCKET_URL FURNIDATA_URL SERVER_IP WS_HOST HOTEL_NAME ADMIN_USER ADMIN_EMAIL \
-        CREDENTIALS_FILE RESTART_COMMAND LOG_COMMAND WS_DNS_ROW; do
+        CREDENTIALS_FILE RESTART_COMMAND LOG_COMMAND WS_DNS_ROW GUIDE_MODE_TITLE GUIDE_MODE_DETAILS; do
         content=${content//"{{$key}}"/${!key-}}
     done
     printf '%s\n' "$content" > "$2"
@@ -141,6 +144,7 @@ ADMIN_EMAIL='$ADMIN_EMAIL'
 ADMIN_PASSWORD='$ADMIN_PASSWORD'
 DB_PASSWORD='$DB_PASSWORD'
 GUIDE_TOKEN='$GUIDE_TOKEN'
+GUIDE_MODE='${GUIDE_MODE:-simple}'
 EOF
     chmod 600 "$STATE_FILE"
     umask 022
@@ -184,17 +188,30 @@ load_installer_files() {
     TEMPLATES=$INSTALLER_TMP/templates
 }
 
+select_guide_mode() {
+    GUIDE_MODE=${GUIDE_MODE_OPTION:-${PLUSEMU_GUIDE_MODE:-${1:-simple}}}
+    case "$GUIDE_MODE" in
+        simple | advanced) ;;
+        *) die "Guide mode must be simple or advanced (this selects instructions only)." ;;
+    esac
+}
+
 ask_questions() {
+    select_guide_mode
     say ""
     say "${bold}Welcome to the PlusEMU hotel installer!${reset}"
     say "This sets up your emulator, client and website on this server in about 10 minutes."
     say ""
 
     if [ -f "$STATE_FILE" ]; then
+        GUIDE_MODE=simple
         # shellcheck disable=SC1090
         . "$STATE_FILE"
-        if [ -z "${GUIDE_TOKEN:-}" ]; then GUIDE_TOKEN=$(random_secret 12) && save_state; fi
+        select_guide_mode "$GUIDE_MODE"
+        if [ -z "${GUIDE_TOKEN:-}" ]; then GUIDE_TOKEN=$(random_secret 12); fi
+        save_state
         say "Found the settings of an earlier run for ${bold}$DOMAIN${reset}; continuing that installation."
+        say "  Setup guide: $GUIDE_MODE. Selecting this guide does not change SSH, RDP, firewall, updates or backups."
         return
     fi
 
@@ -247,6 +264,7 @@ ask_questions() {
     say "  WebSocket:  ${bold}$WS_URL${reset}"
     say "  Hotel name: ${bold}$HOTEL_NAME${reset}"
     say "  Admin:      ${bold}$ADMIN_USER${reset} ($ADMIN_EMAIL)"
+    say "  Setup guide: $GUIDE_MODE. Selecting this guide does not change SSH, RDP, firewall, updates or backups."
     if [ "${PLUSEMU_YES:-0}" != 1 ]; then
         local go
         ask go "Start the installation? (y/n)" "y"
@@ -572,8 +590,7 @@ configure_web() {
     local ssl=/etc/ssl/plusemu php_sock=/run/php/php$PHP-fpm.sock
     mkdir -p "$ssl"
     if [ ! -f "$ssl/cert.pem" ]; then
-        # Cloudflare (SSL mode "Full") encrypts to this certificate; visitors see Cloudflare's.
-        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout "$ssl/key.pem" -out "$ssl/cert.pem" \
+            openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout "$ssl/key.pem" -out "$ssl/cert.pem" \
             -subj "/CN=$DOMAIN" -addext "subjectAltName=DNS:$DOMAIN,DNS:*.$DOMAIN" 2> /dev/null
         chmod 600 "$ssl/key.pem"
     fi
@@ -722,11 +739,13 @@ write_guide() {
     CREDENTIALS_FILE=$STATE_FILE
     RESTART_COMMAND="sudo systemctl restart plusemu"
     LOG_COMMAND="sudo journalctl -u plusemu -f"
+    GUIDE_MODE_TITLE=${GUIDE_MODE^}
+    GUIDE_MODE_DETAILS=$(< "$TEMPLATES/guide-$GUIDE_MODE.html")
     WS_DNS_ROW=""
     if [ "$WS_HOST" != "$DOMAIN" ]; then
         WS_DNS_ROW="<tr><td>A</td><td><code>${WS_HOST%."$DOMAIN"}</code></td><td><code>$SERVER_IP</code></td><td>Proxied (orange cloud)</td></tr>"
     fi
-    render "$TEMPLATES/setup-guide.html" "$HOTEL_ROOT/setup-guide/index.html"
+    render "$TEMPLATES/setup-guide.html" "$HOTEL_ROOT/setup-guide/index.html" "$TEMPLATES/certificate-linux.html"
     ok "Guide written"
 }
 
@@ -735,7 +754,7 @@ finish() {
     say ""
     say "${green}${bold}🎉 Your hotel is installed!${reset}"
     say ""
-    say "  One last part: connect your domain through Cloudflare (about 5 minutes)."
+    say "  One last part: connect your domain and install your Cloudflare origin certificate."
     say "  Open this page in your browser for easy step-by-step instructions:"
     say ""
     say "      ${bold}${cyan}http://$SERVER_IP/$GUIDE_TOKEN/${reset}"
@@ -758,6 +777,19 @@ finish() {
 }
 
 main() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --guide-mode)
+                if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+                    die "Usage: install.sh [--guide-mode simple|advanced]"
+                fi
+                GUIDE_MODE_OPTION=$2
+                shift 2
+                ;;
+            *) die "Unknown option: $1. Usage: install.sh [--guide-mode simple|advanced]" ;;
+        esac
+    done
+    select_guide_mode
     trap 'on_error $LINENO' ERR
     preflight
     exec >> "$LOG" 2>&1
