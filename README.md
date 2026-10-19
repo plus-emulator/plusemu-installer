@@ -50,11 +50,33 @@ The installer asks five questions. Press Enter to accept a suggested answer:
 
 After you confirm, the installer runs on its own in about 10 minutes.
 
+### Choose the setup guide
+
+The **simple** guide is the default. The **advanced** guide includes a manual checklist for administrator access, firewall rules and maintenance. Both contain the full Cloudflare certificate generation and server import steps.
+
+**This selects instructions only. Selecting this guide does not change SSH, RDP, firewall, updates or backups.** There is no advanced provisioning mode in this release.
+
+For downloaded scripts, use `sudo bash install.sh --guide-mode advanced` on Linux or `.\install.ps1 -GuideMode advanced` in Administrator PowerShell. Use `simple` instead to choose the simple guide.
+
+For the one-command installation, set the choice on the process running the installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo env PLUSEMU_GUIDE_MODE=advanced bash
+```
+
+```powershell
+$env:PLUSEMU_GUIDE_MODE = 'advanced'
+irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.ps1 | iex
+Remove-Item Env:\PLUSEMU_GUIDE_MODE
+```
+
+The choice is saved with your existing installation settings and reused on reruns. An explicit script argument takes precedence over the environment variable; either overrides the saved choice. Older installations without a saved guide choice use simple. Rerunning the installer regenerates the guide with the selected instructions while keeping your saved credentials.
+
 ## When it finishes
 
 The installer generates passwords automatically and prints your initial admin login and database connection details, including the database password. On Windows it also prints the MariaDB root password. These passwords are saved before installation starts; the installer tells you where to retrieve them even if a later step fails. The final password summary is shown in the terminal, not written to the installer log or browser setup guide.
 
-It also points you to a **setup guide**: a web page with step-by-step instructions for connecting your domain through Cloudflare, which takes about 5 minutes.
+It also points you to a **setup guide** with instructions for connecting your domain through Cloudflare and installing an origin certificate. The guide includes commands for your server's operating system and contains no passwords or private keys.
 
 - **Linux:** open `http://<your server IP>/<token>/`. The installer prints the exact address. The token is random so that strangers can't find the page.
 - **Windows:** the guide opens in your browser. A copy named *Hotel setup guide* is saved on your desktop.
@@ -64,10 +86,13 @@ The guide walks you through:
 1. Adding your domain to Cloudflare
 2. Pointing your domain's nameservers to Cloudflare
 3. Adding the DNS records (proxied, orange cloud)
-4. Setting SSL/TLS to **Full**, turning on Always Use HTTPS and checking that WebSockets are on
-5. Opening your hotel and logging in
+4. Generating a private key and certificate-signing request (CSR) on your server, requesting a Cloudflare Origin CA certificate, and importing the signed certificate into nginx or IIS
+5. Setting SSL/TLS to **Full (strict)** after installing the certificate, turning on Always Use HTTPS, and checking that WebSockets are on
+6. Opening your hotel and logging in
 
-Once Cloudflare is active, your hotel is live at `https://myhotel.com`, and housekeeping is at `https://myhotel.com/housekeeping`.
+The installer starts with a temporary self-signed certificate. Complete the certificate steps before selecting **Full (strict)**. Keep the DNS records proxied with the orange cloud. Cloudflare Origin CA certificates protect the connection from Cloudflare to your server and are not trusted directly by browsers. The private key stays on your server. Paste only the CSR into Cloudflare.
+
+Once Cloudflare is active and the certificate is installed, your hotel is live at `https://myhotel.com`, and housekeeping is at `https://myhotel.com/housekeeping`.
 
 ## How it works
 
@@ -83,7 +108,7 @@ Every step is logged. If a step fails, the installer shows the last lines of the
 6. Starts the emulator as the `plusemu` systemd service.
 7. Installs the Atom CMS website and creates your admin account.
 8. Configures nginx and the firewall:
-   - nginx serves the site over HTTPS with a self-signed certificate that Cloudflare accepts in **Full** mode.
+   - nginx starts with a temporary self-signed HTTPS certificate. The setup guide replaces it with a Cloudflare Origin CA certificate for **Full (strict)**.
    - It restores visitors' real IPs from Cloudflare and passes the game's WebSocket through to the emulator.
    - The `ufw` firewall allows only SSH, HTTP and HTTPS. The database and the emulator stay private.
 9. Writes your setup guide.

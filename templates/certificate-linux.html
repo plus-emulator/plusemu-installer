@@ -1,0 +1,62 @@
+        <h3>A. Create a certificate request on your Linux server</h3>
+        <p>Connect to your server's terminal. Run <code>sudo -i</code> to open a root shell, then copy this block.</p>
+        <button class="copy" data-copy-target="create-csr">copy</button>
+        <pre><code id="create-csr">umask 077
+mkdir /root/plusemu-origin &amp;&amp; openssl req -new -newkey rsa:2048 -nodes \
+  -keyout /root/plusemu-origin/key.pem \
+  -out /root/plusemu-origin/request.csr \
+  -subj "/CN={{DOMAIN}}" \
+  -addext "subjectAltName=DNS:{{DOMAIN}},DNS:www.{{DOMAIN}},DNS:{{WS_HOST}}"</code></pre>
+        <p>If the directory already exists, stop and reuse its pending request. Do not overwrite its key after requesting a certificate. All certificate files stay under <code>/root/plusemu-origin</code>, outside the website.</p>
+        <p>Display the request and copy the complete block, including its BEGIN and END lines.</p>
+        <button class="copy" data-copy-target="show-csr">copy</button>
+        <pre><code id="show-csr">cat /root/plusemu-origin/request.csr</code></pre>
+
+        <h3>B. Sign the request in Cloudflare</h3>
+        <ol>
+            <li>Open your domain in Cloudflare. Go to <b>SSL/TLS → Origin Server → Create Certificate</b>.</li>
+            <li>Select <b>Use my private key and CSR</b>. Paste the request you just copied. The private key stays on your server.</li>
+            <li>Check that all the hostnames listed above are included. Choose a validity period and click <b>Create</b>.</li>
+            <li>Select <b>PEM</b> as the certificate format. Copy the complete Origin Certificate, including its BEGIN and END lines.</li>
+        </ol>
+        <p>Back in the root terminal, run the command below. Paste the certificate, press Enter, then press <b>Ctrl+D</b> to save it.</p>
+        <button class="copy" data-copy-target="save-certificate">copy</button>
+        <pre><code id="save-certificate">cat &gt; /root/plusemu-origin/cert.pem</code></pre>
+
+        <h3>C. Check and activate the certificate</h3>
+        <p>This block verifies the certificate against Cloudflare's CA, checks the key and hostnames, backs up the existing pair, and reloads nginx. If nginx rejects the new files, it restores the old pair.</p>
+        <button class="copy" data-copy-target="activate-certificate">copy</button>
+        <pre><code id="activate-certificate">bash &lt;&lt;'CERTIFICATE'
+set -e
+cd /root/plusemu-origin
+openssl x509 -in cert.pem -noout -issuer -dates
+openssl x509 -in cert.pem -noout -checkend 86400
+curl -fsSL https://developers.cloudflare.com/ssl/static/origin_ca_rsa_root.pem -o origin-ca.pem
+for host in '{{DOMAIN}}' 'www.{{DOMAIN}}' '{{WS_HOST}}'; do
+  openssl verify -CAfile origin-ca.pem -purpose sslserver -verify_hostname "$host" cert.pem
+done
+openssl pkey -in key.pem -pubout -out key-public.pem
+openssl x509 -in cert.pem -pubkey -noout &gt; cert-public.pem
+cmp key-public.pem cert-public.pem
+backup=$(mktemp -d /etc/ssl/plusemu/backup.XXXXXX)
+cp -p /etc/ssl/plusemu/cert.pem /etc/ssl/plusemu/key.pem "$backup/"
+echo "Previous certificate and key saved in $backup"
+if install -m 600 key.pem /etc/ssl/plusemu/key.pem &amp;&amp;
+   install -m 644 cert.pem /etc/ssl/plusemu/cert.pem &amp;&amp;
+   nginx -t &amp;&amp; systemctl reload nginx; then
+  echo 'Certificate installed. Continue with Full (strict).'
+else
+  cp -p "$backup/cert.pem" "$backup/key.pem" /etc/ssl/plusemu/
+  nginx -t &amp;&amp; systemctl reload nginx
+  echo 'Restored the previous files. Fix the reported error before continuing.'
+  exit 1
+fi
+CERTIFICATE</code></pre>
+        <p>Confirm that the issuer shown is Cloudflare and that you see <code>Certificate installed</code>. If any check fails, stop and correct the certificate before continuing. The final HTTPS and game checks below verify it through Cloudflare.</p>
+        <details><summary>Restore the previous nginx certificate</summary>
+            <p>Use the backup directory printed above. Replace <code>backup.XXXXXX</code> with that exact directory name before running this in the root terminal.</p>
+            <pre><code>cp -p /etc/ssl/plusemu/backup.XXXXXX/cert.pem /etc/ssl/plusemu/backup.XXXXXX/key.pem /etc/ssl/plusemu/ &amp;&amp;
+nginx -t &amp;&amp; systemctl reload nginx</code></pre>
+            <p>This restores the previous server files. An old self-signed certificate still cannot pass Full (strict); install a valid origin certificate to finish setup.</p>
+        </details>
+        <p>When you finish, run <code>exit</code> to leave the root shell. Keep the private key and backup directories private.</p>

@@ -1,0 +1,34 @@
+        <h3>A. Create a certificate request in IIS</h3>
+        <ol>
+            <li>On your Windows server, open <b>Internet Information Services (IIS) Manager</b> as Administrator. Select the server name on the left.</li>
+            <li>Open <b>Server Certificates</b>, then click <b>Create Certificate Request</b>.</li>
+            <li>Enter <code>{{DOMAIN}}</code> as the <b>Common name</b>. Fill in the remaining organization and location fields.</li>
+            <li>Choose <b>Microsoft RSA SChannel Cryptographic Provider</b> and a bit length of <b>2048</b> or higher.</li>
+            <li>Save the request as <code>plusemu-origin-request.txt</code> in your administrator account's Documents folder. IIS keeps the private key on this server.</li>
+            <li>Open the request in Notepad. Copy the whole request, including its BEGIN and END lines.</li>
+        </ol>
+        <p>If you are resuming this step, reuse your pending request. Complete it on the same Windows server where you created it.</p>
+
+        <h3>B. Sign the request in Cloudflare</h3>
+        <ol>
+            <li>Open your domain in Cloudflare. Go to <b>SSL/TLS → Origin Server → Create Certificate</b>.</li>
+            <li>Select <b>Use my private key and CSR</b>. Paste the request from Notepad. Do not paste or export the private key.</li>
+            <li>Add all the hostnames listed above, even though the IIS request has only one common name. Choose a validity period and click <b>Create</b>.</li>
+            <li>Select <b>PKCS#7</b> for the certificate format. Save the returned certificate on the server as <code>plusemu-origin.p7b</code> in the same Documents folder. If copying its text into Notepad, use <b>Save as type → All Files</b> so it does not become a <code>.txt</code> file.</li>
+        </ol>
+
+        <h3>C. Complete the request and update your hotel</h3>
+        <ol>
+            <li>In IIS Manager, return to the server's <b>Server Certificates</b>. Click <b>Complete Certificate Request</b>.</li>
+            <li>Select <code>plusemu-origin.p7b</code>. Change the file picker to <b>All Files</b> if needed. Set a recognizable friendly name, such as <code>PlusEMU Cloudflare Origin</code>, and select the <b>Personal</b> certificate store.</li>
+            <li>Open the completed certificate. Check the issuer, expiry date, and <b>Details → Subject Alternative Name</b>. Confirm it covers every hostname above and says that you have a corresponding private key.</li>
+            <li>Expand <b>Sites → Hotel</b> and click <b>Bindings</b>. Note each existing HTTPS binding's certificate so you can restore it if needed.</li>
+            <li>Edit the existing <b>https</b> binding for <code>{{DOMAIN}}</code>. Select the new certificate and save. Keep its hostname, port <b>443</b>, and <b>Require Server Name Indication</b> setting unchanged.</li>
+            <li>Repeat for the existing <code>www.{{DOMAIN}}</code> binding and the <code>{{WS_HOST}}</code> binding if that hostname is different. Update each binding once. Leave the HTTP bindings in place.</li>
+        </ol>
+        <p>The new certificate takes effect on new connections. Continue below to enable Full (strict), then check the website and game connection.</p>
+        <details><summary>The new certificate is missing or has no private key</summary>
+            Return to the server where you created the request. Complete that exact request using its Cloudflare response. A certificate created from another request cannot use this server's pending key. Do not change the HTTPS bindings until the completed certificate has its private key.</details>
+        <details><summary>Restore the previous IIS certificate</summary>
+            Open <b>Sites → Hotel → Bindings</b>. Edit each changed HTTPS binding and select the certificate you noted earlier. Keep the hostname and SNI settings unchanged. An old self-signed certificate still cannot pass Full (strict); install a valid origin certificate to finish setup.</details>
+        <p><a href="https://learn.microsoft.com/en-us/iis/manage/configuring-security/how-to-set-up-ssl-on-iis" target="_blank" rel="noopener">Microsoft's IIS certificate and HTTPS binding guide</a></p>
