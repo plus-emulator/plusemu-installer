@@ -45,8 +45,9 @@ curl() {
             printf 'https://github.com/plus-emulator/PlusEMU/releases/tag/%s' "$LATEST_EMULATOR" ;;
         https://github.com/plus-emulator/Volt/releases/latest)
             printf 'https://github.com/plus-emulator/Volt/releases/tag/%s' "$LATEST_CLIENT" ;;
-        https://github.com/*/releases/download/*)
+        https://github.com/*/releases/download/* | https://github.com/plus-emulator/plusemu-installer/releases/latest/download/*)
             local file=$RELEASES/${url#https://github.com/*/releases/download/}
+            if [[ $url == */releases/latest/download/* ]]; then file=$RELEASES/hotel-files/${url##*/}; fi
             if [ ! -f "$file" ]; then
                 if [[ " $* " == *' -w '* ]]; then printf 404; return 0; fi
                 return 22
@@ -93,6 +94,15 @@ fails() {
     set -e
     [ "$status" -ne 0 ]
 }
+make_hotel_files() { # make_hotel_files <revision>: the stock hotel files pack on the latest installer release
+    local dir=$TEST_DIR/build/hotel-files-$1
+    mkdir -p "$dir/gamedata" "$dir/assets/furni" "$RELEASES/hotel-files"
+    printf 'figuredata %s\n' "$1" > "$dir/gamedata/FigureData.json"
+    printf 'furni %s\n' "$1" > "$dir/assets/furni/stock_$1.nitro"
+    tar -C "$dir" -czf "$RELEASES/hotel-files/hotel-files.tar.gz" .
+    (cd "$RELEASES/hotel-files" && sha256sum hotel-files.tar.gz > SHA256SUMS)
+}
+
 snapshots() { find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d 2> /dev/null | wc -l; }
 
 # An installation made before update mode existed: no versions file, user edits everywhere.
@@ -232,5 +242,56 @@ for tag in v2.1.0 v2.2.0; do
 done
 [[ $(snapshots) == 3 && $(< "$emulator/Plus Emulator") == 'emulator v2.2.0' ]]
 [[ $(< "$client/index.html") == 'client client-v2.0.0' ]]
+
+# Without --with-assets the hotel files stay as they are, and a newer pack is pointed out.
+hotel_files=$HOTEL_ROOT/hotel-files
+mkdir -p "$hotel_files/gamedata" "$hotel_files/assets/custom"
+printf 'figuredata 1\n' > "$hotel_files/gamedata/FigureData.json"
+printf 'my furni\n' > "$hotel_files/assets/custom/my_furni.nitro"
+touch "$hotel_files/.complete"
+make_hotel_files 2
+pack_version=$(cut -c1-12 "$RELEASES/hotel-files/SHA256SUMS")
+: > "$TEST_DIR/terminal"
+run_update --yes
+grep -Fq -- '--with-assets' "$TEST_DIR/terminal"
+[[ $(< "$hotel_files/gamedata/FigureData.json") == 'figuredata 1' ]]
+cp -a "$HOTEL_ROOT" "$TEST_DIR/before-assets"
+run_update --check --with-assets
+grep -Fq "$pack_version" "$TEST_DIR/terminal"
+diff -r "$TEST_DIR/before-assets" "$HOTEL_ROOT"
+
+# A damaged pack changes nothing.
+good_sums=$(< "$RELEASES/hotel-files/SHA256SUMS")
+printf '%064d  hotel-files.tar.gz\n' 0 > "$RELEASES/hotel-files/SHA256SUMS"
+fails --yes --with-assets
+diff -r "$TEST_DIR/before-assets" "$HOTEL_ROOT"
+printf '%s\n' "$good_sums" > "$RELEASES/hotel-files/SHA256SUMS"
+
+# A failed update restores the hotel files too.
+MIGRATION=fail
+fails --yes --with-assets
+diff -r "$TEST_DIR/before-assets" "$HOTEL_ROOT"
+MIGRATION=ok
+
+# --with-assets installs the stock pack over the hotel files and the emulator's matching clothing data.
+run_update --yes --with-assets
+[[ $(< "$hotel_files/gamedata/FigureData.json") == 'figuredata 2' ]]
+[[ -f "$hotel_files/assets/furni/stock_2.nitro" && -f "$hotel_files/assets/custom/my_furni.nitro" ]]
+[[ $(< "$emulator/Config/figuredata.xml") == 'default figuredata' ]]
+[[ $(< "$emulator/Config/nlog.config") == 'my nlog' ]]
+[[ $(jq -r .Custom "$emulator/Config/config.json") == kept ]]
+[[ $(< "$emulator/Plus Emulator") == 'emulator v2.2.0' ]]
+grep -qx "ASSETS_VERSION='$pack_version'" "$VERSIONS_FILE"
+grep -qx "EMULATOR_VERSION='v2.2.0'" "$VERSIONS_FILE"
+latest=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d | sort | tail -1)
+[[ -f "$latest/hotel-files.tar" ]]
+
+: > "$TEST_DIR/calls"
+run_update --yes --with-assets
+if grep -q 'systemctl stop' "$TEST_DIR/calls"; then exit 1; fi
+
+# --rollback also returns the hotel files.
+run_update --yes --rollback
+diff -r "$TEST_DIR/before-assets" "$HOTEL_ROOT"
 
 printf 'Bash update checks passed\n' >&4
