@@ -776,6 +776,10 @@ finish() {
     say ""
 }
 
+update_main() {
+    die "Update mode is not implemented yet."
+}
+
 main() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
