@@ -129,6 +129,8 @@ The pages the installer generates, such as the setup guide and the client config
 | Hotel files | `/var/www/hotel` | `C:\Hotel` |
 | Saved answers and passwords | `/etc/plusemu/hotel.env` | `C:\ProgramData\PlusEMU\hotel.json` |
 | Installer log | `/var/log/plusemu-install.log` | `C:\ProgramData\PlusEMU\install.log` |
+| Installed versions | `/etc/plusemu/versions.env` | |
+| Update backups | `/var/backups/plusemu` | |
 | Restart the emulator | `sudo systemctl restart plusemu` | `Restart-Service PlusEMU` |
 | Watch the emulator log | `sudo journalctl -u plusemu -f` | `Get-Content C:\Hotel\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 50 -Wait` |
 
@@ -149,6 +151,46 @@ Enter the database password at the prompt. On Windows, use `mariadb.exe` from yo
 Linux database root uses local socket authentication (`sudo mariadb`); no root password is generated. Windows database root uses the saved `DbRootPassword`.
 
 Change your initial admin password after logging in. The saved file still contains the initial value. Keep the file and terminal password summary private, and remove credentials before sharing logs or screenshots.
+
+## Update the emulator and the client
+
+New PlusEMU and Volt releases come out often. To install them, run this on your server:
+
+```bash
+sudo plusemu-update
+```
+
+Hotels installed before this command existed run this once. After that, `sudo plusemu-update` works:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash -s -- update
+```
+
+The update shows the installed and the newest versions and asks before it changes anything. Then it:
+
+1. Downloads the new releases and checks them against their published checksums. If a download fails, your hotel keeps running.
+2. Stops the emulator and saves a backup of the database, the emulator and the client in `/var/backups/plusemu/`. The newest 3 backups are kept.
+3. Installs the new emulator and updates the database with the emulator's own migrations, then installs the new client.
+4. Starts the emulator and checks that it answers.
+
+If any step fails, the update restores the backup and starts the previous version.
+
+The update keeps your work:
+
+- Emulator: every file in `Config/` stays as you left it. New settings from the release are added to `config.json`, your values win. Files you added, such as plugins and database backups, stay.
+- Client: every file in `configuration/` stays as you left it. New settings from the installer's templates are added to `renderer-config.json`, `ui-config.json` and `client-mode.json`, your values win. Files you added, such as `ads.txt` or plugins, stay.
+- The website, the hotel files and your passwords are not changed.
+
+Players are disconnected for about a minute while the emulator restarts. They get the new client when they reload the hotel page.
+
+| Command | What it does |
+|---|---|
+| `sudo plusemu-update` | Update the emulator and the client |
+| `sudo plusemu-update --check` | Show available updates, change nothing |
+| `sudo plusemu-update --yes` | Update without the question |
+| `sudo plusemu-update --rollback` | Restore the newest backup, database included |
+
+`--rollback` returns the database to the moment of the backup, so game changes made since then are lost. It saves the current state first, so running it again undoes the rollback. The update log is `/var/log/plusemu-update.log`.
 
 ## Unattended installs
 
@@ -171,7 +213,7 @@ curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/mai
 Advanced overrides:
 
 - `INSTALLER_REF` installs from another branch or tag of this repository.
-- `EMULATOR_URL`, `CLIENT_URL`, `ASSET_PACK_URL`, `ATOM_REPO` and `ATOM_REF` change where the components come from.
+- `EMULATOR_URL`, `CLIENT_URL`, `ASSET_PACK_URL`, `ATOM_REPO` and `ATOM_REF` change where the components come from. A custom emulator or client URL is saved as version `custom`.
 
 ## Troubleshooting
 
