@@ -17,17 +17,25 @@ shopt -u patsub_replacement 2> /dev/null || true # bash 5.2 would expand "&" in 
 INSTALLER_REPO=${INSTALLER_REPO:-plus-emulator/plusemu-installer}
 INSTALLER_REF=${INSTALLER_REF:-main}
 ASSET_PACK_URL=${ASSET_PACK_URL:-https://github.com/plus-emulator/plusemu-installer/releases/latest/download/hotel-files.tar.gz}
-EMULATOR_URL=${EMULATOR_URL:-https://github.com/plus-emulator/PlusEMU/releases/latest/download/plusemu-linux-ARCH.tar.gz}
-CLIENT_URL=${CLIENT_URL:-https://github.com/plus-emulator/Volt/releases/latest/download/volt-client.zip}
-# Client releases made before the Volt rename ship the same build as octane-client.zip.
-LEGACY_CLIENT_URL=https://github.com/plus-emulator/Volt/releases/latest/download/octane-client.zip
+EMULATOR_REPO=plus-emulator/PlusEMU
+CLIENT_REPO=plus-emulator/Volt
+# Set to install a build from another place instead of the latest release (recorded as version "custom").
+EMULATOR_URL=${EMULATOR_URL:-}
+CLIENT_URL=${CLIENT_URL:-}
 ATOM_REPO=${ATOM_REPO:-https://github.com/atom-projects/atom-cms.git}
 # "auto" picks the Atom CMS that matches the downloaded emulator's database (see download_releases).
 ATOM_REF=${ATOM_REF:-auto}
 
 HOTEL_ROOT=/var/www/hotel
 STATE_FILE=/etc/plusemu/hotel.env
+VERSIONS_FILE=/etc/plusemu/versions.env
 LOG=/var/log/plusemu-install.log
+UPDATE_LOG=/var/log/plusemu-update.log
+UPDATE_COMMAND=/usr/local/sbin/plusemu-update
+BACKUP_ROOT=/var/backups/plusemu
+KEEP_BACKUPS=3
+LOCK_FILE=/run/plusemu-update.lock
+MODE=install
 PHP=8.5
 NODE_MAJOR=22
 TOTAL_STEPS=9
@@ -38,7 +46,7 @@ STEP=0
 exec 3>&1
 bold=$'\e[1m' green=$'\e[32m' red=$'\e[31m' yellow=$'\e[33m' cyan=$'\e[36m' reset=$'\e[0m'
 
-say() { printf '%s\n' "$*" >&3; printf '%s\n' "$*" | sed 's/\x1b\[[0-9;]*m//g'; }
+say() { printf '%s\n' "$*" >&3 2> /dev/null || true; printf '%s\n' "$*" | sed 's/\x1b\[[0-9;]*m//g'; }
 step() { STEP=$((STEP + 1)); say ""; say "${bold}${cyan}[$STEP/$TOTAL_STEPS]${reset} ${bold}$*${reset}"; }
 ok() { say "      ${green}✓${reset} $*"; }
 die() { say ""; say "${red}${bold}✗ $*${reset}"; exit 1; }
@@ -51,14 +59,18 @@ on_error() {
     say ""
     say "${red}${bold}✗ Something went wrong (line $line, exit code $code).${reset}"
     say "  The last lines of the log:"
-    printf '%s\n' "$last" | sed 's/^/    /' >&3
+    printf '%s\n' "$last" | sed 's/^/    /' >&3 2> /dev/null || true
     say ""
     say "  Full log: ${bold}$LOG${reset}"
     if [ -f "$STATE_FILE" ]; then
         say "  Saved passwords: sudo cat $STATE_FILE (keep this file private)."
     fi
-    say "  Fix the problem (or ask for help on DevBest with the log), then run the installer again."
-    say "  It continues where it stopped."
+    if [ "$MODE" = update ]; then
+        say "  The update stopped. Ask for help on DevBest with the log if you need it."
+    else
+        say "  Fix the problem (or ask for help on DevBest with the log), then run the installer again."
+        say "  It continues where it stopped."
+    fi
     exit "$code"
 }
 
@@ -150,10 +162,104 @@ EOF
     umask 022
 }
 
+save_versions() {
+    install -d -m 700 "$(dirname "$VERSIONS_FILE")"
+    printf "EMULATOR_VERSION='%s'\nCLIENT_VERSION='%s'\n" "$EMULATOR_VERSION" "$CLIENT_VERSION" > "$VERSIONS_FILE"
+}
+
+require_free_space() { # require_free_space <GB> [path]
+    local free_gb
+    free_gb=$(df -BG --output=avail "${2:-/}" | tail -1 | tr -dc 0-9)
+    [ "$free_gb" -ge "$1" ] || die "Not enough disk space: ${free_gb} GB free, at least $1 GB needed."
+}
+
+release_version() { # release_version <owner/repo> <custom URL>: the tag of the newest release
+    if [ -n "$2" ]; then
+        printf custom
+        return
+    fi
+    local url
+    url=$(curl -fsSI --retry 3 -o /dev/null -w '%{redirect_url}' "https://github.com/$1/releases/latest") || return 1
+    [[ $url == */releases/tag/* ]] || return 1
+    printf '%s' "${url##*/releases/tag/}"
+}
+
+fetch_release() { # fetch_release <owner/repo> <tag> <asset> <file>: checked against SHA256SUMS when the release has one
+    local base=https://github.com/$1/releases/download/$2 sums=$4.sums status expected
+    curl -fsSL --retry 3 "$base/$3" -o "$4" || return 1
+    status=$(curl -sSL --retry 3 -o "$sums" -w '%{http_code}' "$base/SHA256SUMS") || status=000
+    case $status in
+        200) expected=$(awk -v file="$3" '$2 == file || $2 == "*" file {print $1}' "$sums") ;;
+        404) rm -f "$sums"; return 0 ;; # older releases publish no checksums
+        *) rm -f "$sums"; die "Could not download the checksums of $2. Nothing was changed. Try again later." ;;
+    esac
+    rm -f "$sums"
+    if [ -z "$expected" ] || [ "$(sha256sum "$4" | cut -d' ' -f1)" != "$expected" ]; then
+        die "The download of $3 ($2) does not match its published checksum. Nothing was changed. Try again later."
+    fi
+}
+
+stage_emulator() { # stage_emulator <version> <dir>: unpack the emulator release into a new dir
+    local file
+    mkdir -p "$2"
+    file=$(mktemp -p "$(dirname "$2")")
+    if [ -n "$EMULATOR_URL" ]; then
+        curl -fsSL --retry 3 "${EMULATOR_URL//ARCH/$ARCH}" -o "$file"
+    else
+        fetch_release "$EMULATOR_REPO" "$1" "plusemu-linux-$ARCH.tar.gz" "$file" || die "Could not download PlusEMU $1. Nothing was changed. Try again later."
+    fi
+    tar xzf "$file" --no-same-owner -C "$2"
+    rm -f "$file"
+    [ -x "$2/Plus Emulator" ] || die "The PlusEMU $1 download is incomplete. Nothing was changed. Try again later."
+}
+
+stage_client() { # stage_client <version> <dir>: unpack the client release into a new dir
+    local file
+    mkdir -p "$2"
+    file=$(mktemp -p "$(dirname "$2")")
+    if [ -n "$CLIENT_URL" ]; then
+        curl -fsSL --retry 3 "$CLIENT_URL" -o "$file"
+    else
+        # Client releases made before the Volt rename ship the same build as octane-client.zip.
+        fetch_release "$CLIENT_REPO" "$1" volt-client.zip "$file" 2> /dev/null ||
+            fetch_release "$CLIENT_REPO" "$1" octane-client.zip "$file" || die "Could not download Volt $1. Nothing was changed. Try again later."
+    fi
+    unzip -q "$file" -d "$2"
+    rm -f "$file"
+    [ -f "$2/index.html" ] || die "The Volt $1 download is incomplete. Nothing was changed. Try again later."
+}
+
+wait_for_emulator() {
+    # Any HTTP answer from the emulator's web server means it has started; releases differ in their routes.
+    for _ in $(seq 1 60); do
+        if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/gamedata/furnidata/version)" != 000 ]; then
+            return 0
+        fi
+        sleep 2
+    done
+    journalctl -u plusemu -n 40 --no-pager
+    return 1
+}
+
+install_update_command() {
+    mkdir -p "$(dirname "$UPDATE_COMMAND")"
+    cat > "$UPDATE_COMMAND" <<EOF
+#!/usr/bin/env bash
+# Installed by the PlusEMU installer. Updates the emulator and the Volt client with the newest installer:
+#   sudo plusemu-update [--check] [--yes] [--rollback]
+set -euo pipefail
+script=\$(mktemp)
+trap 'rm -f "\$script"' EXIT
+curl -fsSL "https://raw.githubusercontent.com/$INSTALLER_REPO/$INSTALLER_REF/install.sh" -o "\$script"
+bash "\$script" update "\$@"
+EOF
+    chmod 755 "$UPDATE_COMMAND"
+}
+
 # ---------------------------------------------------------------- steps
 
-preflight() {
-    [ "$(id -u)" -eq 0 ] || die "Please run the installer as root: curl -fsSL <url> | sudo bash"
+preflight() { # preflight [free GB needed]
+    [ "$(id -u)" -eq 0 ] || die "Please run this as root, with sudo."
     [ -r /etc/os-release ] || die "This installer supports Debian 12/13 and Ubuntu 22.04/24.04/26.04 only."
     # shellcheck disable=SC1091
     . /etc/os-release
@@ -167,16 +273,13 @@ preflight() {
         aarch64) ARCH=arm64 ;;
         *) die "Unsupported processor: $(uname -m). A 64-bit (x86_64 or arm64) server is required." ;;
     esac
-    local free_gb
-    free_gb=$(df -BG --output=avail / | tail -1 | tr -dc 0-9)
-    [ "$free_gb" -ge 10 ] || die "Not enough disk space: ${free_gb} GB free, at least 10 GB needed."
-    : > "$LOG"
-    chmod 600 "$LOG"
+    require_free_space "${1:-10}"
 }
 
 load_installer_files() {
     # Templates ship next to this script. When run through `curl | bash` there
     # is no script directory, so the matching installer release is downloaded.
+    [ -z "${TEMPLATES:-}" ] || return 0
     local here
     here=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)
     if [ -n "$here" ] && [ -f "$here/templates/setup-guide.html" ]; then
@@ -342,31 +445,31 @@ install_toolchains() {
 
 download_releases() {
     step "Downloading PlusEMU, the Volt client and Atom CMS"
-    # A re-run repairs and keeps the installed releases: a newer emulator may need
-    # database changes this installer does not apply.
-    local out=$HOTEL_ROOT/emulator
+    # A re-run repairs and keeps the installed releases; `install.sh update` updates them.
+    local out=$HOTEL_ROOT/emulator client=$HOTEL_ROOT/client
+    EMULATOR_VERSION=unknown CLIENT_VERSION=unknown
+    # shellcheck disable=SC1090
+    if [ -f "$VERSIONS_FILE" ]; then . "$VERSIONS_FILE"; fi
     if [ -x "$out/Plus Emulator" ]; then
         ok "PlusEMU (already installed)"
     else
-        mkdir -p "$out"
-        curl -fsSL --retry 3 "${EMULATOR_URL//ARCH/$ARCH}" | tar xz --no-same-owner -C "$out"
-        ok "PlusEMU (latest release)"
+        EMULATOR_VERSION=$(release_version "$EMULATOR_REPO" "$EMULATOR_URL") || die "Could not find the latest PlusEMU release. Check the server's internet connection."
+        rm -rf "$out"
+        stage_emulator "$EMULATOR_VERSION" "$out"
+        save_versions
+        ok "PlusEMU $EMULATOR_VERSION"
     fi
 
-    local client=$HOTEL_ROOT/client zip
     if [ -f "$client/index.html" ]; then
         ok "Volt client (already installed)"
     else
-        zip=$(mktemp)
-        curl -fsSL --retry 3 "$CLIENT_URL" -o "$zip" 2> /dev/null || curl -fsSL --retry 3 "$LEGACY_CLIENT_URL" -o "$zip"
-        rm -rf "$client.new" && mkdir -p "$client.new"
-        unzip -q "$zip" -d "$client.new"
-        rm -f "$zip"
-        rm -rf "$client.old"
-        if [ -d "$client" ]; then mv "$client" "$client.old"; fi
+        CLIENT_VERSION=$(release_version "$CLIENT_REPO" "$CLIENT_URL") || die "Could not find the latest Volt release. Check the server's internet connection."
+        rm -rf "$client.new"
+        stage_client "$CLIENT_VERSION" "$client.new"
+        rm -rf "$client"
         mv "$client.new" "$client"
-        rm -rf "$client.old"
-        ok "Volt client (latest release)"
+        save_versions
+        ok "Volt client $CLIENT_VERSION"
     fi
 
     local atom=$ATOM_REF
@@ -381,13 +484,13 @@ download_releases() {
 }
 
 # shellcheck disable=SC2034 # the {{KEY}} values are read by render() through ${!key}
-write_client_config() {
+write_client_config() { # write_client_config [dir]
     # Newer emulators build FurnitureData.json from the furniture table; older ones need the static file.
     FURNIDATA_URL='${gamedata.url}/FurnitureData.json?t=%timestamp%'
     if curl -fsS -o /dev/null http://127.0.0.1:8080/api/gamedata/furnidata; then
         FURNIDATA_URL="https://$DOMAIN/api/gamedata/furnidata"
     fi
-    local config=$HOTEL_ROOT/client/configuration file
+    local config=${1:-$HOTEL_ROOT/client/configuration} file
     for file in renderer-config.json ui-config.json client-mode.json; do
         render "$TEMPLATES/$file" "$config/$file"
     done
@@ -473,16 +576,8 @@ EOF
     systemctl daemon-reload
     systemctl enable plusemu
     systemctl restart plusemu
-    # Any HTTP answer from the emulator's web server means it has started; releases differ in their routes.
-    for _ in $(seq 1 60); do
-        if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/gamedata/furnidata/version)" != 000 ]; then
-            ok "The emulator is running (service: plusemu)"
-            return
-        fi
-        sleep 2
-    done
-    journalctl -u plusemu -n 40 --no-pager
-    die "The emulator didn't start. See: journalctl -u plusemu -n 100"
+    wait_for_emulator || die "The emulator didn't start. See: journalctl -u plusemu -n 100"
+    ok "The emulator is running (service: plusemu)"
 }
 
 install_cms() {
@@ -771,16 +866,316 @@ finish() {
     say "      Database root uses local socket authentication: sudo mariadb (no generated root password)."
     say ""
     say "  Retrieve saved passwords: sudo cat $STATE_FILE"
+    say "  Update the emulator and the client later with: sudo plusemu-update"
     say "  Store passwords somewhere safe. Change the initial admin password after logging in;"
     say "  the saved file retains the initial password. Keep passwords out of shared logs and screenshots."
     say ""
 }
 
+# ---------------------------------------------------------------- update
+
+carry_over() { # carry_over <installed dir> <new dir> [skipped path regex]: copy the files the new release lacks
+    local old=$1 new=$2 skip=${3:-} file
+    while IFS= read -r -d '' file; do
+        file=${file#./}
+        if [ -n "$skip" ] && [[ $file =~ $skip ]]; then continue; fi
+        if [ ! -e "$new/$file" ] && [ ! -L "$new/$file" ]; then
+            mkdir -p "$new/$(dirname "$file")"
+            cp -a "$old/$file" "$new/$file"
+        fi
+    done < <(cd "$old" && find . \( -type f -o -type l \) -print0)
+}
+
+keep_emulator_files() { # keep_emulator_files <installed dir> <new dir>
+    local old=$1 new=$2 defaults
+    defaults=$(sed '1s/^\xEF\xBB\xBF//' "$new/Config/config.json")
+    # The release's own libraries replace the old ones; the other files it lacks are the hotel's.
+    carry_over "$old" "$new" '^([^/]+\.(dll|so|pdb|json)|backups/.*)$'
+    cp -a "$old/Config/." "$new/Config/"
+    # Keep every installed setting and add the settings this release introduced.
+    jq -s '.[0] * .[1]' <(printf '%s' "$defaults") <(sed '1s/^\xEF\xBB\xBF//' "$old/Config/config.json") > "$new/Config/config.json.new" ||
+        die "Could not read $old/Config/config.json. Fix the file, then run the update again. Nothing was changed."
+    mv "$new/Config/config.json.new" "$new/Config/config.json"
+    chmod 600 "$new/Config/config.json"
+    chown -R plusemu:plusemu "$new"
+}
+
+keep_client_files() { # keep_client_files <installed dir> <new dir>
+    local old=$1 new=$2 rendered file
+    # Hashed bundles belong to one release; the other files the release lacks are the hotel's.
+    carry_over "$old" "$new" '^(src/)?assets/'
+    if [ -d "$old/configuration" ]; then
+        mkdir -p "$new/configuration"
+        cp -a "$old/configuration/." "$new/configuration/"
+    fi
+    rendered=$(mktemp -d)
+    write_client_config "$rendered"
+    for file in renderer-config.json ui-config.json client-mode.json; do
+        if [ ! -f "$new/configuration/$file" ]; then
+            cp "$rendered/$file" "$new/configuration/$file"
+        elif jq -s '.[0] * .[1]' "$rendered/$file" "$new/configuration/$file" > "$rendered/$file.new" 2> /dev/null; then
+            mv "$rendered/$file.new" "$new/configuration/$file"
+        else
+            say "      ${yellow}Kept configuration/$file as it is: it is not plain JSON, so no new settings were added.${reset}"
+        fi
+    done
+    rm -rf "$rendered"
+}
+
+create_snapshot() { # sets SNAPSHOT to a new backup of the database, the emulator, the client and the versions
+    SNAPSHOT=$BACKUP_ROOT/$(date -u +%Y%m%d-%H%M%S-%N)
+    local partial=$SNAPSHOT.partial
+    install -d -m 700 "$BACKUP_ROOT"
+    install -d -m 700 "$partial"
+    mariadb-dump --protocol=socket -uroot --single-transaction --routines --triggers --events plus | gzip > "$partial/database.sql.gz"
+    # The emulator's own database backups stay in place and are not copied again.
+    # Exit code 1 only means a file changed while it was read, for example a log of the running emulator.
+    tar -C "$HOTEL_ROOT" --exclude=emulator/backups --warning=no-file-changed -czf "$partial/files.tar.gz" emulator client || [ "$?" = 1 ]
+    if [ -f "$VERSIONS_FILE" ]; then cp "$VERSIONS_FILE" "$partial/versions.env"; fi
+    mv "$partial" "$SNAPSHOT"
+}
+
+restore_snapshot() { # restore_snapshot <backup dir> <restore the database: 0|1>
+    local snapshot=$1 staging=$HOTEL_ROOT/.restore
+    systemctl stop plusemu || return 1
+    rm -rf "$staging" && mkdir -p "$staging" || return 1
+    tar xzf "$snapshot/files.tar.gz" -C "$staging" || return 1
+    if [ -d "$HOTEL_ROOT/emulator/backups" ] && [ ! -e "$staging/emulator/backups" ]; then
+        mv "$HOTEL_ROOT/emulator/backups" "$staging/emulator/backups" || return 1
+    fi
+    rm -rf "$HOTEL_ROOT/emulator" "$HOTEL_ROOT/client" || return 1
+    mv "$staging/emulator" "$staging/client" "$HOTEL_ROOT/" && rmdir "$staging" || return 1
+    chown -R plusemu:plusemu "$HOTEL_ROOT/emulator" || return 1
+    if [ "$2" = 1 ]; then
+        sql -e "DROP DATABASE IF EXISTS plus; CREATE DATABASE plus CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" || return 1
+        gunzip -c "$snapshot/database.sql.gz" | sql plus || return 1
+    fi
+    if [ -f "$snapshot/versions.env" ]; then
+        cp "$snapshot/versions.env" "$VERSIONS_FILE" || return 1
+    else
+        rm -f "$VERSIONS_FILE"
+    fi
+    systemctl start plusemu
+}
+
+prune_snapshots() {
+    find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '*.partial' -exec rm -rf {} +
+    find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d | sort | head -n -"$KEEP_BACKUPS" | xargs -r -d '\n' rm -rf
+}
+
+finish_update() { # the EXIT trap: undo an unfinished update and remove temporary files
+    local snapshot=${RESTORE_FROM:-}
+    RESTORE_FROM=
+    rm -rf "${INSTALLER_TMP:-}"
+    if [ -n "$snapshot" ]; then
+        say ""
+        say "  Restoring the previous version from $snapshot ..."
+        if restore_snapshot "$snapshot" "$RESTORE_DATABASE"; then
+            say "  ${green}Your hotel was restored to the version it had before this update.${reset}"
+        else
+            systemctl start plusemu || true
+            say "  ${red}${bold}The automatic restore failed.${reset} Your backup is in $snapshot"
+            say "  (files.tar.gz and database.sql.gz). The previous files are also in ${WORK:-$HOTEL_ROOT}."
+            say "  Ask for help on DevBest with the log: $LOG"
+            return
+        fi
+    elif [ "${EMULATOR_STOPPED:-0}" = 1 ]; then
+        systemctl start plusemu || true
+    fi
+    rm -rf "${WORK:-}"
+}
+
+require_update_space() {
+    # Staged copies and the backup of the files, plus two dumps of the database: the backup's and the emulator's own.
+    local files_mb database_mb
+    files_mb=$(du -smc --exclude=emulator/backups "$HOTEL_ROOT/emulator" "$HOTEL_ROOT/client" | tail -1 | cut -f1)
+    database_mb=$(sql -N -e "SELECT COALESCE(ROUND(SUM(data_length + index_length) / 1048576), 0) FROM information_schema.tables WHERE table_schema = 'plus'" < /dev/null)
+    require_free_space $(((files_mb * 3 + ${database_mb:-0} * 2) / 1024 + 1)) "$HOTEL_ROOT"
+}
+
+confirm_update() { # confirm_update <question>
+    [ "${PLUSEMU_YES:-0}" != 1 ] || return 0
+    local go
+    ask go "$1 (y/n)" "y"
+    [[ $go =~ ^[Yy] ]] || die "Cancelled. Nothing was changed."
+}
+
+rollback_update() {
+    local target name versions="unknown versions"
+    target=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' 2> /dev/null | sort | tail -1)
+    [ -n "$target" ] || die "No backup found in $BACKUP_ROOT. Nothing was changed."
+    name=${target##*/}
+    if [ -f "$target/versions.env" ]; then
+        versions=$(EMULATOR_VERSION=unknown CLIENT_VERSION=unknown
+            # shellcheck disable=SC1091
+            . "$target/versions.env"
+            printf 'emulator %s, client %s' "$EMULATOR_VERSION" "$CLIENT_VERSION")
+    fi
+    say ""
+    say "${bold}Restore the backup from ${name:0:4}-${name:4:2}-${name:6:2} ${name:9:2}:${name:11:2} UTC${reset} ($versions)."
+    say "  ${yellow}The database goes back to that moment too: game changes made since then are lost.${reset}"
+    confirm_update "Restore this backup?"
+
+    require_update_space
+    TOTAL_STEPS=2
+    step "Backing up the current state"
+    systemctl stop plusemu
+    EMULATOR_STOPPED=1
+    create_snapshot
+    ok "Saved in $SNAPSHOT"
+    step "Restoring the backup"
+    RESTORE_FROM=$SNAPSHOT RESTORE_DATABASE=1
+    restore_snapshot "$target" 1 || die "Could not restore $target."
+    RESTORE_FROM='' EMULATOR_STOPPED=0
+    wait_for_emulator || die "The restored emulator didn't start. See: journalctl -u plusemu -n 100"
+    prune_snapshots
+    ok "Restored $target"
+    say ""
+    say "  ${green}${bold}Done.${reset} To undo this, run the same command again: sudo plusemu-update --rollback"
+}
+
 update_main() {
-    die "Update mode is not implemented yet."
+    local check=0 rollback=0 arg latest_emulator latest_client update_emulator=0 update_client=0
+    for arg in "$@"; do
+        case "$arg" in
+            --check) check=1 ;;
+            --yes) PLUSEMU_YES=1 ;;
+            --rollback) rollback=1 ;;
+            *) die "Unknown option: $arg. Usage: plusemu-update [--check] [--yes] [--rollback]" ;;
+        esac
+    done
+    MODE=update
+    LOG=$UPDATE_LOG
+    trap 'on_error $LINENO' ERR
+    preflight 1
+    if [ ! -f "$STATE_FILE" ] || [ ! -x "$HOTEL_ROOT/emulator/Plus Emulator" ]; then
+        die "No hotel from the PlusEMU installer was found on this server. Install one first."
+    fi
+    exec 9> "$LOCK_FILE"
+    flock -n 9 || die "Another update is already running."
+    : > "$LOG"
+    chmod 600 "$LOG"
+    exec >> "$LOG" 2>&1
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+    EMULATOR_VERSION=unknown CLIENT_VERSION=unknown
+    # shellcheck disable=SC1090
+    if [ -f "$VERSIONS_FILE" ]; then . "$VERSIONS_FILE"; fi
+    # A closed SSH session does not stop the update; other stop signals restore the previous version.
+    trap '' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap finish_update EXIT
+
+    if [ "$rollback" = 1 ]; then
+        rollback_update
+        return
+    fi
+
+    latest_emulator=$(release_version "$EMULATOR_REPO" "$EMULATOR_URL") || die "Could not find the latest PlusEMU release. Check the server's internet connection."
+    latest_client=$(release_version "$CLIENT_REPO" "$CLIENT_URL") || die "Could not find the latest Volt release. Check the server's internet connection."
+    if [ "$EMULATOR_VERSION" != "$latest_emulator" ]; then update_emulator=1; fi
+    if [ "$CLIENT_VERSION" != "$latest_client" ]; then update_client=1; fi
+    say ""
+    say "${bold}PlusEMU hotel update${reset}"
+    if [ "$update_emulator" = 1 ]; then
+        say "  Emulator (PlusEMU): $EMULATOR_VERSION -> ${bold}$latest_emulator${reset}"
+    else
+        say "  Emulator (PlusEMU): $EMULATOR_VERSION (up to date)"
+    fi
+    if [ "$update_client" = 1 ]; then
+        say "  Client (Volt):      $CLIENT_VERSION -> ${bold}$latest_client${reset}"
+    else
+        say "  Client (Volt):      $CLIENT_VERSION (up to date)"
+    fi
+    if [ "$update_emulator" = 0 ] && [ "$update_client" = 0 ]; then
+        say ""
+        say "  ${green}Everything is up to date.${reset}"
+        return
+    fi
+    if [ "$check" = 1 ]; then
+        say ""
+        say "  Install the update with: sudo plusemu-update"
+        return
+    fi
+    say ""
+    say "  Your settings and added files are kept, and a backup is made first."
+    if [ "$update_emulator" = 1 ]; then say "  Players are disconnected for about a minute."; fi
+    confirm_update "Update now?"
+
+    require_update_space
+    WORK=$(mktemp -d "$HOTEL_ROOT/.update.XXXXXX")
+    TOTAL_STEPS=4
+
+    step "Downloading the new versions"
+    if [ "$update_emulator" = 1 ]; then
+        stage_emulator "$latest_emulator" "$WORK/emulator"
+        keep_emulator_files "$HOTEL_ROOT/emulator" "$WORK/emulator"
+        ok "PlusEMU $latest_emulator (your settings and added files are kept)"
+    fi
+    if [ "$update_client" = 1 ]; then
+        load_installer_files
+        derive_settings
+        stage_client "$latest_client" "$WORK/client"
+        keep_client_files "$HOTEL_ROOT/client" "$WORK/client"
+        ok "Volt $latest_client (your configuration and added files are kept)"
+    fi
+
+    step "Backing up your hotel"
+    if [ "$update_emulator" = 1 ]; then
+        systemctl stop plusemu
+        EMULATOR_STOPPED=1
+    fi
+    create_snapshot
+    ok "Database, emulator and client saved in $SNAPSHOT"
+    RESTORE_FROM=$SNAPSHOT RESTORE_DATABASE=0
+
+    step "Installing the new versions"
+    if [ "$update_emulator" = 1 ]; then
+        if [ -d "$HOTEL_ROOT/emulator/backups" ]; then mv "$HOTEL_ROOT/emulator/backups" "$WORK/emulator/backups"; fi
+        mv "$HOTEL_ROOT/emulator" "$WORK/emulator.old"
+        mv "$WORK/emulator" "$HOTEL_ROOT/emulator"
+        RESTORE_DATABASE=1
+        runuser -u plusemu -- env -C "$HOTEL_ROOT/emulator" "./Plus Emulator" --migrate < /dev/null
+        ok "PlusEMU $latest_emulator installed and the database updated"
+    fi
+    if [ "$update_client" = 1 ]; then
+        mv "$HOTEL_ROOT/client" "$WORK/client.old"
+        mv "$WORK/client" "$HOTEL_ROOT/client"
+        ok "Volt $latest_client installed"
+    fi
+
+    step "Starting the emulator"
+    if [ "$update_emulator" = 1 ]; then
+        systemctl start plusemu
+        wait_for_emulator || die "The new emulator didn't start. See: journalctl -u plusemu -n 100"
+        EMULATOR_STOPPED=0
+        ok "The emulator is running"
+    else
+        ok "The emulator kept running"
+    fi
+    RESTORE_FROM=
+    EMULATOR_VERSION=$latest_emulator CLIENT_VERSION=$latest_client
+    save_versions
+    prune_snapshots
+    install_update_command
+
+    say ""
+    say "${green}${bold}✓ Your hotel is up to date.${reset}"
+    say "  Emulator: $EMULATOR_VERSION    Client: $CLIENT_VERSION"
+    say "  Players get the new client when they reload the hotel page."
+    say "  Backup of the previous version: $SNAPSHOT"
+    say "  Undo this update: sudo plusemu-update --rollback"
+    say "  Next time, update with: sudo plusemu-update"
+    say ""
 }
 
 main() {
+    if [ "${1:-}" = update ]; then
+        shift
+        update_main "$@"
+        return
+    fi
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --guide-mode)
@@ -796,6 +1191,8 @@ main() {
     select_guide_mode
     trap 'on_error $LINENO' ERR
     preflight
+    : > "$LOG"
+    chmod 600 "$LOG"
     exec >> "$LOG" 2>&1
     load_installer_files
     ask_questions
@@ -811,6 +1208,7 @@ main() {
     install_cms
     configure_web
     write_guide
+    install_update_command
     finish
 }
 
