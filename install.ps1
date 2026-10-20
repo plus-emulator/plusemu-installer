@@ -12,7 +12,7 @@
 # PLUSEMU_HOTEL_NAME, PLUSEMU_ADMIN_USER, PLUSEMU_ADMIN_EMAIL, PLUSEMU_YES=1.
 # PLUSEMU_GUIDE_MODE=simple|advanced selects the final instructions only.
 
-param([ValidateSet('simple', 'advanced')][string]$GuideMode)
+param([string]$GuideMode)
 
 function Get-Setting($Name, $Default) {
     $value = [Environment]::GetEnvironmentVariable($Name)
