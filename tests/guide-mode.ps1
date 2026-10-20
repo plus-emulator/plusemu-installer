@@ -9,6 +9,8 @@ foreach ($statement in $ast.EndBlock.Statements) {
     }
 }
 function Assert($Condition, $Message) { if (-not $Condition) { throw $Message } }
+# irm | iex runs the text without script parameters, so the param block must accept an empty value.
+Invoke-Expression $ast.ParamBlock.Extent.Text
 $testDir = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
 New-Item -ItemType Directory $testDir | Out-Null
 try {
