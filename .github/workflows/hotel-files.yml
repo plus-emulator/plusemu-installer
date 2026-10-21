@@ -1,0 +1,40 @@
+name: Hotel files
+
+# Rebuilds the hotel files pack from the plusemu-assets bucket and publishes it on the rolling
+# "hotel-files" release that install.sh and install.ps1 download. Nothing is published when the
+# content did not change. Needs the CLOUDFLARE_API_TOKEN secret (R2 read access).
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * 1'
+
+permissions:
+  contents: write
+
+concurrency: hotel-files
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the pack
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: python3 -I tools/hotel-files.py build --out dist --cache cache --threads 32
+
+      - name: Publish the pack
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(cat dist/changed)" != true ]; then
+            echo "The published pack already has this content."
+            exit 0
+          fi
+          if ! gh release view hotel-files --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create hotel-files --repo "$GITHUB_REPOSITORY" --latest=false --title "Hotel files" \
+              --notes "The stock hotel files (furniture, clothing, effects, badges, texts, icons, sounds) that the installer downloads. Rebuilt from the asset bucket by the Hotel files workflow; the checksum in SHA256SUMS is the version the installer records."
+          fi
+          gh release upload hotel-files --repo "$GITHUB_REPOSITORY" --clobber dist/hotel-files.tar.gz dist/SHA256SUMS
+          echo "Published $(cat dist/SHA256SUMS)"
