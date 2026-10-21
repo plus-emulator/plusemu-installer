@@ -268,7 +268,7 @@ install_update_command() {
     cat > "$UPDATE_COMMAND" <<EOF
 #!/usr/bin/env bash
 # Installed by the PlusEMU installer. Updates the emulator and the Volt client with the newest installer:
-#   sudo plusemu-update [--check] [--yes] [--rollback]
+#   sudo plusemu-update [--check] [--yes] [--assets] [--rollback]
 set -euo pipefail
 script=\$(mktemp)
 trap 'rm -f "\$script"' EXIT
@@ -991,7 +991,8 @@ restore_snapshot() { # restore_snapshot <backup dir> <restore the database: 0|1>
 
 prune_snapshots() {
     find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '*.partial' -exec rm -rf {} +
-    find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d | sort | head -n -"$KEEP_BACKUPS" | xargs -r -d '\n' rm -rf
+    # Snapshots are named by their time; the gamedata-* copies of the assets-only update are not snapshots.
+    find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' | sort | head -n -"$KEEP_BACKUPS" | xargs -r -d '\n' rm -rf
 }
 
 finish_update() { # the EXIT trap: undo an unfinished update and remove temporary files
@@ -1033,9 +1034,46 @@ confirm_update() { # confirm_update <question>
     [[ $go =~ ^[Yy] ]] || die "Cancelled. Nothing was changed."
 }
 
+add_hotel_files() { # add_hotel_files <check: 0|1>: the stock files the hotel lacks, without stopping the emulator
+    local files=$HOTEL_ROOT/hotel-files latest
+    latest=$(pack_version) || die "Could not find the latest hotel files. Check the server's internet connection."
+    say ""
+    say "${bold}PlusEMU hotel files update${reset}"
+    if [ "$ASSETS_VERSION" = "$latest" ]; then
+        say "  Hotel files:        $ASSETS_VERSION (up to date)"
+        return
+    fi
+    say "  Hotel files:        $ASSETS_VERSION -> ${bold}$latest${reset} (about 550 MB)"
+    if [ "$1" = 1 ]; then
+        say ""
+        say "  Install them with: sudo plusemu-update --assets"
+        return
+    fi
+    say "  Stock files the hotel lacks are added; files it already has stay as they are."
+    say "  The gamedata index (clothing, effects, products, texts) is replaced; the old one is kept in $BACKUP_ROOT."
+    require_free_space 3 "$HOTEL_ROOT"
+    WORK=$(mktemp -d "$HOTEL_ROOT/.update.XXXXXX")
+    fetch_checked "${ASSET_PACK_URL%/*}" "${ASSET_PACK_URL##*/}" "$WORK/hotel-files.tar.gz" || die "Could not download the hotel files. Nothing was changed. Try again later."
+    mkdir -p "$files"
+    if [ -d "$files/gamedata" ]; then
+        install -d -m 700 "$BACKUP_ROOT"
+        rm -rf "$BACKUP_ROOT/gamedata-$ASSETS_VERSION"
+        mv "$files/gamedata" "$BACKUP_ROOT/gamedata-$ASSETS_VERSION"
+    fi
+    tar xzf "$WORK/hotel-files.tar.gz" --no-same-owner --skip-old-files -C "$files"
+    rm -f "$files/.complete"
+    ASSETS_VERSION=$latest
+    save_versions
+    say ""
+    say "${green}${bold}✓ Hotel files $latest installed.${reset} The emulator kept running."
+    say "  Your previous gamedata files: $BACKUP_ROOT/gamedata-* (copy edited texts back by hand if you need them)."
+    say "  New clothing also needs the emulator's Config/figuredata.xml, which comes with the full update: sudo plusemu-update"
+    say ""
+}
+
 rollback_update() {
     local target name versions="unknown versions" with_hotel_files=0
-    target=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' 2> /dev/null | sort | tail -1)
+    target=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' ! -name '*.partial' 2> /dev/null | sort | tail -1)
     [ -n "$target" ] || die "No backup found in $BACKUP_ROOT. Nothing was changed."
     name=${target##*/}
     if [ -f "$target/versions.env" ]; then
@@ -1072,15 +1110,16 @@ rollback_update() {
 }
 
 update_main() {
-    local check=0 rollback=0 arg latest_emulator latest_client latest_assets
+    local check=0 rollback=0 assets_only=0 arg latest_emulator latest_client latest_assets
     local update_emulator=0 update_client=0 update_assets=0
     for arg in "$@"; do
         case "$arg" in
             --check) check=1 ;;
             --yes) PLUSEMU_YES=1 ;;
+            --assets) assets_only=1 ;;
             --with-assets) ;; # the hotel files are always updated now; older guides still name this option
             --rollback) rollback=1 ;;
-            *) die "Unknown option: $arg. Usage: plusemu-update [--check] [--yes] [--rollback]" ;;
+            *) die "Unknown option: $arg. Usage: plusemu-update [--check] [--yes] [--assets] [--rollback]" ;;
         esac
     done
     MODE=update
@@ -1108,6 +1147,10 @@ update_main() {
 
     if [ "$rollback" = 1 ]; then
         rollback_update
+        return
+    fi
+    if [ "$assets_only" = 1 ]; then
+        add_hotel_files "$check"
         return
     fi
 
