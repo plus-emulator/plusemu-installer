@@ -195,6 +195,41 @@ sudo plusemu-update --rollback
 
 Log: `/var/log/plusemu-update.log`. Post it here if something breaks (no passwords).
 
+## Keep PHP patched
+
+PHP ships security fixes as patch releases (for example 8.5.11 to 8.5.12). These scripts
+update PHP to the newest patch release of the version you already run. They work on any
+hotel, also ones not made by this installer. They never move you to a newer PHP version
+(8.2 stays 8.2), because that needs a check of the website code first.
+
+Debian or Ubuntu with php-fpm:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/php-update.sh | sudo bash
+```
+
+Windows Server with IIS (PowerShell as Administrator):
+
+```powershell
+irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/php-update.ps1 | iex
+```
+
+What they do:
+
+- Read the newest release of your PHP version from php.net.
+- Linux: upgrade the `php8.x-*` packages and restart `php8.x-fpm`. When your Linux packages are
+  behind php.net, the script adds the Sury (Debian) or Ondřej (Ubuntu) PHP packages, the same
+  ones `install.sh` uses. If php.net released today and the packages are not built yet, the
+  script says so; run it again later.
+- Windows: download the matching build from windows.php.net (same thread safety, compiler and
+  bitness), check its SHA256, keep a backup copy of the PHP folder, stop IIS, unpack the new
+  files over the old ones (`php.ini` is kept), start IIS and check the version. On an error the
+  backup is put back.
+- PHP 8.1 or older gets no security fixes any more. The scripts stop and tell you to update to
+  PHP 8.2 or newer by hand.
+
+Only report, change nothing: `sudo bash php-update.sh --check` or `powershell -File php-update.ps1 -Check`.
+
 ## Unattended installs
 
 To install without questions, set the answers in environment variables:
