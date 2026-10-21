@@ -129,8 +129,9 @@ The pages the installer generates, such as the setup guide and the client config
 | Hotel files | `/var/www/hotel` | `C:\Hotel` |
 | Saved answers and passwords | `/etc/plusemu/hotel.env` | `C:\ProgramData\PlusEMU\hotel.json` |
 | Installer log | `/var/log/plusemu-install.log` | `C:\ProgramData\PlusEMU\install.log` |
-| Installed versions | `/etc/plusemu/versions.env` | |
-| Update backups | `/var/backups/plusemu` | |
+| Installed versions | `/etc/plusemu/versions.env` | `C:\ProgramData\PlusEMU\versions.json` |
+| Update log | `/var/log/plusemu-update.log` | `C:\ProgramData\PlusEMU\update.log` |
+| Update backups | `/var/backups/plusemu` | `C:\ProgramData\PlusEMU\backups` |
 | Restart the emulator | `sudo systemctl restart plusemu` | `Restart-Service PlusEMU` |
 | Watch the emulator log | `sudo journalctl -u plusemu -f` | `Get-Content C:\Hotel\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 50 -Wait` |
 
@@ -152,48 +153,87 @@ Linux database root uses local socket authentication (`sudo mariadb`); no root p
 
 Change your initial admin password after logging in. The saved file still contains the initial value. Keep the file and terminal password summary private, and remove credentials before sharing logs or screenshots.
 
-## One-command updates for PlusEMU and Volt
+## One-command updates
 
-Hotels set up with the one-command installer (Linux) can now update the emulator and client without reinstalling.
+Hotels set up with this installer update the emulator, the client and the hotel files in place, on Linux and on Windows.
 
-**First time only:**
+**Linux, first time only:**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash -s -- update
 ```
 
-**After that:**
+**Linux, after that:**
 ```bash
 sudo plusemu-update
 ```
 
+**Windows (PowerShell as Administrator), first time only:**
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.ps1))) -Update
+```
+
+**Windows, after that:**
+```powershell
+plusemu-update
+```
+
 **What it does**
 - Downloads and checks the new releases before touching anything.
-- Backs up the database, emulator and client to `/var/backups/plusemu/` (newest 3 kept).
+- Backs up the database, emulator, client and hotel files to `/var/backups/plusemu/` or `C:\ProgramData\PlusEMU\backups\` (newest 3 kept).
 - Installs the new versions and runs the database migrations.
-- Keeps your `Config/` and `configuration/` files and anything you added. (New settings are added, any existing settings with your own values remains)
+- Installs the newest hotel files pack (furniture, clothing, effects, badges, texts, icons, sounds, about 550 MB) whenever it changed, so the hotel never misses stock content. Files you added to `hotel-files` stay. The emulator's clothing data (`Config/figuredata.xml`) is replaced by the release's one that matches the pack.
+- Keeps your `Config/` and `configuration/` files and anything you added. New settings are added, your own values stay.
 - Restores the backup automatically if any step fails.
 
-**Options**
-- `--with-assets`: also update the stock hotel files (furniture, clothing, effects, badges, texts, about 550 MB). Your own added files stay.
-- `--check`: show available updates, change nothing.
-- `--rollback`: restore the last backup. The database goes back too, so progress since then is lost.
+**Options** (Linux `--check`, Windows `-Check`, and so on)
+- `check`: show available updates, change nothing.
+- `yes`: update without the "Update now?" question.
+- `rollback`: restore the last backup. The database goes back too, so progress since then is lost.
+
+`--with-assets` is still accepted and does nothing: the hotel files are part of every update now.
 
 ### Examples
 ```bash
-# Also update the stock hotel files (furniture, clothing, effects, badges, texts)
-sudo plusemu-update --with-assets
-
 # Only check what is new, change nothing
-sudo plusemu-update --check --with-assets
+sudo plusemu-update --check
 
 # Update without the "Update now?" question
-sudo plusemu-update --yes --with-assets
+sudo plusemu-update --yes
 
 # Undo the last update (the database goes back too)
 sudo plusemu-update --rollback
 ```
 
-Log: `/var/log/plusemu-update.log`. Post it here if something breaks (no passwords).
+```powershell
+plusemu-update -Check
+plusemu-update -Yes
+plusemu-update -Rollback
+```
+
+Log: `/var/log/plusemu-update.log` or `C:\ProgramData\PlusEMU\update.log`. Post it here if something breaks (no passwords).
+
+Running the installer again also refreshes the hotel files when a newer pack exists, and keeps everything else as it is.
+
+### The hotel files pack
+
+Both installers download `hotel-files.tar.gz` from the rolling [`hotel-files` release](https://github.com/plus-emulator/plusemu-installer/releases/tag/hotel-files). The pack is built from the `plusemu-assets` bucket by [`tools/hotel-files.py`](tools/hotel-files.py) and published by the [Hotel files workflow](.github/workflows/hotel-files.yml) (every Monday, or by hand through "Run workflow"). The workflow needs a `CLOUDFLARE_API_TOKEN` repository secret with read access to the bucket.
+
+The pack holds everything the installed client loads from `/hotel-files/`: `assets/` (furniture, figure, effect and pet libraries as `.hab`, images, sounds), `c_images/`, `gamedata/`, `images/`, `sounds/` and `habbicons/`. It leaves out the client build (that comes with the Volt release), CMS screenshots, the `.nitro` copies of the libraries (the client loads `.hab`) and stray editor files. The first 12 characters of the pack's SHA-256 are the version the installers record and compare.
+
+To see what the bucket has that the published pack lacks:
+
+```bash
+CLOUDFLARE_API_TOKEN=... python3 -I tools/hotel-files.py check
+```
+
+To build and publish by hand:
+
+```bash
+CLOUDFLARE_API_TOKEN=... python3 -I tools/hotel-files.py build --out dist
+gh release upload hotel-files dist/hotel-files.tar.gz dist/SHA256SUMS --clobber
+```
+
+Hotels with their own files can point `ASSET_PACK_URL` at another `hotel-files.tar.gz`; a `SHA256SUMS` file next to it is checked when it exists.
 
 ## Keep PHP patched
 
