@@ -189,6 +189,7 @@ plusemu-update
 - `check`: show available updates, change nothing.
 - `yes`: update without the "Update now?" question.
 - `rollback`: restore the last backup. The database goes back too, so progress since then is lost.
+- `assets`: hotel files only, without stopping the emulator. Adds every stock file the hotel lacks and leaves the files it already has as they are. Only the `gamedata` index (clothing, effects, products, texts) is replaced; the previous one is kept in the backups folder as `gamedata-<version>`. Run the full update afterwards when new clothing does not show: the emulator's clothing data comes with it.
 
 `--with-assets` is still accepted and does nothing: the hotel files are part of every update now.
 
@@ -200,6 +201,9 @@ sudo plusemu-update --check
 # Update without the "Update now?" question
 sudo plusemu-update --yes
 
+# Add the stock hotel files the hotel lacks, without downtime
+sudo plusemu-update --assets
+
 # Undo the last update (the database goes back too)
 sudo plusemu-update --rollback
 ```
@@ -207,6 +211,7 @@ sudo plusemu-update --rollback
 ```powershell
 plusemu-update -Check
 plusemu-update -Yes
+plusemu-update -Assets
 plusemu-update -Rollback
 ```
 
