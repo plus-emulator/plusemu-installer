@@ -14,7 +14,6 @@ Listing the bucket needs a Cloudflare API token with R2 read access in CLOUDFLAR
 in the file named by CLOUDFLARE_API_TOKEN_FILE). Downloads use the public CDN and need no token.
 """
 import argparse
-import calendar
 import concurrent.futures
 import gzip
 import hashlib
@@ -134,7 +133,7 @@ def pack(objects, root, out_dir):
             key = obj['key']
             info = tarfile.TarInfo(key)
             info.size = obj['size']
-            info.mtime = calendar.timegm(time.strptime(obj['last_modified'][:19], '%Y-%m-%dT%H:%M:%S'))
+            info.mtime = 0  # a fixed time, so the pack's checksum changes only when the content changes
             info.mode = 0o644
             info.uid = info.gid = 0
             info.uname = info.gname = 'root'
