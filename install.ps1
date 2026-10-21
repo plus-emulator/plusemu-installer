@@ -58,11 +58,11 @@ $UpdateLog     = Join-Path $StateDir 'update.log'
 $LockFile      = Join-Path $StateDir 'update.lock'
 $KeepBackups   = 3
 $Downloads  = Join-Path $env:TEMP 'plusemu-downloads'
-$Log        = "$StateDir\install.log"
+$script:Log        = "$StateDir\install.log"
 $PhpDir     = 'C:\PHP'
 $NodeMajor  = 22
 $MariaDbSeries = '11.4'
-$TotalSteps = 10
+$script:TotalSteps = 10
 $script:Step = 0
 
 # `irm | iex` runs in the user's own session, so these are restored at the end.
@@ -73,14 +73,14 @@ $ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest is very slow with
 
 # ---------------------------------------------------------------- output
 
-function Write-Log($Text) { Add-Content -Path $Log -Value $Text -Encoding UTF8 }
+function Write-Log($Text) { Add-Content -Path $script:Log -Value $Text -Encoding UTF8 }
 function Say($Text, $Color = 'Gray') { Write-Host $Text -ForegroundColor $Color; Write-Log $Text }
 function Step($Text) {
     $script:Step++
     Write-Host ''
-    Write-Host "[$script:Step/$TotalSteps] " -ForegroundColor Cyan -NoNewline
+    Write-Host "[$script:Step/$script:TotalSteps] " -ForegroundColor Cyan -NoNewline
     Write-Host $Text -ForegroundColor White
-    Write-Log "`n[$script:Step/$TotalSteps] $Text"
+    Write-Log "`n[$script:Step/$script:TotalSteps] $Text"
 }
 function Ok($Text) { Say "      + $Text" 'Green' }
 
@@ -101,7 +101,7 @@ function Run {
     Write-Log "> $Exe $($Arguments -join ' ')"
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'   # native stderr is not an error by itself
-    & $Exe @Arguments 2>&1 | ForEach-Object { Add-Content -Path $Log -Value "$_" -Encoding UTF8 }
+    & $Exe @Arguments 2>&1 | ForEach-Object { Add-Content -Path $script:Log -Value "$_" -Encoding UTF8 }
     $code = $LASTEXITCODE
     $ErrorActionPreference = $previous
     if ($code -ne 0) { throw "'$Exe $($Arguments -join ' ')' failed with exit code $code" }
@@ -123,7 +123,7 @@ function Invoke-Tar([string[]]$Arguments) {
     Write-Log "> tar.exe $($Arguments -join ' ')"
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    & tar.exe @Arguments 2>&1 | ForEach-Object { Add-Content -Path $Log -Value "$_" -Encoding UTF8 }
+    & tar.exe @Arguments 2>&1 | ForEach-Object { Add-Content -Path $script:Log -Value "$_" -Encoding UTF8 }
     $code = $LASTEXITCODE
     $ErrorActionPreference = $previous
     return $code
@@ -218,20 +218,20 @@ function Sql([string]$Query, [string]$Database = '') {
     $mariadb = Get-MariaDb
     $env:MYSQL_PWD = $state.DbRootPassword
     $ErrorActionPreference = 'Continue'   # native stderr is not an error by itself
-    $result = & $mariadb @arguments 2>> $Log
+    $result = & $mariadb @arguments 2>> $script:Log
     $code = $LASTEXITCODE
     $ErrorActionPreference = 'Stop'
     Remove-Item Env:\MYSQL_PWD
-    if ($code -ne 0) { throw "A database command failed (exit code $code). See $Log" }
+    if ($code -ne 0) { throw "A database command failed (exit code $code). See $script:Log" }
     return $result
 }
 
 function Import-Database($File) {
     $env:MYSQL_PWD = $state.DbRootPassword
-    & cmd.exe /c "`"$(Get-MariaDb)`" -uroot --skip-ssl plus < `"$File`" 2>> `"$Log`""
+    & cmd.exe /c "`"$(Get-MariaDb)`" -uroot --skip-ssl plus < `"$File`" 2>> `"$script:Log`""
     $code = $LASTEXITCODE
     Remove-Item Env:\MYSQL_PWD
-    if ($code -ne 0) { throw "Importing the database failed (exit code $code). See $Log" }
+    if ($code -ne 0) { throw "Importing the database failed (exit code $code). See $script:Log" }
 }
 
 function Read-Versions {
@@ -365,7 +365,7 @@ function Test-Prerequisites {
     # Only administrators may read the passwords and the log.
     & icacls.exe $StateDir /inheritance:r /grant:r 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Could not protect $StateDir." }
-    Set-Content -Path $Log -Value "PlusEMU installer log $(Get-Date -Format s)" -Encoding UTF8
+    Set-Content -Path $script:Log -Value "PlusEMU installer log $(Get-Date -Format s)" -Encoding UTF8
 }
 
 function Get-InstallerFiles {
@@ -1020,10 +1020,10 @@ function Copy-ClientSettings($Old, $New) {
 function Invoke-DatabaseDump($File) {
     $dump = Join-Path (Split-Path (Get-MariaDb)) 'mariadb-dump.exe'
     $env:MYSQL_PWD = $state.DbRootPassword
-    & cmd.exe /c "`"$dump`" -uroot --skip-ssl --single-transaction --routines --triggers --events plus > `"$File`" 2>> `"$Log`""
+    & cmd.exe /c "`"$dump`" -uroot --skip-ssl --single-transaction --routines --triggers --events plus > `"$File`" 2>> `"$script:Log`""
     $code = $LASTEXITCODE
     Remove-Item Env:\MYSQL_PWD
-    if ($code -ne 0) { throw "Backing up the database failed (exit code $code). See $Log" }
+    if ($code -ne 0) { throw "Backing up the database failed (exit code $code). See $script:Log" }
 }
 
 function Invoke-DatabaseRestore($File) {
@@ -1044,9 +1044,9 @@ function New-Snapshot($WithHotelFiles) {
     # The emulator's own database backups stay in place and are not copied again.
     # Exit code 1 only means a file changed while it was read, for example a log of the running emulator.
     $code = Invoke-Tar @('-C', $HotelRoot, '--exclude=emulator/backups', '-czf', (Join-Path $partial 'files.tar.gz'), 'emulator', 'client')
-    if ($code -notin 0, 1) { throw "Backing up the program files failed (tar exit code $code). See $Log" }
+    if ($code -notin 0, 1) { throw "Backing up the program files failed (tar exit code $code). See $script:Log" }
     if ($WithHotelFiles) {
-        if ((Invoke-Tar @('-C', $HotelRoot, '-cf', (Join-Path $partial 'hotel-files.tar'), 'hotel-files')) -ne 0) { throw "Backing up the hotel files failed. See $Log" }
+        if ((Invoke-Tar @('-C', $HotelRoot, '-cf', (Join-Path $partial 'hotel-files.tar'), 'hotel-files')) -ne 0) { throw "Backing up the hotel files failed. See $script:Log" }
     }
     if (Test-Path $VersionsFile) { Copy-Item $VersionsFile (Join-Path $partial 'versions.json') }
     Move-Item $partial $snapshot
@@ -1103,7 +1103,7 @@ function Complete-Update {
             try { Start-EmulatorService } catch { }
             Say "  The automatic restore failed. Your backup is in $snapshot" 'Red'
             Say "  (files.tar.gz and database.sql). The previous files are also in $($script:Work)."
-            Say "  Ask for help on DevBest with the log: $Log"
+            Say "  Ask for help on DevBest with the log: $script:Log"
             return
         }
     } elseif ($script:EmulatorStopped) {
@@ -1202,7 +1202,7 @@ function Update-HotelFiles([switch]$Check) {
     }
     New-Item -ItemType Directory -Force -Path $hotelFiles | Out-Null
     # -k keeps the files the hotel already has, so stock files the owner edited stay.
-    if ((Invoke-Tar @('-xzf', $archive, '-k', '-C', $hotelFiles)) -ne 0) { throw "Unpacking the hotel files failed. See $Log" }
+    if ((Invoke-Tar @('-xzf', $archive, '-k', '-C', $hotelFiles)) -ne 0) { throw "Unpacking the hotel files failed. See $script:Log" }
     Remove-Item $archive
     Remove-Item (Join-Path $hotelFiles '.complete') -Force -ErrorAction SilentlyContinue
     $script:Versions.AssetsVersion = $latest
@@ -1293,6 +1293,7 @@ function Update-Hotel([switch]$Check) {
         Stop-EmulatorService
         $script:EmulatorStopped = $true
     }
+    if ($updateAssets) { New-Item -ItemType Directory -Force -Path $hotelFiles | Out-Null }
     $snapshot = New-Snapshot $updateAssets
     Ok "Your hotel is saved in $snapshot"
     $script:RestoreFrom = $snapshot
@@ -1315,7 +1316,7 @@ function Update-Hotel([switch]$Check) {
     }
     if ($updateAssets) {
         New-Item -ItemType Directory -Force -Path $hotelFiles | Out-Null
-        if ((Invoke-Tar @('-xzf', $archive, '-C', $hotelFiles)) -ne 0) { throw "Unpacking the hotel files failed. See $Log" }
+        if ((Invoke-Tar @('-xzf', $archive, '-C', $hotelFiles)) -ne 0) { throw "Unpacking the hotel files failed. See $script:Log" }
         Ok "Hotel files $latestAssets installed"
     }
     Set-HotelPermissions
@@ -1357,7 +1358,7 @@ function Invoke-Update([switch]$Check, [switch]$Yes, [switch]$Rollback, [switch]
     catch { throw "Another update is already running (could not lock $LockFile)." }
     try {
         $script:Log = $UpdateLog
-        Set-Content -Path $Log -Value "PlusEMU update log $(Get-Date -Format s)" -Encoding UTF8
+        Set-Content -Path $script:Log -Value "PlusEMU update log $(Get-Date -Format s)" -Encoding UTF8
         $script:AssumeYes = [bool]$Yes
         $script:state = Get-Content $StateFile -Raw | ConvertFrom-Json
         Read-Versions
@@ -1404,12 +1405,12 @@ try {
     Write-Log "ERROR: $_`n$($_.ScriptStackTrace)"
     Write-Host ''
     Write-Host "Something went wrong: $_" -ForegroundColor Red
-    if (Test-Path $Log) {
+    if (Test-Path $script:Log) {
         Write-Host '  The last lines of the log:'
-        Get-Content $Log -Tail 15 | ForEach-Object { Write-Host "    $_" }
+        Get-Content $script:Log -Tail 15 | ForEach-Object { Write-Host "    $_" }
     }
     Write-Host ''
-    Write-Host "  Full log: $Log"
+    Write-Host "  Full log: $script:Log"
     if ($Update) {
         Write-Host '  Fix the problem (or ask for help on DevBest with the log), then run plusemu-update again.'
     } else {
