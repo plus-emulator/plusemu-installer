@@ -1055,12 +1055,18 @@ add_hotel_files() { # add_hotel_files <check: 0|1>: the stock files the hotel la
     WORK=$(mktemp -d "$HOTEL_ROOT/.update.XXXXXX")
     fetch_checked "${ASSET_PACK_URL%/*}" "${ASSET_PACK_URL##*/}" "$WORK/hotel-files.tar.gz" || die "Could not download the hotel files. Nothing was changed. Try again later."
     mkdir -p "$files"
+    local old_gamedata=
     if [ -d "$files/gamedata" ]; then
         install -d -m 700 "$BACKUP_ROOT"
-        rm -rf "$BACKUP_ROOT/gamedata-$ASSETS_VERSION"
-        mv "$files/gamedata" "$BACKUP_ROOT/gamedata-$ASSETS_VERSION"
+        old_gamedata=$BACKUP_ROOT/gamedata-$ASSETS_VERSION
+        rm -rf "$old_gamedata"
+        mv "$files/gamedata" "$old_gamedata"
     fi
-    tar xzf "$WORK/hotel-files.tar.gz" --no-same-owner --skip-old-files -C "$files"
+    if ! tar xzf "$WORK/hotel-files.tar.gz" --no-same-owner --skip-old-files -C "$files"; then
+        # The installed index goes back, so the hotel keeps working.
+        if [ -n "$old_gamedata" ]; then rm -rf "$files/gamedata" && mv "$old_gamedata" "$files/gamedata"; fi
+        die "Unpacking the hotel files failed. The hotel files were not changed. Try again later."
+    fi
     rm -f "$files/.complete"
     ASSETS_VERSION=$latest
     save_versions

@@ -237,7 +237,7 @@ function Import-Database($File) {
 function Read-Versions {
     $script:Versions = [ordered]@{ EmulatorVersion = 'unknown'; ClientVersion = 'unknown'; AssetsVersion = 'unknown' }
     if (-not (Test-Path $VersionsFile)) { return }
-    $saved = Get-Content $VersionsFile -Raw | ConvertFrom-Json
+    $saved = Get-Content $VersionsFile -Raw -Encoding UTF8 | ConvertFrom-Json
     foreach ($name in @($script:Versions.Keys)) {
         if ($saved.$name) { $script:Versions[$name] = [string]$saved.$name }
     }
@@ -391,7 +391,7 @@ function Read-Answers {
     Write-Host ''
 
     if (Test-Path $StateFile) {
-        $script:state = Get-Content $StateFile -Raw | ConvertFrom-Json
+        $script:state = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
         $selectedMode = Resolve-GuideMode $state.GuideMode
         $state | Add-Member -MemberType NoteProperty -Name GuideMode -Value $selectedMode -Force
         $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
@@ -671,7 +671,7 @@ function Start-Emulator {
     Step 'Starting the emulator'
     $out = "$HotelRoot\emulator"
     $config = "$out\Config\config.json"
-    $json = Get-Content $config -Raw | ConvertFrom-Json
+    $json = Get-Content $config -Raw -Encoding UTF8 | ConvertFrom-Json
     $json.Database.Hostname = '127.0.0.1'; $json.Database.Port = 3306; $json.Database.Username = 'hotel'
     $json.Database.Password = $state.DbPassword; $json.Database.Name = 'plus'
     $json.Flash.Hostname = '127.0.0.1'
@@ -987,11 +987,11 @@ function Merge-Json($Defaults, $Overrides) {
 function Copy-EmulatorSettings($Old, $New) {
     $oldConfig = Join-Path $Old 'Config'
     $newConfig = Join-Path $New 'Config'
-    $defaults = Get-Content (Join-Path $newConfig 'config.json') -Raw | ConvertFrom-Json
+    $defaults = Get-Content (Join-Path $newConfig 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     # The release's own libraries replace the old ones; the other files it lacks are the hotel's.
     Copy-MissingFiles $Old $New '^([^/]+\.(dll|so|pdb|json)|backups/.*)$'
     if (Test-Path $oldConfig) { Copy-Item -Path (Join-Path $oldConfig '*') -Destination $newConfig -Recurse -Force }
-    try { $installed = Get-Content (Join-Path $oldConfig 'config.json') -Raw | ConvertFrom-Json }
+    try { $installed = Get-Content (Join-Path $oldConfig 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json }
     catch { throw "Could not read $(Join-Path $oldConfig 'config.json'). Fix the file, then run the update again. Nothing was changed." }
     # Keep every installed setting and add the settings this release introduced.
     Write-Utf8 (Join-Path $newConfig 'config.json') ((Merge-Json $defaults $installed) | ConvertTo-Json -Depth 20)
@@ -1010,7 +1010,7 @@ function Copy-ClientSettings($Old, $New) {
     foreach ($file in 'renderer-config.json', 'ui-config.json', 'client-mode.json') {
         $target = Join-Path $newConfig $file
         if (-not (Test-Path $target)) { Copy-Item (Join-Path $rendered $file) $target; continue }
-        try { $merged = Merge-Json (Get-Content (Join-Path $rendered $file) -Raw | ConvertFrom-Json) (Get-Content $target -Raw | ConvertFrom-Json) }
+        try { $merged = Merge-Json (Get-Content (Join-Path $rendered $file) -Raw -Encoding UTF8 | ConvertFrom-Json) (Get-Content $target -Raw -Encoding UTF8 | ConvertFrom-Json) }
         catch { Say "      Kept configuration/$file as it is: it is not plain JSON, so no new settings were added." 'Yellow'; continue }
         Write-Utf8 $target ($merged | ConvertTo-Json -Depth 20)
     }
@@ -1146,7 +1146,7 @@ function Restore-LastBackup {
     $name = $target.Name
     $versions = 'unknown versions'
     if (Test-Path (Join-Path $target.FullName 'versions.json')) {
-        $saved = Get-Content (Join-Path $target.FullName 'versions.json') -Raw | ConvertFrom-Json
+        $saved = Get-Content (Join-Path $target.FullName 'versions.json') -Raw -Encoding UTF8 | ConvertFrom-Json
         $versions = "emulator $($saved.EmulatorVersion), client $($saved.ClientVersion)"
     }
     $withHotelFiles = Test-Path (Join-Path $target.FullName 'hotel-files.tar')
@@ -1187,12 +1187,16 @@ function Update-HotelFiles([switch]$Check) {
     if ($installed -eq $latest) { Say "  Hotel files: $installed (up to date)" 'Green'; return }
     Say "  Hotel files: $installed -> $latest (about 550 MB)"
     if ($Check) { Say ''; Say '  Install with: plusemu-update -Assets'; return }
+    $free = (New-Object IO.DriveInfo $HotelRoot).AvailableFreeSpace / 1GB
+    if ($free -lt 3) { throw "Not enough disk space: $([int]$free) GB free, at least 3 GB needed." }
     $hotelFiles = Join-Path $HotelRoot 'hotel-files'
     $archive = Join-Path $Downloads 'hotel-files.tar.gz'
     $pack = Get-PackLocation
     if (-not (Get-CheckedDownload $pack.Base $pack.Name $archive)) { throw 'Could not download the hotel files. Nothing was changed. Try again later.' }
+    New-Item -ItemType Directory -Force -Path $hotelFiles | Out-Null
     # gamedata is the index of the stock content, so the pack's copy replaces it. The old copy stays for edited texts.
     $gamedata = Join-Path $hotelFiles 'gamedata'
+    $copy = $null
     if (Test-Path $gamedata) {
         $copy = Join-Path $BackupRoot "gamedata-$installed"
         if (Test-Path $copy) { Remove-Item $copy -Recurse -Force }
@@ -1200,9 +1204,15 @@ function Update-HotelFiles([switch]$Check) {
         Move-Item $gamedata $copy
         Say "  The previous gamedata folder is kept in $copy"
     }
-    New-Item -ItemType Directory -Force -Path $hotelFiles | Out-Null
     # -k keeps the files the hotel already has, so stock files the owner edited stay.
-    if ((Invoke-Tar @('-xzf', $archive, '-k', '-C', $hotelFiles)) -ne 0) { throw "Unpacking the hotel files failed. See $script:Log" }
+    if ((Invoke-Tar @('-xzf', $archive, '-k', '-C', $hotelFiles)) -ne 0) {
+        # The installed index goes back, so the hotel keeps working.
+        if ($copy) {
+            if (Test-Path $gamedata) { Remove-Item $gamedata -Recurse -Force }
+            Move-Item $copy $gamedata
+        }
+        throw "Unpacking the hotel files failed. The hotel files were not changed. See $script:Log"
+    }
     Remove-Item $archive
     Remove-Item (Join-Path $hotelFiles '.complete') -Force -ErrorAction SilentlyContinue
     $script:Versions.AssetsVersion = $latest
@@ -1360,7 +1370,7 @@ function Invoke-Update([switch]$Check, [switch]$Yes, [switch]$Rollback, [switch]
         $script:Log = $UpdateLog
         Set-Content -Path $script:Log -Value "PlusEMU update log $(Get-Date -Format s)" -Encoding UTF8
         $script:AssumeYes = [bool]$Yes
-        $script:state = Get-Content $StateFile -Raw | ConvertFrom-Json
+        $script:state = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
         Read-Versions
         $script:RestoreFrom = $null
         $script:RestoreDatabase = $false
