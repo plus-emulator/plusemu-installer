@@ -45,9 +45,8 @@ curl() {
             printf 'https://github.com/plus-emulator/PlusEMU/releases/tag/%s' "$LATEST_EMULATOR" ;;
         https://github.com/plus-emulator/Volt/releases/latest)
             printf 'https://github.com/plus-emulator/Volt/releases/tag/%s' "$LATEST_CLIENT" ;;
-        https://github.com/*/releases/download/* | https://github.com/plus-emulator/plusemu-installer/releases/latest/download/*)
+        https://github.com/*/releases/download/*)
             local file=$RELEASES/${url#https://github.com/*/releases/download/}
-            if [[ $url == */releases/latest/download/* ]]; then file=$RELEASES/hotel-files/${url##*/}; fi
             if [ ! -f "$file" ]; then
                 if [[ " $* " == *' -w '* ]]; then printf 404; return 0; fi
                 return 22
@@ -103,7 +102,7 @@ make_hotel_files() { # make_hotel_files <revision>: the stock hotel files pack o
     (cd "$RELEASES/hotel-files" && sha256sum hotel-files.tar.gz > SHA256SUMS)
 }
 
-snapshots() { find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d 2> /dev/null | wc -l; }
+snapshots() { find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' 2> /dev/null | wc -l; }
 
 # An installation made before update mode existed: no versions file, user edits everywhere.
 mkdir -p "$TEST_DIR/etc" "$HOTEL_ROOT/emulator/Config" "$HOTEL_ROOT/emulator/plugins/MyPlugin" \
@@ -137,10 +136,14 @@ printf '{"apiBaseUrl": "https://example.com"}\n' > "$client/configuration/client
 printf '{"text": "mine"}\n' > "$client/configuration/UITexts_en.jsonc"
 printf 'ads\n' > "$client/ads.txt"
 printf 'mine\n' > "$client/plugins/mine.js"
+mkdir -p "$HOTEL_ROOT/hotel-files/gamedata"
+printf 'figuredata 0\n' > "$HOTEL_ROOT/hotel-files/gamedata/FigureData.json"
+touch "$HOTEL_ROOT/hotel-files/.complete"
 cp -a "$HOTEL_ROOT" "$TEST_DIR/original"
 
 make_emulator_release v2.0.0
 make_client_release client-v2.0.0
+make_hotel_files 1
 LATEST_EMULATOR=v2.0.0 LATEST_CLIENT=client-v2.0.0
 
 # --check reports available updates and changes nothing.
@@ -195,7 +198,8 @@ config=$emulator/Config/config.json
 [[ $(jq -r .Custom "$config") == kept ]]
 [[ $(stat -c %a "$config") == 600 ]]
 [[ $(< "$emulator/Config/nlog.config") == 'my nlog' ]]
-[[ $(< "$emulator/Config/figuredata.xml") == 'my custom clothes' ]]
+# The stock pack came with this update, so the emulator's clothing data is the release's one that matches it.
+[[ $(< "$emulator/Config/figuredata.xml") == 'default figuredata' ]]
 [[ -f "$emulator/plugins/MyPlugin/MyPlugin.dll" && -f "$emulator/backups/before-migration.sql" ]]
 grep -q 'runuser .*--migrate' "$TEST_DIR/calls"
 [[ $(< "$client/index.html") == 'client client-v2.0.0' ]]
@@ -209,6 +213,8 @@ renderer=$client/configuration/renderer-config.json
 [[ $(jq -r '."hotel.name"' "$client/configuration/ui-config.json") == Mine ]]
 grep -qx "EMULATOR_VERSION='v2.0.0'" "$VERSIONS_FILE"
 grep -qx "CLIENT_VERSION='client-v2.0.0'" "$VERSIONS_FILE"
+grep -qx "ASSETS_VERSION='$(cut -c1-12 "$RELEASES/hotel-files/SHA256SUMS")'" "$VERSIONS_FILE"
+[[ $(< "$HOTEL_ROOT/hotel-files/gamedata/FigureData.json") == 'figuredata 1' && ! -e "$HOTEL_ROOT/hotel-files/.complete" ]]
 [[ $(snapshots) == 3 ]]
 latest=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d | sort | tail -1)
 gunzip -c "$latest/database.sql.gz" | grep -Fq 'CREATE TABLE users'
@@ -243,55 +249,120 @@ done
 [[ $(snapshots) == 3 && $(< "$emulator/Plus Emulator") == 'emulator v2.2.0' ]]
 [[ $(< "$client/index.html") == 'client client-v2.0.0' ]]
 
-# Without --with-assets the hotel files stay as they are, and a newer pack is pointed out.
+# The stock hotel files are part of every update: a newer pack is installed without any option.
+[[ $ASSET_PACK_URL == https://github.com/plus-emulator/plusemu-installer/releases/download/hotel-files/hotel-files.tar.gz ]]
 hotel_files=$HOTEL_ROOT/hotel-files
 mkdir -p "$hotel_files/gamedata" "$hotel_files/assets/custom"
 printf 'figuredata 1\n' > "$hotel_files/gamedata/FigureData.json"
 printf 'my furni\n' > "$hotel_files/assets/custom/my_furni.nitro"
-touch "$hotel_files/.complete"
 make_hotel_files 2
 pack_version=$(cut -c1-12 "$RELEASES/hotel-files/SHA256SUMS")
-: > "$TEST_DIR/terminal"
-run_update --yes
-grep -Fq -- '--with-assets' "$TEST_DIR/terminal"
-[[ $(< "$hotel_files/gamedata/FigureData.json") == 'figuredata 1' ]]
 cp -a "$HOTEL_ROOT" "$TEST_DIR/before-assets"
-run_update --check --with-assets
+
+# --check names the new pack and changes nothing, even though the emulator and client are current.
+: > "$TEST_DIR/terminal"
+run_update --check
 grep -Fq "$pack_version" "$TEST_DIR/terminal"
+if grep -qi 'everything is up to date' "$TEST_DIR/terminal"; then exit 1; fi
 diff -r "$TEST_DIR/before-assets" "$HOTEL_ROOT"
 
 # A damaged pack changes nothing.
 good_sums=$(< "$RELEASES/hotel-files/SHA256SUMS")
 printf '%064d  hotel-files.tar.gz\n' 0 > "$RELEASES/hotel-files/SHA256SUMS"
-fails --yes --with-assets
+fails --yes
 diff -r "$TEST_DIR/before-assets" "$HOTEL_ROOT"
 printf '%s\n' "$good_sums" > "$RELEASES/hotel-files/SHA256SUMS"
 
 # A failed update restores the hotel files too.
 MIGRATION=fail
-fails --yes --with-assets
+fails --yes
 diff -r "$TEST_DIR/before-assets" "$HOTEL_ROOT"
 MIGRATION=ok
 
-# --with-assets installs the stock pack over the hotel files and the emulator's matching clothing data.
-run_update --yes --with-assets
+# The update installs the stock pack over the hotel files and the emulator's matching clothing data.
+: > "$TEST_DIR/terminal"
+run_update --yes
 [[ $(< "$hotel_files/gamedata/FigureData.json") == 'figuredata 2' ]]
 [[ -f "$hotel_files/assets/furni/stock_2.nitro" && -f "$hotel_files/assets/custom/my_furni.nitro" ]]
+[[ ! -e "$hotel_files/.complete" ]]
 [[ $(< "$emulator/Config/figuredata.xml") == 'default figuredata' ]]
 [[ $(< "$emulator/Config/nlog.config") == 'my nlog' ]]
 [[ $(jq -r .Custom "$emulator/Config/config.json") == kept ]]
 [[ $(< "$emulator/Plus Emulator") == 'emulator v2.2.0' ]]
 grep -qx "ASSETS_VERSION='$pack_version'" "$VERSIONS_FILE"
 grep -qx "EMULATOR_VERSION='v2.2.0'" "$VERSIONS_FILE"
+grep -Fq "$pack_version" "$TEST_DIR/terminal"
 latest=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d | sort | tail -1)
 [[ -f "$latest/hotel-files.tar" ]]
 
+# Everything current, hotel files included: nothing happens. --with-assets is still accepted.
 : > "$TEST_DIR/calls"
+: > "$TEST_DIR/terminal"
+run_update --yes
+grep -qi 'everything is up to date' "$TEST_DIR/terminal"
+if grep -q 'systemctl stop' "$TEST_DIR/calls"; then exit 1; fi
+if grep -Fq -- '--with-assets' "$TEST_DIR/terminal"; then exit 1; fi
 run_update --yes --with-assets
 if grep -q 'systemctl stop' "$TEST_DIR/calls"; then exit 1; fi
 
 # --rollback also returns the hotel files.
 run_update --yes --rollback
 diff -r "$TEST_DIR/before-assets" "$HOTEL_ROOT"
+
+# A re-run of the installer refreshes the hotel files when the published pack changed, and keeps added files.
+EMULATOR_VERSION=v2.2.0 CLIENT_VERSION=client-v2.0.0 ASSETS_VERSION=unknown
+mkdir -p "$hotel_files" && touch "$hotel_files/.complete"
+STEP=0 TOTAL_STEPS=9
+download_hotel_files
+[[ $(< "$hotel_files/gamedata/FigureData.json") == 'figuredata 2' ]]
+[[ -f "$hotel_files/assets/custom/my_furni.nitro" && ! -e "$hotel_files/.complete" ]]
+grep -qx "ASSETS_VERSION='$pack_version'" "$VERSIONS_FILE"
+make_hotel_files 3
+printf 'edited\n' > "$hotel_files/gamedata/FigureData.json"
+: > "$TEST_DIR/terminal"
+download_hotel_files
+[[ $(< "$hotel_files/gamedata/FigureData.json") == 'figuredata 3' ]]
+[[ -f "$hotel_files/assets/furni/stock_2.nitro" && -f "$hotel_files/assets/furni/stock_3.nitro" ]]
+grep -qx "ASSETS_VERSION='$(cut -c1-12 "$RELEASES/hotel-files/SHA256SUMS")'" "$VERSIONS_FILE"
+printf 'edited again\n' > "$hotel_files/gamedata/FigureData.json"
+: > "$TEST_DIR/terminal"
+download_hotel_files
+[[ $(< "$hotel_files/gamedata/FigureData.json") == 'edited again' ]]
+grep -qi 'already' "$TEST_DIR/terminal"
+
+# --assets only adds the stock files the hotel lacks and refreshes gamedata; existing files stay, no downtime.
+: > "$TEST_DIR/calls"
+: > "$TEST_DIR/terminal"
+run_update --assets
+grep -qi 'up to date' "$TEST_DIR/terminal"
+[[ ! -e "$TEST_DIR/calls" || ! -s "$TEST_DIR/calls" ]]
+old_assets=$(cut -c1-12 "$RELEASES/hotel-files/SHA256SUMS")
+make_hotel_files 4
+printf 'edited by owner\n' > "$hotel_files/assets/furni/stock_3.nitro"
+printf 'my texts\n' > "$hotel_files/gamedata/UITexts.jsonc"
+printf 'stock_3 from pack 4\n' > "$TEST_DIR/build/hotel-files-4/assets/furni/stock_3.nitro"
+tar -C "$TEST_DIR/build/hotel-files-4" -czf "$RELEASES/hotel-files/hotel-files.tar.gz" .
+(cd "$RELEASES/hotel-files" && sha256sum hotel-files.tar.gz > SHA256SUMS)
+pack_version=$(cut -c1-12 "$RELEASES/hotel-files/SHA256SUMS")
+snapshots_before=$(snapshots)
+: > "$TEST_DIR/terminal"
+run_update --check --assets
+grep -Fq "$pack_version" "$TEST_DIR/terminal"
+[[ $(< "$hotel_files/gamedata/FigureData.json") == 'edited again' ]]
+: > "$TEST_DIR/terminal"
+run_update --assets
+[[ -f "$hotel_files/assets/furni/stock_4.nitro" ]]
+[[ $(< "$hotel_files/assets/furni/stock_3.nitro") == 'edited by owner' ]]
+[[ $(< "$hotel_files/gamedata/FigureData.json") == 'figuredata 4' && ! -e "$hotel_files/gamedata/UITexts.jsonc" ]]
+[[ $(< "$BACKUP_ROOT/gamedata-$old_assets/UITexts.jsonc") == 'my texts' ]]
+[[ $(< "$emulator/Plus Emulator") == 'emulator v2.2.0' ]]
+grep -qx "ASSETS_VERSION='$pack_version'" "$VERSIONS_FILE"
+[[ $(snapshots) == "$snapshots_before" ]]
+if grep -q 'systemctl' "$TEST_DIR/calls" 2> /dev/null; then exit 1; fi
+grep -Fq "$pack_version" "$TEST_DIR/terminal"
+grep -Fqi 'figuredata.xml' "$TEST_DIR/terminal"
+: > "$TEST_DIR/terminal"
+run_update --assets
+grep -qi 'up to date' "$TEST_DIR/terminal"
 
 printf 'Bash update checks passed\n' >&4

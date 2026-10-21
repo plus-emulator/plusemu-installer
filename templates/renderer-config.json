@@ -13,7 +13,6 @@
     "soundboard.asset.url": "${asset.url}/sounds/soundboard/%file%",
     "soundboard.manifest.url": "${gamedata.url}/SoundData.json?t=%timestamp%",
     "external.texts.url": [
-    "${gamedata.url}/QuestUITexts.jsonc?t=%timestamp%",
         "${gamedata.url}/ExternalTexts.json?t=%timestamp%",
         "${gamedata.url}/UITexts.jsonc?t=%timestamp%",
         "${gamedata.url}/hotel-texts.json?t=%timestamp%",
