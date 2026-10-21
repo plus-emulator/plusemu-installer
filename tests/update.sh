@@ -102,7 +102,7 @@ make_hotel_files() { # make_hotel_files <revision>: the stock hotel files pack o
     (cd "$RELEASES/hotel-files" && sha256sum hotel-files.tar.gz > SHA256SUMS)
 }
 
-snapshots() { find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d 2> /dev/null | wc -l; }
+snapshots() { find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' 2> /dev/null | wc -l; }
 
 # An installation made before update mode existed: no versions file, user edits everywhere.
 mkdir -p "$TEST_DIR/etc" "$HOTEL_ROOT/emulator/Config" "$HOTEL_ROOT/emulator/plugins/MyPlugin" \
@@ -329,5 +329,40 @@ printf 'edited again\n' > "$hotel_files/gamedata/FigureData.json"
 download_hotel_files
 [[ $(< "$hotel_files/gamedata/FigureData.json") == 'edited again' ]]
 grep -qi 'already' "$TEST_DIR/terminal"
+
+# --assets only adds the stock files the hotel lacks and refreshes gamedata; existing files stay, no downtime.
+: > "$TEST_DIR/calls"
+: > "$TEST_DIR/terminal"
+run_update --assets
+grep -qi 'up to date' "$TEST_DIR/terminal"
+[[ ! -e "$TEST_DIR/calls" || ! -s "$TEST_DIR/calls" ]]
+old_assets=$(cut -c1-12 "$RELEASES/hotel-files/SHA256SUMS")
+make_hotel_files 4
+printf 'edited by owner\n' > "$hotel_files/assets/furni/stock_3.nitro"
+printf 'my texts\n' > "$hotel_files/gamedata/UITexts.jsonc"
+printf 'stock_3 from pack 4\n' > "$TEST_DIR/build/hotel-files-4/assets/furni/stock_3.nitro"
+tar -C "$TEST_DIR/build/hotel-files-4" -czf "$RELEASES/hotel-files/hotel-files.tar.gz" .
+(cd "$RELEASES/hotel-files" && sha256sum hotel-files.tar.gz > SHA256SUMS)
+pack_version=$(cut -c1-12 "$RELEASES/hotel-files/SHA256SUMS")
+snapshots_before=$(snapshots)
+: > "$TEST_DIR/terminal"
+run_update --check --assets
+grep -Fq "$pack_version" "$TEST_DIR/terminal"
+[[ $(< "$hotel_files/gamedata/FigureData.json") == 'edited again' ]]
+: > "$TEST_DIR/terminal"
+run_update --assets
+[[ -f "$hotel_files/assets/furni/stock_4.nitro" ]]
+[[ $(< "$hotel_files/assets/furni/stock_3.nitro") == 'edited by owner' ]]
+[[ $(< "$hotel_files/gamedata/FigureData.json") == 'figuredata 4' && ! -e "$hotel_files/gamedata/UITexts.jsonc" ]]
+[[ $(< "$BACKUP_ROOT/gamedata-$old_assets/UITexts.jsonc") == 'my texts' ]]
+[[ $(< "$emulator/Plus Emulator") == 'emulator v2.2.0' ]]
+grep -qx "ASSETS_VERSION='$pack_version'" "$VERSIONS_FILE"
+[[ $(snapshots) == "$snapshots_before" ]]
+if grep -q 'systemctl' "$TEST_DIR/calls" 2> /dev/null; then exit 1; fi
+grep -Fq "$pack_version" "$TEST_DIR/terminal"
+grep -Fqi 'figuredata.xml' "$TEST_DIR/terminal"
+: > "$TEST_DIR/terminal"
+run_update --assets
+grep -qi 'up to date' "$TEST_DIR/terminal"
 
 printf 'Bash update checks passed\n' >&4
