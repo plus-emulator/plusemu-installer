@@ -16,7 +16,8 @@ shopt -u patsub_replacement 2> /dev/null || true # bash 5.2 would expand "&" in 
 
 INSTALLER_REPO=${INSTALLER_REPO:-plus-emulator/plusemu-installer}
 INSTALLER_REF=${INSTALLER_REF:-main}
-ASSET_PACK_URL=${ASSET_PACK_URL:-https://github.com/plus-emulator/plusemu-installer/releases/latest/download/hotel-files.tar.gz}
+# The hotel files pack is rebuilt from the asset bucket and published on the rolling "hotel-files" release.
+ASSET_PACK_URL=${ASSET_PACK_URL:-https://github.com/plus-emulator/plusemu-installer/releases/download/hotel-files/hotel-files.tar.gz}
 EMULATOR_REPO=plus-emulator/PlusEMU
 CLIENT_REPO=plus-emulator/Volt
 # Set to install a build from another place instead of the latest release (recorded as version "custom").
@@ -267,7 +268,7 @@ install_update_command() {
     cat > "$UPDATE_COMMAND" <<EOF
 #!/usr/bin/env bash
 # Installed by the PlusEMU installer. Updates the emulator and the Volt client with the newest installer:
-#   sudo plusemu-update [--check] [--yes] [--with-assets] [--rollback]
+#   sudo plusemu-update [--check] [--yes] [--rollback]
 set -euo pipefail
 script=\$(mktemp)
 trap 'rm -f "\$script"' EXIT
@@ -543,21 +544,21 @@ EOF
 
 download_hotel_files() {
     step "Downloading the hotel files (furniture, clothes, badges, texts; about 550 MB)"
-    local files=$HOTEL_ROOT/hotel-files
-    if [ -f "$files/.complete" ]; then
-        ok "Already downloaded"
+    # A re-run installs the newest pack over the hotel files when it changed. Files the owner added stay.
+    local files=$HOTEL_ROOT/hotel-files latest pack
+    latest=$(pack_version) || latest=unknown
+    if [ "$latest" != unknown ] && [ "$latest" = "$ASSETS_VERSION" ] && [ -d "$files" ]; then
+        ok "Already downloaded (version $latest)"
         return
     fi
-    rm -rf "$files" && mkdir -p "$files"
-    local pack
+    mkdir -p "$files"
     pack=$(mktemp -p "$HOTEL_ROOT")
-    ASSETS_VERSION=$(pack_version) || ASSETS_VERSION=unknown
     fetch_checked "${ASSET_PACK_URL%/*}" "${ASSET_PACK_URL##*/}" "$pack" || die "Could not download the hotel files. Run the installer again."
     tar xzf "$pack" --no-same-owner -C "$files"
-    rm -f "$pack"
-    touch "$files/.complete"
+    rm -f "$pack" "$files/.complete"
+    ASSETS_VERSION=$latest
     save_versions
-    ok "Hotel files ready ($(du -sh "$files" | cut -f1))"
+    ok "Hotel files $latest ready ($(du -sh "$files" | cut -f1))"
 }
 
 start_emulator() {
@@ -1025,14 +1026,6 @@ require_update_space() { # require_update_space [with the hotel files: 0|1]
     require_free_space $(((files_mb * 3 + ${database_mb:-0} * 2 + hotel_files_mb * 3) / 1024 + 1)) "$HOTEL_ROOT"
 }
 
-assets_hint() { # assets_hint <newest hotel files version>
-    if [ -n "$1" ] && [ "$1" != custom ] && [ "$1" != "$ASSETS_VERSION" ]; then
-        say ""
-        say "  The stock hotel files (furniture, clothing, effects, texts) can be updated too:"
-        say "  ${bold}sudo plusemu-update --with-assets${reset}"
-    fi
-}
-
 confirm_update() { # confirm_update <question>
     [ "${PLUSEMU_YES:-0}" != 1 ] || return 0
     local go
@@ -1079,15 +1072,15 @@ rollback_update() {
 }
 
 update_main() {
-    local check=0 rollback=0 with_assets=0 arg latest_emulator latest_client latest_assets
+    local check=0 rollback=0 arg latest_emulator latest_client latest_assets
     local update_emulator=0 update_client=0 update_assets=0
     for arg in "$@"; do
         case "$arg" in
             --check) check=1 ;;
             --yes) PLUSEMU_YES=1 ;;
-            --with-assets) with_assets=1 ;;
+            --with-assets) ;; # the hotel files are always updated now; older guides still name this option
             --rollback) rollback=1 ;;
-            *) die "Unknown option: $arg. Usage: plusemu-update [--check] [--yes] [--with-assets] [--rollback]" ;;
+            *) die "Unknown option: $arg. Usage: plusemu-update [--check] [--yes] [--rollback]" ;;
         esac
     done
     MODE=update
@@ -1122,11 +1115,8 @@ update_main() {
     latest_client=$(release_version "$CLIENT_REPO" "$CLIENT_URL") || die "Could not find the latest Volt release. Check the server's internet connection."
     if [ "$EMULATOR_VERSION" != "$latest_emulator" ]; then update_emulator=1; fi
     if [ "$CLIENT_VERSION" != "$latest_client" ]; then update_client=1; fi
-    latest_assets=$(pack_version) || latest_assets=
-    if [ "$with_assets" = 1 ]; then
-        [ -n "$latest_assets" ] || die "Could not find the latest hotel files. Check the server's internet connection."
-        if [ "$ASSETS_VERSION" != "$latest_assets" ]; then update_assets=1; fi
-    fi
+    latest_assets=$(pack_version) || die "Could not find the latest hotel files. Check the server's internet connection."
+    if [ "$ASSETS_VERSION" != "$latest_assets" ]; then update_assets=1; fi
     say ""
     say "${bold}PlusEMU hotel update${reset}"
     if [ "$update_emulator" = 1 ]; then
@@ -1145,23 +1135,17 @@ update_main() {
     fi
     if [ "$update_assets" = 1 ]; then
         say "  Hotel files:        $ASSETS_VERSION -> ${bold}$latest_assets${reset} (about 550 MB)"
-    elif [ "$with_assets" = 1 ]; then
+    else
         say "  Hotel files:        $ASSETS_VERSION (up to date)"
     fi
-    if [ "$update_emulator" = 0 ] && [ "$update_client" = 0 ]; then
+    if [ "$update_emulator" = 0 ] && [ "$update_client" = 0 ] && [ "$update_assets" = 0 ]; then
         say ""
         say "  ${green}Everything is up to date.${reset}"
-        if [ "$with_assets" = 0 ]; then assets_hint "$latest_assets"; fi
         return
     fi
     if [ "$check" = 1 ]; then
         say ""
-        if [ "$with_assets" = 1 ]; then
-            say "  Install the update with: sudo plusemu-update --with-assets"
-        else
-            say "  Install the update with: sudo plusemu-update"
-            assets_hint "$latest_assets"
-        fi
+        say "  Install the update with: sudo plusemu-update"
         return
     fi
     say ""
@@ -1204,6 +1188,7 @@ update_main() {
         systemctl stop plusemu
         EMULATOR_STOPPED=1
     fi
+    if [ "$update_assets" = 1 ]; then mkdir -p "$HOTEL_ROOT/hotel-files"; fi
     create_snapshot "$update_assets"
     ok "Your hotel is saved in $SNAPSHOT"
     RESTORE_FROM=$SNAPSHOT RESTORE_DATABASE=0
@@ -1223,8 +1208,8 @@ update_main() {
         ok "Volt $latest_client installed"
     fi
     if [ "$update_assets" = 1 ]; then
-        mkdir -p "$HOTEL_ROOT/hotel-files"
         tar xzf "$WORK/hotel-files.tar.gz" --no-same-owner -C "$HOTEL_ROOT/hotel-files"
+        rm -f "$HOTEL_ROOT/hotel-files/.complete" # the marker of installers that never refreshed the pack
         ok "Hotel files $latest_assets installed"
     fi
 
