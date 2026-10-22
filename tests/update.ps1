@@ -52,6 +52,15 @@ function Stop-EmulatorService { $Calls.Add('stop') }
 function Start-EmulatorService { $Calls.Add('start') }
 function Wait-Emulator { return $true }
 function Set-HotelPermissions { $Calls.Add('permissions') }
+# Windows does not allow moving a folder while a program uses a file in it; the first moves of a locked folder fail.
+$script:LockedMoves = @{}
+function Move-Folder($From, $To) {
+    if ($script:LockedMoves[$From] -gt 0) {
+        $script:LockedMoves[$From]--
+        throw "Windows did not allow moving $From, because a program still uses a file in it."
+    }
+    Move-Item -LiteralPath $From $To
+}
 function Invoke-DatabaseDump($File) { Set-Content $File 'CREATE TABLE users (id INT);' }
 function Invoke-DatabaseRestore($File) { $Calls.Add('restore database'); $script:RestoredSql = Get-Content $File -Raw }
 function Invoke-Migration($Dir) {
@@ -226,6 +235,22 @@ try {
     Assert (@($Calls | Where-Object { $_ -in 'stop', 'start' })[-1] -eq 'start') 'The emulator was not started again after the restore'
     Assert (-not (Test-Path $VersionsFile)) 'A failed update recorded versions'
     Assert ($Terminal -match '(?i)restored') "The restore was not reported: $Terminal"
+
+    # A locked emulator folder stops the update and the restore puts everything back.
+    $script:Migration = 'ok'; $Calls.Clear()
+    $script:LockedMoves = @{ $emulator = 1 }
+    Assert (Test-UpdateFails -Yes) 'An update with a locked emulator folder was reported as success'
+    Assert ($LastError -like '*program still uses*') "Wrong locked folder error: $LastError"
+    Assert ((Get-Tree $HotelRoot) -ceq $original) 'A locked emulator folder left changed files'
+    Assert (-not ($Calls -like 'migrate*')) 'The migration ran although the emulator was not replaced'
+    # When the restore cannot move the folder either, nothing is deleted from the hotel.
+    $script:LockedMoves = @{ $emulator = 2 }
+    Assert (Test-UpdateFails -Yes) 'An update with a locked emulator folder was reported as success'
+    Assert ($Terminal -match 'automatic restore failed') "The failed restore was not reported: $Terminal"
+    Get-ChildItem $HotelRoot -Directory -Force | Where-Object Name -like '.update*' | Remove-Item -Recurse -Force
+    Assert ((Get-Tree $HotelRoot) -ceq $original) 'A failed restore deleted or changed hotel files'
+    $script:LockedMoves = @{}
+    Get-Snapshots | Select-Object -Skip 1 | Remove-Item -Recurse -Force
 
     # A successful update installs both releases and the hotel files, and keeps every user file and setting.
     $script:Migration = 'ok'; $Calls.Clear(); $script:RestoredSql = ''

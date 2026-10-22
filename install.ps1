@@ -708,7 +708,43 @@ function Wait-Emulator {
     return $false
 }
 
-function Stop-EmulatorService { Stop-Service PlusEMU }
+function Get-EmulatorProcesses {
+    $folder = (Join-Path $HotelRoot 'emulator') + '\'
+    return @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($folder, [StringComparison]::OrdinalIgnoreCase) })
+}
+
+function Stop-EmulatorService {
+    Stop-Service PlusEMU
+    # The service can report "stopped" while shawl or the emulator is still closing.
+    for ($i = 0; $i -lt 30 -and (Get-EmulatorProcesses).Count; $i++) { Start-Sleep 2 }
+    # Shawl only starts and stops the emulator. A shawl.exe left after the service stopped holds its own file, so it is ended.
+    foreach ($process in Get-EmulatorProcesses | Where-Object Name -eq 'shawl.exe') {
+        Write-Log "Ending shawl.exe (process $($process.ProcessId)), which still ran after the PlusEMU service stopped"
+        Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+        Wait-Process -Id $process.ProcessId -Timeout 10 -ErrorAction SilentlyContinue
+    }
+    $running = Get-EmulatorProcesses
+    if ($running.Count) {
+        $names = ($running | ForEach-Object { "$($_.Name) (process $($_.ProcessId))" }) -join ', '
+        throw "These programs still run from $(Join-Path $HotelRoot 'emulator') after the PlusEMU service stopped: $names. Close them (for example an emulator you started by hand), then run plusemu-update again."
+    }
+}
+
+# Windows does not allow moving a folder while a program uses a file in it.
+# A program that is still closing or a virus scanner can hold a file for a few seconds.
+function Move-Folder($From, $To) {
+    for ($i = 1; ; $i++) {
+        try { Move-Item -LiteralPath $From $To; return }
+        catch {
+            Write-Log "Moving $From failed (try $i): $_"
+            if ($i -ge 10) {
+                throw "Windows did not allow moving $From, because a program still uses a file in it. Close every program and window that has this folder open (for example File Explorer, or a PowerShell window that is in this folder or follows the emulator log), then run plusemu-update again."
+            }
+            Start-Sleep 3
+        }
+    }
+}
+
 function Start-EmulatorService { Start-Service PlusEMU }
 
 function Install-Cms {
@@ -1069,21 +1105,33 @@ function Restore-Snapshot($Snapshot, $RestoreDatabase) {
     if (Test-Path $staging) { Remove-Item $staging -Recurse -Force }
     New-Item -ItemType Directory -Path $staging | Out-Null
     if ((Invoke-Tar @('-xzf', (Join-Path $Snapshot 'files.tar.gz'), '-C', $staging)) -ne 0) { throw "Could not unpack the program files of $Snapshot." }
-    $hotelFiles = Join-Path $HotelRoot 'hotel-files'
+    $names = @('emulator', 'client')
     if (Test-Path (Join-Path $Snapshot 'hotel-files.tar')) {
         if ((Invoke-Tar @('-xf', (Join-Path $Snapshot 'hotel-files.tar'), '-C', $staging)) -ne 0) { throw "Could not unpack the hotel files of $Snapshot." }
-        if (Test-Path $hotelFiles) { Remove-Item $hotelFiles -Recurse -Force }
-        Move-Item (Join-Path $staging 'hotel-files') $hotelFiles
+        $names += 'hotel-files'
     }
-    $emulator = Join-Path $HotelRoot 'emulator'
-    $client = Join-Path $HotelRoot 'client'
-    $backups = Join-Path $emulator 'backups'
+    # The current folders are moved aside first, so a folder Windows does not allow to move leaves the hotel unchanged.
+    $previous = Join-Path $staging 'previous'
+    New-Item -ItemType Directory -Path $previous | Out-Null
+    $moved = @()
+    try {
+        foreach ($name in $names) {
+            $dir = Join-Path $HotelRoot $name
+            if (Test-Path $dir) { Move-Folder $dir (Join-Path $previous $name); $moved += $name }
+        }
+    } catch {
+        foreach ($name in $moved) { Move-Item (Join-Path $previous $name) (Join-Path $HotelRoot $name) }
+        Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
+        throw
+    }
+    # The emulator's own database backups are not in the snapshot. An unfinished update may have left them in its work folder.
     $stagedBackups = Join-Path (Join-Path $staging 'emulator') 'backups'
-    if ((Test-Path $backups) -and -not (Test-Path $stagedBackups)) { Move-Item $backups $stagedBackups }
-    foreach ($dir in $emulator, $client) { if (Test-Path $dir) { Remove-Item $dir -Recurse -Force } }
-    Move-Item (Join-Path $staging 'emulator') $emulator
-    Move-Item (Join-Path $staging 'client') $client
-    Remove-Item $staging -Recurse -Force
+    $sources = @(Join-Path (Join-Path $previous 'emulator') 'backups')
+    if ($script:Work) { $sources += (Join-Path (Join-Path $script:Work 'emulator.old') 'backups'), (Join-Path (Join-Path $script:Work 'emulator') 'backups') }
+    $backups = $sources | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($backups -and -not (Test-Path $stagedBackups)) { Move-Item $backups $stagedBackups }
+    foreach ($name in $names) { Move-Item (Join-Path $staging $name) (Join-Path $HotelRoot $name) }
+    Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
     Set-HotelPermissions
     if ($RestoreDatabase) { Invoke-DatabaseRestore (Join-Path $Snapshot 'database.sql') }
     if (Test-Path (Join-Path $Snapshot 'versions.json')) { Copy-Item (Join-Path $Snapshot 'versions.json') $VersionsFile -Force }
@@ -1170,8 +1218,9 @@ function Restore-LastBackup {
     $script:TotalSteps = 2
     $script:Step = 0
     Step 'Backing up the current state'
-    Stop-EmulatorService
+    # Set first, so the service starts again when stopping it fails.
     $script:EmulatorStopped = $true
+    Stop-EmulatorService
     $snapshot = New-Snapshot $withHotelFiles
     Ok "Saved in $snapshot"
     Step 'Restoring the backup'
@@ -1310,8 +1359,8 @@ function Update-Hotel([switch]$Check) {
 
     Step 'Backing up your hotel'
     if ($updateEmulator) {
-        Stop-EmulatorService
         $script:EmulatorStopped = $true
+        Stop-EmulatorService
     }
     if ($updateAssets) { New-Item -ItemType Directory -Force -Path $hotelFiles | Out-Null }
     $snapshot = New-Snapshot $updateAssets
@@ -1321,16 +1370,17 @@ function Update-Hotel([switch]$Check) {
 
     Step 'Installing the new versions'
     if ($updateEmulator) {
-        $backups = Join-Path $emulator 'backups'
-        if (Test-Path $backups) { Move-Item $backups (Join-Path $newEmulator 'backups') }
-        Move-Item $emulator (Join-Path $script:Work 'emulator.old')
+        $oldEmulator = Join-Path $script:Work 'emulator.old'
+        Move-Folder $emulator $oldEmulator
         Move-Item $newEmulator $emulator
+        $backups = Join-Path $oldEmulator 'backups'
+        if (Test-Path $backups) { Move-Item $backups (Join-Path $emulator 'backups') }
         $script:RestoreDatabase = $true
         Invoke-Migration $emulator
         Ok "PlusEMU $latestEmulator installed and the database updated"
     }
     if ($updateClient) {
-        Move-Item $client (Join-Path $script:Work 'client.old')
+        Move-Folder $client (Join-Path $script:Work 'client.old')
         Move-Item $newClient $client
         Ok "Volt $latestClient installed"
     }
