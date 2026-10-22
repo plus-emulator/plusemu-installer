@@ -717,6 +717,12 @@ function Stop-EmulatorService {
     Stop-Service PlusEMU
     # The service can report "stopped" while shawl or the emulator is still closing.
     for ($i = 0; $i -lt 30 -and (Get-EmulatorProcesses).Count; $i++) { Start-Sleep 2 }
+    # Shawl only starts and stops the emulator. A shawl.exe left after the service stopped holds its own file, so it is ended.
+    foreach ($process in Get-EmulatorProcesses | Where-Object Name -eq 'shawl.exe') {
+        Write-Log "Ending shawl.exe (process $($process.ProcessId)), which still ran after the PlusEMU service stopped"
+        Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+        Wait-Process -Id $process.ProcessId -Timeout 10 -ErrorAction SilentlyContinue
+    }
     $running = Get-EmulatorProcesses
     if ($running.Count) {
         $names = ($running | ForEach-Object { "$($_.Name) (process $($_.ProcessId))" }) -join ', '
