@@ -116,7 +116,9 @@ function New-ClientRelease($Tag) {
     New-Item -ItemType Directory -Force (Join-Path $dir 'assets'), (Join-Path $dir 'configuration'), (Join-Path $dir 'plugins'), $release | Out-Null
     Set-Content (Join-Path $dir 'index.html') "client $Tag"
     Set-Content (Join-Path (Join-Path $dir 'assets') "index-$Tag.js") 'bundle'
-    Set-Content (Join-Path (Join-Path $dir 'configuration') 'ui-config.example') '{}'
+    # The release ships its own default settings; the updater adds the ones a hotel lacks.
+    Set-Content (Join-Path (Join-Path $dir 'configuration') 'ui-config.example') '{"hotel.name": "Example Hotel", "collectibles.hub.enabled": true}'
+    Set-Content (Join-Path (Join-Path $dir 'configuration') 'renderer-config.json.example.json') '{"socket.url": "wss://example.invalid/game", "room.planes.direct": true}'
     Set-Content (Join-Path (Join-Path $dir 'configuration') 'pets.json') '{"pets": []}'
     Set-Content (Join-Path (Join-Path $dir 'plugins') 'room-builder.js') 'builder'
     # Client releases publish no SHA256SUMS, like the releases made before checksums existed.
@@ -247,7 +249,10 @@ try {
     $renderer = Get-Json (Join-Path $clientConfig 'renderer-config.json')
     Assert ($renderer.'socket.url' -eq 'wss://custom.example.com/game' -and $renderer.'my.setting' -eq 1) 'Custom renderer settings were lost'
     Assert ($renderer.'asset.url' -eq 'https://example.com/hotel-files/assets') 'New renderer settings were not added'
-    Assert ((Get-Json (Join-Path $clientConfig 'ui-config.json')).'hotel.name' -eq 'Mine') 'Custom ui-config settings were lost'
+    Assert ($renderer.'room.planes.direct' -eq $true) 'The settings shipped with the client release were not added to renderer-config.json'
+    $ui = Get-Json (Join-Path $clientConfig 'ui-config.json')
+    Assert ($ui.'hotel.name' -eq 'Mine') 'Custom ui-config settings were lost'
+    Assert ($ui.'collectibles.hub.enabled' -eq $true) 'The settings shipped with the client release were not added to ui-config.json'
     Assert ((Get-Text (Join-Path (Join-Path $hotelFiles 'gamedata') 'FigureData.json')) -eq 'figuredata 1') 'The hotel files were not updated'
     Assert ((Test-Path (Join-Path (Join-Path (Join-Path $hotelFiles 'assets') 'furni') 'stock_1.nitro')) -and (Test-Path (Join-Path (Join-Path (Join-Path $hotelFiles 'assets') 'custom') 'my_furni.nitro'))) 'Stock or owner-added hotel files are missing'
     $versions = Get-Versions
