@@ -1003,14 +1003,24 @@ function Copy-ClientSettings($Old, $New) {
     $oldConfig = Join-Path $Old 'configuration'
     $newConfig = Join-Path $New 'configuration'
     New-Item -ItemType Directory -Force -Path $newConfig | Out-Null
+    # The release ships the defaults of every setting it knows; the hotel's own files replace them below.
+    $shipped = @{}
+    foreach ($pair in @{ 'renderer-config.json' = 'renderer-config.json.example.json'; 'ui-config.json' = 'ui-config.example' }.GetEnumerator()) {
+        $example = Join-Path $newConfig $pair.Value
+        if (Test-Path $example) {
+            try { $shipped[$pair.Key] = Get-Content $example -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+        }
+    }
     if (Test-Path $oldConfig) { Copy-Item -Path (Join-Path $oldConfig '*') -Destination $newConfig -Recurse -Force }
     $rendered = Join-Path $Downloads 'client-configuration'
     if (Test-Path $rendered) { Remove-Item $rendered -Recurse -Force }
     Write-ClientConfig $rendered
     foreach ($file in 'renderer-config.json', 'ui-config.json', 'client-mode.json') {
         $target = Join-Path $newConfig $file
-        if (-not (Test-Path $target)) { Copy-Item (Join-Path $rendered $file) $target; continue }
-        try { $merged = Merge-Json (Get-Content (Join-Path $rendered $file) -Raw -Encoding UTF8 | ConvertFrom-Json) (Get-Content $target -Raw -Encoding UTF8 | ConvertFrom-Json) }
+        $defaults = Get-Content (Join-Path $rendered $file) -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($shipped.ContainsKey($file)) { $defaults = Merge-Json $shipped[$file] $defaults }
+        if (-not (Test-Path $target)) { Write-Utf8 $target ($defaults | ConvertTo-Json -Depth 20); continue }
+        try { $merged = Merge-Json $defaults (Get-Content $target -Raw -Encoding UTF8 | ConvertFrom-Json) }
         catch { Say "      Kept configuration/$file as it is: it is not plain JSON, so no new settings were added." 'Yellow'; continue }
         Write-Utf8 $target ($merged | ConvertTo-Json -Depth 20)
     }

@@ -78,7 +78,9 @@ make_client_release() { # make_client_release <tag>
     mkdir -p "$dir/assets" "$dir/configuration" "$dir/plugins" "$RELEASES/$1"
     printf 'client %s\n' "$1" > "$dir/index.html"
     printf 'bundle\n' > "$dir/assets/index-$1.js"
-    printf '{}\n' > "$dir/configuration/ui-config.example"
+    # The release ships its own default settings; the updater adds the ones a hotel lacks.
+    printf '{"hotel.name": "Example Hotel", "collectibles.hub.enabled": true}\n' > "$dir/configuration/ui-config.example"
+    printf '{"socket.url": "wss://example.invalid/game", "room.planes.direct": true}\n' > "$dir/configuration/renderer-config.json.example.json"
     printf '{"pets": []}\n' > "$dir/configuration/pets.json"
     printf 'builder\n' > "$dir/plugins/room-builder.js"
     (cd "$dir" && python3 -m zipfile -c "$RELEASES/$1/volt-client.zip" index.html assets configuration plugins)
@@ -210,7 +212,9 @@ renderer=$client/configuration/renderer-config.json
 [[ $(jq -r '."socket.url"' "$renderer") == wss://custom.example.com/game ]]
 [[ $(jq -r '."my.setting"' "$renderer") == 1 ]]
 [[ $(jq -r '."asset.url"' "$renderer") == https://example.com/hotel-files/assets ]]
+[[ $(jq -r '."room.planes.direct"' "$renderer") == true ]]
 [[ $(jq -r '."hotel.name"' "$client/configuration/ui-config.json") == Mine ]]
+[[ $(jq -r '."collectibles.hub.enabled"' "$client/configuration/ui-config.json") == true ]]
 grep -qx "EMULATOR_VERSION='v2.0.0'" "$VERSIONS_FILE"
 grep -qx "CLIENT_VERSION='client-v2.0.0'" "$VERSIONS_FILE"
 grep -qx "ASSETS_VERSION='$(cut -c1-12 "$RELEASES/hotel-files/SHA256SUMS")'" "$VERSIONS_FILE"
