@@ -927,16 +927,26 @@ keep_emulator_files() { # keep_emulator_files <installed dir> <new dir>
 }
 
 keep_client_files() { # keep_client_files <installed dir> <new dir>
-    local old=$1 new=$2 rendered file
+    local old=$1 new=$2 rendered file example
     # Hashed bundles belong to one release; the other files the release lacks are the hotel's.
     carry_over "$old" "$new" '^(src/)?assets/'
+    rendered=$(mktemp -d)
+    # The release ships the defaults of every setting it knows; the hotel's own files replace them below.
+    mkdir -p "$rendered/shipped"
+    for file in renderer-config.json:renderer-config.json.example.json ui-config.json:ui-config.example; do
+        example=$new/configuration/${file#*:}
+        if [ -f "$example" ] && jq empty "$example" 2> /dev/null; then cp "$example" "$rendered/shipped/${file%%:*}"; fi
+    done
     if [ -d "$old/configuration" ]; then
         mkdir -p "$new/configuration"
         cp -a "$old/configuration/." "$new/configuration/"
     fi
-    rendered=$(mktemp -d)
     write_client_config "$rendered"
     for file in renderer-config.json ui-config.json client-mode.json; do
+        if [ -f "$rendered/shipped/$file" ]; then
+            jq -s '.[0] * .[1]' "$rendered/shipped/$file" "$rendered/$file" > "$rendered/$file.defaults"
+            mv "$rendered/$file.defaults" "$rendered/$file"
+        fi
         if [ ! -f "$new/configuration/$file" ]; then
             cp "$rendered/$file" "$new/configuration/$file"
         elif jq -s '.[0] * .[1]' "$rendered/$file" "$new/configuration/$file" > "$rendered/$file.new" 2> /dev/null; then
