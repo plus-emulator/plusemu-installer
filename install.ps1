@@ -54,6 +54,12 @@ $StateFile  = "$StateDir\hotel.json"
 $VersionsFile  = Join-Path $StateDir 'versions.json'
 $BackupRoot    = Join-Path $StateDir 'backups'
 $UpdateCommand = Join-Path $StateDir 'plusemu-update.ps1'
+$CleanupScript = Join-Path $StateDir 'plusemu-cleanup.ps1'
+$NightlyRoot   = Join-Path $BackupRoot 'nightly'
+$BackupScript  = Join-Path $StateDir 'plusemu-backup.ps1'
+$BackupLog     = Join-Path $StateDir 'backup.log'
+$KeepNightly   = 7
+$BackupLockWait = 3600
 $UpdateLog     = Join-Path $StateDir 'update.log'
 $LockFile      = Join-Path $StateDir 'update.lock'
 $KeepBackups   = 3
@@ -62,7 +68,7 @@ $script:Log        = "$StateDir\install.log"
 $PhpDir     = 'C:\PHP'
 $NodeMajor  = 22
 $MariaDbSeries = '11.4'
-$script:TotalSteps = 10
+$script:TotalSteps = 11
 $script:Step = 0
 
 # `irm | iex` runs in the user's own session, so these are restored at the end.
@@ -472,7 +478,7 @@ function Get-Derived {
 function Install-WebServer {
     Step 'Installing IIS with URL Rewrite, reverse proxy and WebSockets'
     $features = 'Web-Server', 'Web-Static-Content', 'Web-Default-Doc', 'Web-Http-Errors', 'Web-Http-Logging',
-                'Web-Stat-Compression', 'Web-Dyn-Compression', 'Web-Filtering', 'Web-CGI', 'Web-WebSockets', 'Web-Mgmt-Console'
+                'Web-Stat-Compression', 'Web-Dyn-Compression', 'Web-Filtering', 'Web-IP-Security', 'Web-CGI', 'Web-WebSockets', 'Web-Mgmt-Console'
     $result = Install-WindowsFeature -Name $features
     if (-not $result.Success) { throw 'Installing IIS failed.' }
     Import-Module WebAdministration
@@ -924,6 +930,7 @@ function Set-IisSite {
     Set-HotelPermissions
     foreach ($dir in "$HotelRoot\cms\storage", "$HotelRoot\cms\bootstrap\cache") { Run icacls.exe $dir /grant "IIS AppPool\$($pool):(OI)(CI)M" /T /Q }
     Run icacls.exe "$HotelRoot\cms\.env" /inheritance:r /grant:r 'Administrators:F' 'SYSTEM:F' "IIS AppPool\$($pool):R"
+    Set-IisLimits $site
     Start-Website -Name $site -ErrorAction SilentlyContinue
     if ((Get-WebAppPoolState -Name $pool).Value -eq 'Started') { Restart-WebAppPool -Name $pool } else { Start-WebAppPool -Name $pool }
     Ok "IIS serves https://$domain"
@@ -936,6 +943,37 @@ function Set-IisSite {
     Ok 'Firewall allows HTTP and HTTPS (the database and emulator stay private)'
 }
 
+# Per-visitor limits and security headers for the hotel site.
+function Set-IisLimits($Site) {
+    $apphost = 'MACHINE/WEBROOT/APPHOST'
+    # Visitors arrive through Cloudflare, so the visitor's address is read from X-Forwarded-For.
+    # The game client loads hundreds of hotel files at once, so the request rate stays high.
+    $dynamic = 'system.webServer/security/dynamicIpSecurity'
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $dynamic -Name 'enableProxyMode' -Value 'True'
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $dynamic -Name 'denyAction' -Value 'Forbidden'
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByConcurrentRequests" -Name 'enabled' -Value 'True'
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByConcurrentRequests" -Name 'maxConcurrentRequests' -Value 50
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByRequestRate" -Name 'enabled' -Value 'True'
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByRequestRate" -Name 'maxRequests' -Value 1500
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByRequestRate" -Name 'requestIntervalInMilliseconds' -Value 10000
+    $requestLimits = 'system.webServer/security/requestFiltering/requestLimits'
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $requestLimits -Name 'maxAllowedContentLength' -Value 20971520
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $requestLimits -Name 'maxUrl' -Value 4096
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $requestLimits -Name 'maxQueryString' -Value 2048
+    # Slow clients that never finish sending their request headers are dropped after 10 seconds.
+    & cmd.exe /c 'netsh http delete timeout timeouttype=headerwaittimeout >nul 2>&1'
+    try { Run netsh.exe http add timeout timeouttype=headerwaittimeout value=10 }
+    catch { Say "      Could not set the 10 second header timeout ($_). The website works without it." 'Yellow' }
+
+    $headers = 'system.webServer/httpProtocol/customHeaders'
+    foreach ($header in @(@('Strict-Transport-Security', 'max-age=31536000'), @('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), usb=()'))) {
+        if (Get-WebConfiguration -PSPath $apphost -Location $Site -Filter "$headers/add[@name='$($header[0])']") {
+            Remove-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $headers -Name 'collection' -AtElement @{ name = $header[0] }
+        }
+        Add-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $headers -Name '.' -Value @{ name = $header[0]; value = $header[1] }
+    }
+}
+
 function Set-HotelPermissions {
     # IIS needs to read the client and the hotel files; only administrators may read the emulator's passwords.
     foreach ($dir in 'client', 'hotel-files') {
@@ -943,6 +981,120 @@ function Set-HotelPermissions {
         if (Test-Path $path) { Run icacls.exe $path /grant 'IIS_IUSRS:(OI)(CI)RX' 'IUSR:(OI)(CI)RX' /Q }
     }
     Run icacls.exe (Join-Path (Join-Path $HotelRoot 'emulator') 'Config') /inheritance:r /grant:r 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F'
+}
+
+# Windows Update policy: install every day at 05:00 and restart only when an update needs it.
+# Windows ships security fixes inside cumulative updates, so they cannot be installed alone.
+function Set-WindowsUpdates {
+    $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $au = "$policy\AU"
+    # New-Item -Force on an existing registry key would remove its other values.
+    if (-not (Test-Path $au)) { New-Item -Path $au -Force | Out-Null }
+    $values = [ordered]@{
+        NoAutoUpdate = 0; AUOptions = 4; ScheduledInstallDay = 0; ScheduledInstallTime = 5
+        AlwaysAutoRebootAtScheduledTime = 1; AlwaysAutoRebootAtScheduledTimeMinutes = 15
+    }
+    foreach ($name in $values.Keys) { New-ItemProperty -Path $au -Name $name -Value $values[$name] -PropertyType DWord -Force | Out-Null }
+    New-ItemProperty -Path $policy -Name ExcludeWUDriversInQualityUpdate -Value 1 -PropertyType DWord -Force | Out-Null
+    Ok 'Windows updates install every day at 05:00; the server restarts only when an update needs it'
+}
+
+# The emulator's service log, the website log and the IIS logs are removed after 14 days.
+function Set-LogCleanup {
+    Write-Utf8 $CleanupScript @"
+# Installed by the PlusEMU installer. The "PlusEMU log cleanup" task runs this every day.
+`$limit = (Get-Date).AddDays(-14)
+foreach (`$pattern in '$HotelRoot\emulator\service\*.log', '$HotelRoot\cms\storage\logs\*.log', "`$env:SystemDrive\inetpub\logs\LogFiles\*\*.log") {
+    Get-ChildItem `$pattern -File -ErrorAction SilentlyContinue | Where-Object LastWriteTime -lt `$limit | Remove-Item -Force -ErrorAction SilentlyContinue
+}
+"@
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$CleanupScript`""
+    $trigger = New-ScheduledTaskTrigger -Daily -At '03:30'
+    Register-ScheduledTask -TaskName 'PlusEMU log cleanup' -Action $action -Trigger $trigger -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+    Ok 'Logs older than 14 days are removed every day at 03:30 (task: PlusEMU log cleanup)'
+}
+
+# Saves what a download cannot bring back: the database, the settings, the website's uploads and the hotel's texts.
+function Invoke-NightlyBackup {
+    $nightly = $NightlyRoot
+    New-Item -ItemType Directory -Force -Path $nightly | Out-Null
+    # plusemu-update holds this lock while it changes the hotel.
+    $deadline = (Get-Date).AddSeconds([int]$BackupLockWait)
+    $lock = $null
+    while (-not $lock) {
+        try { $lock = [IO.File]::Open($LockFile, 'OpenOrCreate', 'ReadWrite', 'None') }
+        catch {
+            if ((Get-Date) -ge $deadline) { throw 'An update is still running; no backup was made.' }
+            Start-Sleep 1
+        }
+    }
+    try {
+        $script:state = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $databaseMb = [int]"$(Sql "SELECT COALESCE(ROUND(SUM(data_length + index_length) / 1048576), 0) FROM information_schema.tables WHERE table_schema = 'plus'")".Trim()
+        $freeMb = [int]((New-Object IO.DriveInfo $nightly).AvailableFreeSpace / 1MB)
+        if ($freeMb -lt $databaseMb + 2048) { throw "Only $freeMb MB free for $nightly; no backup was made." }
+        $target = Join-Path $nightly (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss-fff')
+        $partial = "$target.partial"
+        New-Item -ItemType Directory -Force -Path $partial | Out-Null
+        $sql = Join-Path $partial 'database.sql'
+        Invoke-DatabaseDump $sql
+        $in = [IO.File]::OpenRead($sql)
+        $out = [IO.File]::Create("$sql.gz")
+        $zip = New-Object IO.Compression.GZipStream($out, [IO.Compression.CompressionMode]::Compress)
+        try { $in.CopyTo($zip) } finally { $zip.Dispose(); $out.Dispose(); $in.Dispose() }
+        Remove-Item $sql
+        $files = @('emulator/Config', 'client/configuration', 'cms/.env', 'cms/storage/app', 'hotel-files/gamedata') | Where-Object { Test-Path (Join-Path $HotelRoot $_) }
+        # Exit code 1 only means a file changed while it was read.
+        $code = Invoke-Tar (@('-C', $HotelRoot, '-czf', (Join-Path $partial 'hotel.tar.gz')) + $files)
+        if ($code -notin 0, 1) { throw "Backing up the hotel files failed (tar exit code $code)." }
+        $settings = @('hotel.json', 'versions.json') | Where-Object { Test-Path (Join-Path $StateDir $_) }
+        if ((Invoke-Tar (@('-C', $StateDir, '-czf', (Join-Path $partial 'settings.tar.gz')) + $settings)) -ne 0) { throw 'Backing up the settings failed.' }
+        Move-Item $partial $target
+        Get-ChildItem $nightly -Directory -Filter '*.partial' | Remove-Item -Recurse -Force
+        $backups = @(Get-ChildItem $nightly -Directory | Where-Object { $_.Name -match '^\d{8}-\d{6}-\d{3}$' } | Sort-Object Name)
+        if ($backups.Count -gt [int]$KeepNightly) { $backups[0..($backups.Count - [int]$KeepNightly - 1)] | Remove-Item -Recurse -Force }
+        Write-Log "$(Get-Date -Format s) Backup saved in $target"
+    } finally {
+        $lock.Dispose()
+    }
+}
+
+# Writes plusemu-backup.ps1 from the installer's own functions and runs it every night at 04:00.
+function Write-BackupCommand {
+    $text = "# Installed by the PlusEMU installer. The `"PlusEMU nightly backup`" task runs this every night at 04:00.`r`n"
+    $text += "`$ErrorActionPreference = 'Stop'`r`n"
+    foreach ($name in 'HotelRoot', 'StateDir', 'StateFile', 'NightlyRoot', 'LockFile', 'KeepNightly', 'BackupLockWait') {
+        $text += "`$$name = '$((Get-Variable $name).Value)'`r`n"
+    }
+    $text += "`$script:Log = '$BackupLog'`r`n"
+    foreach ($name in 'Write-Log', 'Find-MariaDb', 'Get-MariaDb', 'Sql', 'Invoke-DatabaseDump', 'Invoke-Tar', 'Invoke-NightlyBackup') {
+        $text += "function $name {$((Get-Item "function:$name").Definition)}`r`n"
+    }
+    $text += "try { Invoke-NightlyBackup } catch { Write-Log `"`$(Get-Date -Format s) Backup failed: `$_`"; exit 1 }`r`n"
+    Write-Utf8 $BackupScript $text
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$BackupScript`""
+    $trigger = New-ScheduledTaskTrigger -Daily -At '04:00'
+    Register-ScheduledTask -TaskName 'PlusEMU nightly backup' -Action $action -Trigger $trigger -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+    Ok "Nightly backups at 04:00 in $NightlyRoot (the newest $KeepNightly are kept)"
+}
+
+function Protect-Server {
+    Step 'Securing the server (failed logins, Windows updates, logs and backups)'
+    # A domain controller would apply this to the whole domain, so its own policy is left alone.
+    if ((Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4) {
+        Say '      This server is a domain controller: the account lockout policy was left as it is.' 'Yellow'
+    } else {
+        # Windows refuses a counting window longer than the lockout, so the window shrinks first
+        # when it can, and the lockout is set before the window when it cannot.
+        Run net.exe accounts /lockoutthreshold:10
+        & net.exe accounts /lockoutwindow:10 *> $null
+        Run net.exe accounts /lockoutduration:10
+        Run net.exe accounts /lockoutwindow:10
+        Ok 'An account locks for 10 minutes after 10 wrong passwords in 10 minutes (RDP and SSH were not opened or changed)'
+    }
+    Set-WindowsUpdates
+    Set-LogCleanup
+    Write-BackupCommand
 }
 
 function Write-Guide {
@@ -986,6 +1138,7 @@ function Complete-Install {
     Write-Host ''
     Write-Host "  Retrieve saved passwords (Administrator PowerShell): Get-Content $StateFile"
     Write-Host '  Update the emulator, client and hotel files later (Administrator PowerShell): plusemu-update'
+    Write-Host "  Nightly backups of the database and your settings: $NightlyRoot"
     Write-Host '  Store passwords somewhere safe. Change the initial admin password after logging in;'
     Write-Host '  the saved file retains the initial password. Keep passwords out of shared logs and screenshots.'
     Write-Host ''
@@ -1467,6 +1620,7 @@ try {
         Write-ClientConfig
         Install-Cms
         Set-IisSite
+        Protect-Server
         Write-Guide
         Write-UpdateCommand
         Complete-Install

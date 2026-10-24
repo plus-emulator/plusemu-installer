@@ -54,7 +54,7 @@ After you confirm, the installer runs on its own in about 10 minutes.
 
 The **simple** guide is the default. The **advanced** guide includes a manual checklist for administrator access, firewall rules and maintenance. Both contain the full Cloudflare certificate generation and server import steps.
 
-**This selects instructions only. Selecting this guide does not change SSH, RDP, firewall, updates or backups.** There is no advanced provisioning mode in this release.
+**This selects instructions only. Selecting this guide does not change SSH, RDP, firewall, updates or backups.** There is no advanced provisioning mode in this release. Both guides get the same server protection, described in [How it works](#how-it-works).
 
 For downloaded scripts, use `sudo bash install.sh --guide-mode advanced` on Linux or `.\install.ps1 -GuideMode advanced` in Administrator PowerShell. Use `simple` instead to choose the simple guide.
 
@@ -110,8 +110,17 @@ Every step is logged. If a step fails, the installer shows the last lines of the
 8. Configures nginx and the firewall:
    - nginx starts with a temporary self-signed HTTPS certificate. The setup guide replaces it with a Cloudflare Origin CA certificate for **Full (strict)**.
    - It restores visitors' real IPs from Cloudflare and passes the game's WebSocket through to the emulator.
+   - It limits each visitor: 5 login, registration or password reset attempts per minute (plus a burst of 5), 30 housekeeping pages per minute (plus a burst of 20), 50 open requests and 20 game connections (many players can share one address, for example at a school). Over the limit, nginx answers 429. The game client and the hotel files have no limits.
+   - It drops slow connections after 10 seconds and sends the `Strict-Transport-Security` and `Permissions-Policy` headers. `Strict-Transport-Security` covers the hotel domain only, not its subdomains.
    - The `ufw` firewall allows only SSH, HTTP and HTTPS. The database and the emulator stay private.
-9. Writes your setup guide.
+9. Secures the server:
+   - `fail2ban` bans an address for 1 hour after 5 failed SSH logins in 10 minutes.
+   - Security updates from Debian or Ubuntu install every day at 05:00 server time with `unattended-upgrades`. The server restarts right after, but only when an update needs it. Unused packages are removed. The emulator, the client, the website and PHP are not touched: update them with `plusemu-update` and the PHP script below.
+   - Network settings in `/etc/sysctl.d/90-plusemu.conf` turn on SYN cookies and raise the queues for new connections, so a flood of connections does not stop the server.
+   - Installer, update and backup logs and the website log rotate daily and are kept for 14 days. The emulator logs to the system journal, which keeps 14 days and at most 1 GB.
+   - A nightly backup runs at 04:00 (see [Nightly backups](#nightly-backups)).
+   - SSH lets root log in with a key only. SSH password login goes off only when your login uses an SSH key (this session, or the account that ran `sudo` has a key in `~/.ssh/authorized_keys`). Otherwise password login stays on, and the installer says so. The settings are in `/etc/ssh/sshd_config.d/10-plusemu.conf`.
+10. Writes your setup guide.
 
 **Windows** (`install.ps1`) follows the same steps with Windows equivalents:
 
@@ -119,6 +128,12 @@ Every step is logged. If a step fails, the installer shows the last lines of the
 - MariaDB 11.4
 - The emulator as the `PlusEMU` Windows service
 - Windows Firewall rules for the website
+- An account lockout policy: an account locks for 10 minutes after 10 wrong passwords in 10 minutes, the default of new Windows versions. A lower limit would let an attacker keep the built-in Administrator locked out. RDP and SSH are not opened or changed.
+- The *PlusEMU log cleanup* task removes emulator, website and IIS logs older than 14 days, every day at 03:30. Windows has SYN flood protection built in and has no settings for it, so the installer changes nothing there.
+- The *PlusEMU nightly backup* task makes the nightly backup at 04:00 (see [Nightly backups](#nightly-backups)).
+- Windows Update installs updates every day at 05:00 and restarts the server only when an update needs it. Windows has no security-only updates, so all quality updates install. Driver updates are left out. The installer sets these Windows Update policies under `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU`: `NoAutoUpdate=0`, `AUOptions=4`, `ScheduledInstallDay=0`, `ScheduledInstallTime=5`, `AlwaysAutoRebootAtScheduledTime=1` and `AlwaysAutoRebootAtScheduledTimeMinutes=15`, plus `ExcludeWUDriversInQualityUpdate=1` one level up. A domain Group Policy can replace them.
+- IIS Dynamic IP Restrictions: each visitor gets at most 50 open requests and 1500 requests in 10 seconds, read from the address Cloudflare forwards. Over the limit, IIS answers 403. IIS cannot limit single pages, so the login limits come from Atom CMS itself (5 attempts per minute). Uploads are limited to 20 MB, and request headers must arrive within 10 seconds.
+- The `Strict-Transport-Security` header (for the hotel domain only, not its subdomains) and the `Permissions-Policy` header
 
 The pages the installer generates, such as the setup guide and the client configuration, come from the templates in [`templates/`](templates). When you run the installer through `curl | bash` or `irm | iex`, it downloads these templates from this repository's `main` branch, so a fix merged here reaches every new install.
 
@@ -132,6 +147,9 @@ The pages the installer generates, such as the setup guide and the client config
 | Installed versions | `/etc/plusemu/versions.env` | `C:\ProgramData\PlusEMU\versions.json` |
 | Update log | `/var/log/plusemu-update.log` | `C:\ProgramData\PlusEMU\update.log` |
 | Update backups | `/var/backups/plusemu` | `C:\ProgramData\PlusEMU\backups` |
+| Nightly backups | `/var/backups/plusemu/nightly` | `C:\ProgramData\PlusEMU\backups\nightly` |
+| Backup log | `/var/log/plusemu-backup.log` | `C:\ProgramData\PlusEMU\backup.log` |
+| Make a backup now | `sudo plusemu-backup` | `Start-ScheduledTask 'PlusEMU nightly backup'` |
 | Restart the emulator | `sudo systemctl restart plusemu` | `Restart-Service PlusEMU` |
 | Watch the emulator log | `sudo journalctl -u plusemu -f` | `Get-Content C:\Hotel\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 50 -Wait` |
 
@@ -152,6 +170,28 @@ Enter the database password at the prompt. On Windows, use `mariadb.exe` from yo
 Linux database root uses local socket authentication (`sudo mariadb`); no root password is generated. Windows database root uses the saved `DbRootPassword`.
 
 Change your initial admin password after logging in. The saved file still contains the initial value. Keep the file and terminal password summary private, and remove credentials before sharing logs or screenshots.
+
+## Nightly backups
+
+Every night at 04:00 server time, the installer's backup saves what a download cannot bring back. It keeps the newest 7 backups, each in its own folder named by its time (UTC):
+
+- `database.sql.gz`: the whole `plus` database.
+- `hotel.tar.gz`: the emulator's `Config` folder, the client's `configuration` folder, the website's `.env` file and uploads (`cms/storage/app`), and the hotel's texts (`hotel-files/gamedata`).
+- `settings.tar.gz`: the saved answers, passwords and versions. On Linux also the HTTPS certificate in `/etc/ssl/plusemu`. On Windows the certificate stays in the Windows certificate store; export it yourself if you need a copy.
+
+The backup leaves out what the installer or `plusemu-update` downloads again: the emulator and client programs and the stock hotel files. Furniture, clothes or badges that you added to `hotel-files` yourself are not in the backup, so keep your own copy of them. When an update is running, the backup waits for it. When the disk has less than 2 GB free plus the size of the database, it makes no backup and writes the reason in the backup log. The update backups (newest 3) stay separate.
+
+These backups are on the same server, so they cannot recover a lost server. Copy them to another place now and then.
+
+To restore the database of a backup on Linux (the hotel loses every change made since then):
+
+```bash
+sudo systemctl stop plusemu
+gunzip -c /var/backups/plusemu/nightly/<time>/database.sql.gz | sudo mariadb plus
+sudo systemctl start plusemu
+```
+
+To get files back, unpack the file you need from `hotel.tar.gz`, for example `sudo tar -xzf /var/backups/plusemu/nightly/<time>/hotel.tar.gz -C /var/www/hotel emulator/Config`.
 
 ## One-command updates
 

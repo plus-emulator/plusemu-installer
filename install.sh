@@ -35,11 +35,20 @@ UPDATE_LOG=/var/log/plusemu-update.log
 UPDATE_COMMAND=/usr/local/sbin/plusemu-update
 BACKUP_ROOT=/var/backups/plusemu
 KEEP_BACKUPS=3
+NIGHTLY_ROOT=$BACKUP_ROOT/nightly
+KEEP_NIGHTLY=7
+BACKUP_COMMAND=/usr/local/sbin/plusemu-backup
+BACKUP_CRON=/etc/cron.d/plusemu-backup
+BACKUP_LOG=/var/log/plusemu-backup.log
+SSL_DIR=/etc/ssl/plusemu
 LOCK_FILE=/run/plusemu-update.lock
+SSHD_DROPIN=/etc/ssh/sshd_config.d/10-plusemu.conf
+LOGROTATE_CONF=/etc/logrotate.d/plusemu
+JOURNALD_DROPIN=/etc/systemd/journald.conf.d/90-plusemu.conf
 MODE=install
 PHP=8.5
 NODE_MAJOR=22
-TOTAL_STEPS=9
+TOTAL_STEPS=10
 STEP=0
 
 # ---------------------------------------------------------------- output
@@ -413,7 +422,8 @@ install_packages() {
     step "Installing system packages (nginx, MariaDB, PHP $PHP)"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y ca-certificates curl git unzip jq gnupg openssl cron ufw nginx mariadb-server mariadb-client libicu-dev xz-utils
+    apt-get install -y ca-certificates curl git unzip jq gnupg openssl cron ufw nginx mariadb-server mariadb-client libicu-dev xz-utils \
+        fail2ban python3-systemd unattended-upgrades
     if ! apt-cache show "php$PHP-fpm" > /dev/null 2>&1; then
         # PHP 8.5 isn't in these releases yet: use the well-known Sury/Ondřej packages.
         if [ "$OS_ID" = ubuntu ]; then
@@ -691,10 +701,29 @@ cloudflare_real_ip() {
     } > /etc/nginx/conf.d/cloudflare-real-ip.conf
 }
 
+request_limits() {
+    cat > /etc/nginx/conf.d/plusemu-limits.conf <<'EOF'
+# Per-visitor limits. The visitor's address comes from cloudflare-real-ip.conf.
+# Only POSTs to the login forms count, so opening the pages is never limited.
+# The game client and hotel files have no limits: the client loads hundreds of them at once.
+map $request_method $plusemu_login_key {
+    POST $binary_remote_addr;
+    default "";
+}
+limit_req_zone $plusemu_login_key zone=plusemu_login:10m rate=5r/m;
+limit_req_zone $binary_remote_addr zone=plusemu_housekeeping:10m rate=30r/m;
+limit_conn_zone $binary_remote_addr zone=plusemu_conn:10m;
+limit_conn_zone $binary_remote_addr zone=plusemu_ws:10m;
+limit_req_status 429;
+limit_conn_status 429;
+EOF
+}
+
 ws_location() { # the nginx block that hands the game connection to the emulator
     cat <<EOF
     location = $WS_PATH {
         if (\$http_origin != "https://$DOMAIN") { return 403; }
+        limit_conn plusemu_ws 20;
         proxy_pass http://127.0.0.1:2096;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
@@ -708,7 +737,7 @@ EOF
 
 configure_web() {
     step "Configuring nginx, HTTPS and the firewall"
-    local ssl=/etc/ssl/plusemu php_sock=/run/php/php$PHP-fpm.sock
+    local ssl=$SSL_DIR php_sock=/run/php/php$PHP-fpm.sock
     mkdir -p "$ssl"
     if [ ! -f "$ssl/cert.pem" ]; then
             openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout "$ssl/key.pem" -out "$ssl/cert.pem" \
@@ -716,6 +745,7 @@ configure_web() {
         chmod 600 "$ssl/key.pem"
     fi
     cloudflare_real_ip
+    request_limits
     # Added to nginx's own list; .hab and .nitro already fall back to application/octet-stream.
     echo 'types { application/json jsonc; }' > /etc/nginx/conf.d/hotel-mime.conf
 
@@ -727,6 +757,11 @@ configure_web() {
     listen [::]:443 ssl;
     http2 on;"
     fi
+
+    # Slow clients that hold connections open without sending a request are dropped.
+    local timeouts="client_header_timeout 10s;
+    client_body_timeout 10s;
+    keepalive_timeout 20s;"
 
     local ws_main="" ws_server=""
     if [ "$WS_HOST" = "$DOMAIN" ]; then
@@ -741,6 +776,7 @@ server {
     server_name $WS_HOST;
     ssl_certificate $ssl/cert.pem;
     ssl_certificate_key $ssl/key.pem;
+    $timeouts
 $(ws_location)
     location / { return 404; }
 }
@@ -756,6 +792,7 @@ server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
+    $timeouts
     location /$GUIDE_TOKEN/ { alias $HOTEL_ROOT/setup-guide/; index index.html; }
     location / { return 444; }
 }
@@ -766,6 +803,7 @@ server {
     server_name _;
     ssl_certificate $ssl/cert.pem;
     ssl_certificate_key $ssl/key.pem;
+    $timeouts
     return 444;
 }
 
@@ -776,6 +814,7 @@ server {
     server_name www.$DOMAIN;
     ssl_certificate $ssl/cert.pem;
     ssl_certificate_key $ssl/key.pem;
+    $timeouts
     return 301 https://$DOMAIN\$request_uri;
 }
 
@@ -792,9 +831,12 @@ server {
     charset utf-8;
     client_max_body_size 20m;
     server_tokens off;
+    $timeouts
 
     add_header X-Content-Type-Options nosniff always;
     add_header Referrer-Policy strict-origin-when-cross-origin always;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), usb=()" always;
 
     gzip on;
     gzip_types text/plain text/css application/json application/javascript text/javascript image/svg+xml application/wasm;
@@ -821,11 +863,26 @@ $ws_main
         expires 7d;
     }
 
+    # Atom CMS sign-in, registration and password reset forms.
+    location ~ ^/(login|register|forgot-password|reset-password/[^/]+|two-factor-challenge)\$ {
+        limit_req zone=plusemu_login burst=5 nodelay;
+        limit_conn plusemu_conn 50;
+        try_files \$uri /index.php?\$query_string;
+    }
+
+    location /housekeeping {
+        limit_req zone=plusemu_housekeeping burst=20 nodelay;
+        limit_conn plusemu_conn 50;
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
     location / {
+        limit_conn plusemu_conn 50;
         try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
     location ~ \.php\$ {
+        limit_conn plusemu_conn 50;
         fastcgi_pass unix:$php_sock;
         fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
         fastcgi_param HTTPS on;
@@ -851,6 +908,265 @@ EOF
     ufw allow 443/tcp
     ufw --force enable
     ok "Firewall on: only SSH, HTTP and HTTPS are open (the database and emulator stay private)"
+}
+
+# ---------------------------------------------------------------- server hardening
+
+sshd_installed() { command -v sshd > /dev/null; }
+
+session_sshd_pids() { # the sshd processes this run descends from
+    local pid=$$ comm
+    while [ "${pid:-0}" -gt 1 ]; do
+        comm=$(ps -o comm= -p "$pid" 2> /dev/null) || return 0
+        case $comm in sshd | sshd-session) printf '%s\n' "$pid" ;; esac
+        pid=$(ps -o ppid= -p "$pid" 2> /dev/null | tr -d ' ') || return 0
+    done
+}
+
+sshd_session_log() { # sshd_session_log <pid>: what sshd logged for that process
+    journalctl -q --no-pager -o cat "_PID=$1" 2> /dev/null || true
+    grep -h "sshd[a-z-]*\[$1\]:" /var/log/auth.log 2> /dev/null || true
+}
+
+ssh_login_used_key() { # the SSH login of this session was made with a key
+    local pid
+    if [[ ${SSH_AUTH_INFO_0:-} == publickey* ]]; then return 0; fi
+    for pid in $(session_sshd_pids); do
+        if [[ $(sshd_session_log "$pid") == *'Accepted publickey '* ]]; then return 0; fi
+    done
+    return 1
+}
+
+sudo_user() { # the account that ran sudo, unless it is root
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then printf '%s' "$SUDO_USER"; fi
+}
+
+sudo_user_has_keys() {
+    local user home
+    user=$(sudo_user)
+    [ -n "$user" ] || return 1
+    home=$(getent passwd "$user" | cut -d: -f6)
+    [ -n "$home" ] && grep -qE '^[^#[:space:]]' "$home/.ssh/authorized_keys" 2> /dev/null
+}
+
+harden_ssh() { # sets SSH_PASSWORDS to on, off or none
+    SSH_PASSWORDS=on
+    if ! sshd_installed; then
+        SSH_PASSWORDS=none
+        ok "No SSH server is installed; nothing to change"
+        return
+    fi
+    local previous='' root_keys=0
+    if [ -f "$SSHD_DROPIN" ]; then previous=$(< "$SSHD_DROPIN"); fi
+    # Password login only goes off when a key login is known to work, so the owner is never locked out.
+    if ssh_login_used_key || sudo_user_has_keys || [[ $previous == *'PasswordAuthentication no'* ]]; then
+        SSH_PASSWORDS=off
+        root_keys=1
+    elif [ -n "$(sudo_user)" ]; then
+        root_keys=1
+    fi
+    if [ "$root_keys" = 0 ]; then
+        say "      ${yellow}SSH password login stays on: this session did not log in with an SSH key. The setup guide explains how to turn it off.${reset}"
+        return
+    fi
+    mkdir -p "$(dirname "$SSHD_DROPIN")"
+    # sshd -t needs this folder, which only exists once the SSH service has started.
+    install -d -m 755 /run/sshd 2> /dev/null || true
+    {
+        echo "# Written by the PlusEMU installer. sshd uses the first value it reads, so this file sorts before the other drop-ins."
+        echo "PermitRootLogin prohibit-password"
+        if [ "$SSH_PASSWORDS" = off ]; then
+            echo "PasswordAuthentication no"
+            echo "KbdInteractiveAuthentication no"
+        fi
+    } > "$SSHD_DROPIN"
+    if ! sshd -t; then
+        if [ -n "$previous" ]; then printf '%s\n' "$previous" > "$SSHD_DROPIN"; else rm -f "$SSHD_DROPIN"; fi
+        SSH_PASSWORDS=on
+        say "      ${yellow}SSH was left as it is: sshd did not accept the new settings (see $LOG).${reset}"
+        return
+    fi
+    if ! systemctl try-reload-or-restart ssh.service; then
+        say "      ${yellow}The SSH service did not reload; the new SSH settings apply after a restart.${reset}"
+    fi
+    if [ "$SSH_PASSWORDS" = off ]; then
+        if [[ $(sshd -T 2> /dev/null) != *'passwordauthentication no'* ]]; then
+            SSH_PASSWORDS=on
+            say "      ${yellow}SSH password login stays on: another SSH setting turns it on. Check: sudo sshd -T | grep -i passwordauthentication${reset}"
+            return
+        fi
+        ok "SSH: key login only (password login is off, root may log in with a key only)"
+    else
+        ok "SSH: root may log in with a key only"
+        say "      ${yellow}SSH password login stays on: $(sudo_user) has no SSH key. The setup guide explains how to turn it off.${reset}"
+    fi
+}
+
+protect_ssh_logins() {
+    mkdir -p /etc/fail2ban/jail.d
+    cat > /etc/fail2ban/jail.d/plusemu.local <<'EOF'
+# Written by the PlusEMU installer. Bans an address for 1 hour after 5 failed SSH logins in 10 minutes.
+[sshd]
+enabled = true
+backend = systemd
+banaction = ufw
+maxretry = 5
+findtime = 10m
+bantime = 1h
+EOF
+    systemctl enable fail2ban
+    if systemctl restart fail2ban; then
+        ok "fail2ban bans an address for 1 hour after 5 failed SSH logins"
+    else
+        say "      ${yellow}fail2ban did not start. See: journalctl -u fail2ban -n 50${reset}"
+    fi
+}
+
+install_security_updates() {
+    cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+    # The emulator, client, website and the PHP packages are not from these sources:
+    # plusemu-update and php-update.sh update them.
+    cat > /etc/apt/apt.conf.d/52plusemu-security-updates <<'EOF'
+// Written by the PlusEMU installer: security updates only, with a restart only when an update needs one.
+#clear Unattended-Upgrade::Allowed-Origins;
+#clear Unattended-Upgrade::Origins-Pattern;
+Unattended-Upgrade::Origins-Pattern {
+    "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+    "origin=Ubuntu,archive=${distro_codename}-security";
+    "origin=UbuntuESMApps,archive=${distro_codename}-apps-security";
+    "origin=UbuntuESM,archive=${distro_codename}-infra-security";
+};
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-Time "now";
+EOF
+    # The package lists refresh at 04:30, after the nightly backup, and updates install at 05:00.
+    mkdir -p /etc/systemd/system/apt-daily.timer.d /etc/systemd/system/apt-daily-upgrade.timer.d
+    printf '[Timer]\nOnCalendar=\nOnCalendar=*-*-* 04:30\nRandomizedDelaySec=0\n' > /etc/systemd/system/apt-daily.timer.d/plusemu.conf
+    printf '[Timer]\nOnCalendar=\nOnCalendar=*-*-* 05:00\nRandomizedDelaySec=0\n' > /etc/systemd/system/apt-daily-upgrade.timer.d/plusemu.conf
+    systemctl daemon-reload
+    systemctl enable apt-daily.timer apt-daily-upgrade.timer
+    systemctl restart apt-daily.timer apt-daily-upgrade.timer
+    ok "Security updates install every day at 05:00 server time; the server restarts only when an update needs it"
+}
+
+tune_network() {
+    # Only raise the queues for new connections; a bigger server may already have more.
+    local backlog somaxconn
+    backlog=$(sysctl -n net.ipv4.tcp_max_syn_backlog 2> /dev/null || true)
+    somaxconn=$(sysctl -n net.core.somaxconn 2> /dev/null || true)
+    if ! [[ $backlog =~ ^[0-9]+$ ]] || [ "$backlog" -lt 4096 ]; then backlog=4096; fi
+    if ! [[ $somaxconn =~ ^[0-9]+$ ]] || [ "$somaxconn" -lt 4096 ]; then somaxconn=4096; fi
+    cat > /etc/sysctl.d/90-plusemu.conf <<EOF
+# Written by the PlusEMU installer: survive floods of new connections.
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_syn_backlog = $backlog
+net.core.somaxconn = $somaxconn
+net.ipv4.tcp_fin_timeout = 15
+EOF
+    if sysctl --system; then
+        ok "Network settings for floods of new connections (/etc/sysctl.d/90-plusemu.conf)"
+    else
+        say "      ${yellow}Some network settings could not be applied (this happens in some containers). See $LOG.${reset}"
+    fi
+}
+
+rotate_logs() {
+    cat > "$LOGROTATE_CONF" <<EOF
+# Written by the PlusEMU installer.
+/var/log/plusemu-*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 600 root root
+}
+
+$HOTEL_ROOT/cms/storage/logs/laravel.log {
+    su www-data www-data
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+    # The emulator logs to the journal. A rerun leaves the journal running when nothing changed.
+    local journal=$'[Journal]\nSystemMaxUse=1G\nMaxRetentionSec=14day'
+    if [ "$(cat "$JOURNALD_DROPIN" 2> /dev/null)" != "$journal" ]; then
+        mkdir -p "$(dirname "$JOURNALD_DROPIN")"
+        printf '%s\n' "$journal" > "$JOURNALD_DROPIN"
+        systemctl restart systemd-journald
+    fi
+    ok "Logs are kept for 14 days (the system journal uses at most 1 GB)"
+}
+
+# The plusemu-backup command. It saves what a download cannot bring back: the database,
+# the settings, the website's uploads and the hotel's texts.
+nightly_backup() {
+    local target partial free_mb database_mb path saved=() settings=()
+    exec 9> "$LOCK_FILE"
+    if ! flock -w "${BACKUP_LOCK_WAIT:-3600}" 9; then
+        echo "$(date) An update is still running; no backup was made."
+        return 1
+    fi
+    install -d -m 700 "$BACKUP_ROOT" "$NIGHTLY_ROOT"
+    database_mb=$(mariadb --protocol=socket -uroot -N -e "SELECT COALESCE(ROUND(SUM(data_length + index_length) / 1048576), 0) FROM information_schema.tables WHERE table_schema = 'plus'")
+    free_mb=$(df -Pm "$NIGHTLY_ROOT" | awk 'NR == 2 {print $4}')
+    if [ "$free_mb" -lt $((database_mb + 2048)) ]; then
+        echo "$(date) Only $free_mb MB free in $NIGHTLY_ROOT; no backup was made."
+        return 1
+    fi
+    target=$NIGHTLY_ROOT/$(date -u +%Y%m%d-%H%M%S-%N)
+    partial=$target.partial
+    install -d -m 700 "$partial"
+    mariadb-dump --protocol=socket -uroot --single-transaction --routines --triggers --events plus | gzip > "$partial/database.sql.gz"
+    for path in emulator/Config client/configuration cms/.env cms/storage/app hotel-files/gamedata; do
+        if [ -e "$HOTEL_ROOT/$path" ]; then saved+=("$path"); fi
+    done
+    # Exit code 1 only means a file changed while it was read.
+    tar -C "$HOTEL_ROOT" --warning=no-file-changed -czf "$partial/hotel.tar.gz" "${saved[@]}" || [ "$?" = 1 ]
+    for path in "$STATE_FILE" "$VERSIONS_FILE" "$SSL_DIR"; do
+        if [ -e "$path" ]; then settings+=("${path#/}"); fi
+    done
+    tar -C / -czf "$partial/settings.tar.gz" "${settings[@]}"
+    mv "$partial" "$target"
+    find "$NIGHTLY_ROOT" -mindepth 1 -maxdepth 1 -type d -name '*.partial' -exec rm -rf {} +
+    find "$NIGHTLY_ROOT" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' | sort | head -n -"$KEEP_NIGHTLY" | xargs -r -d '\n' rm -rf
+    echo "$(date) Backup saved in $target"
+}
+
+install_backup_command() {
+    mkdir -p "$(dirname "$BACKUP_COMMAND")" "$(dirname "$BACKUP_CRON")"
+    {
+        echo '#!/usr/bin/env bash'
+        echo '# Installed by the PlusEMU installer. Cron runs it every night at 04:00; run it by hand with: sudo plusemu-backup'
+        echo 'set -Eeuo pipefail'
+        declare -p HOTEL_ROOT STATE_FILE VERSIONS_FILE SSL_DIR BACKUP_ROOT NIGHTLY_ROOT KEEP_NIGHTLY LOCK_FILE
+        declare -f nightly_backup
+        echo 'nightly_backup'
+    } > "$BACKUP_COMMAND"
+    chmod 700 "$BACKUP_COMMAND"
+    echo "0 4 * * * root $BACKUP_COMMAND >> $BACKUP_LOG 2>&1" > "$BACKUP_CRON"
+    ok "Nightly backups at 04:00 in $NIGHTLY_ROOT (the newest $KEEP_NIGHTLY are kept)"
+}
+
+secure_server() {
+    step "Securing the server (SSH, failed logins, updates, logs and backups)"
+    protect_ssh_logins
+    harden_ssh
+    install_security_updates
+    tune_network
+    rotate_logs
+    install_backup_command
 }
 
 # shellcheck disable=SC2034 # the {{KEY}} values are read by render() through ${!key}
@@ -893,6 +1209,10 @@ finish() {
     say ""
     say "  Retrieve saved passwords: sudo cat $STATE_FILE"
     say "  Update the emulator and the client later with: sudo plusemu-update"
+    say "  Nightly backups of the database and your settings: $NIGHTLY_ROOT"
+    if [ "${SSH_PASSWORDS:-}" = on ]; then
+        say "  ${yellow}SSH password login is still on.${reset} To turn it off, add your SSH key, log in with it and run the installer again."
+    fi
     say "  Store passwords somewhere safe. Change the initial admin password after logging in;"
     say "  the saved file retains the initial password. Keep passwords out of shared logs and screenshots."
     say ""
@@ -1335,6 +1655,7 @@ main() {
     write_client_config
     install_cms
     configure_web
+    secure_server
     write_guide
     install_update_command
     finish
