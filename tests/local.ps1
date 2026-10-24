@@ -320,6 +320,46 @@ try {
     Assert ($summary.Contains('http://localhost')) "Summary: $summary"
     Assert ($summary -notmatch 'Cloudflare') "The local summary talks about Cloudflare: $summary"
 
+    # ---------------------------------------------------------------- Node.js
+
+    # The PC keeps its own Node.js: the installer's copy is only on the installer's PATH.
+    $script:NodeVersion = 'v20.11.0'
+    function node { return $script:NodeVersion }
+    $sample = Join-Path $testDir 'download.sample'
+    Set-Content $sample 'node download'
+    $hash = (Get-FileHash $sample -Algorithm SHA256).Hash.ToLower()
+    function Invoke-WebRequest($Uri) {
+        $script:Calls.Add("Invoke-WebRequest $Uri")
+        return [pscustomobject]@{ Content = "$hash  node-v22.11.0-x64.msi`n$hash  node-v22.11.0-win-x64.zip`n$hash  node-v22.11.0.tar.gz" }
+    }
+    function Download($Url, $File) { $script:Calls.Add("Download $Url"); Set-Content $File 'node download' }
+    function Expand-Archive($Path, $DestinationPath) {
+        $folder = Join-Path $DestinationPath 'node-v22.11.0-win-x64'
+        New-Item -ItemType Directory -Force -Path $folder | Out-Null
+        Set-Content (Join-Path $folder 'npm.cmd') '@echo npm'
+    }
+    function Install-Msi { $script:Calls.Add("Install-Msi $args") }
+    $pcPath = $env:Path
+    try {
+        Reset-Calls
+        Install-NodeJs *> $null
+        Expect-NoCall '^Install-Msi'
+        Assert ($Calls | Where-Object { $_ -like 'Download *node-v22.11.0-win-x64.zip' }) "Node.js download: $($Calls -join '; ')"
+        $nodeDir = Join-Path $StateDir 'node'
+        Assert (Test-Path (Join-Path $nodeDir 'npm.cmd')) "Node.js is not in $nodeDir"
+        Assert ($env:Path.StartsWith("$nodeDir;")) "The installer's PATH does not start with its Node.js: $env:Path"
+        # A rerun finds its own Node.js and downloads nothing.
+        Reset-Calls
+        Update-Path
+        Assert ($env:Path.StartsWith("$nodeDir;")) 'A new PATH lost the installer''s Node.js'
+        # A server gets Node.js from its installer package.
+        $script:state | Add-Member -NotePropertyName Local -NotePropertyValue $false -Force
+        Reset-Calls
+        Install-NodeJs *> $null
+        Assert ($Calls | Where-Object { $_ -like 'Install-Msi *node-v22.11.0-x64.msi*' }) "Server Node.js: $($Calls -join '; ')"
+        $script:state | Add-Member -NotePropertyName Local -NotePropertyValue $true -Force
+    } finally { $env:Path = $pcPath }
+
     # ---------------------------------------------------------------- the whole run
 
     $steps = 'Get-InstallerFiles', 'Get-Derived', 'Install-WebServer', 'Install-Toolchains', 'Install-Database', 'Get-Releases', 'Initialize-HotelDatabase', 'Get-HotelFiles',
