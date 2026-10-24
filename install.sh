@@ -158,7 +158,7 @@ render() { # render <template> <output> [certificate fragment]: replace {{KEY}} 
     # The fragments come first, so the placeholders inside them are filled too.
     for key in CLOUDFLARE_STATUS MANUAL_START MANUAL_END GUIDE_INTRO GAME_ADDRESS_ITEM DOMAIN SITE_URL SOCKET_URL FURNIDATA_URL SERVER_IP WS_HOST HOTEL_NAME ADMIN_USER ADMIN_EMAIL \
         CREDENTIALS_FILE RESTART_COMMAND LOG_COMMAND WS_DNS_ROW GUIDE_MODE_TITLE GUIDE_MODE_DETAILS CERTIFICATE_EXPIRES CLOUDFLARE_ERROR_HTML \
-        CREDENTIALS_COMMAND START_COMMAND STOP_COMMAND STOP_ALL_COMMAND HEALTH_RUN UPDATE_RUN BACKUP_RUN BACKUP_DIR SERVER_INSTALL; do
+        CREDENTIALS_COMMAND START_COMMAND STOP_COMMAND STOP_ALL_COMMAND HEALTH_RUN UPDATE_RUN BACKUP_RUN BACKUP_DIR SERVER_INSTALL LOCAL_FLAG; do
         content=${content//"{{$key}}"/${!key-}}
     done
     printf '%s\n' "$content" > "$2"
@@ -2105,7 +2105,7 @@ render_guide() { # the guide in its manual form, or in its connected form after 
         START_COMMAND="sudo systemctl start plusemu" STOP_COMMAND="sudo systemctl stop plusemu"
         STOP_ALL_COMMAND="sudo systemctl stop plusemu nginx php$PHP-fpm mariadb"
         HEALTH_RUN="sudo plusemu-health" UPDATE_RUN="sudo plusemu-update" BACKUP_RUN="sudo plusemu-backup" BACKUP_DIR=$NIGHTLY_ROOT
-        SERVER_INSTALL="curl -fsSL https://raw.githubusercontent.com/$INSTALLER_REPO/main/install.sh | sudo bash"
+        SERVER_INSTALL="curl -fsSL https://raw.githubusercontent.com/$INSTALLER_REPO/main/install.sh | sudo bash" LOCAL_FLAG=--local
         render "$TEMPLATES/guide-local.html" "$HOTEL_ROOT/setup-guide/index.html"
         return
     fi
