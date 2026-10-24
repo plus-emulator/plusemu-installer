@@ -40,13 +40,15 @@ curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/mai
 irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.ps1 | iex
 ```
 
-The installer asks five questions. Press Enter to accept a suggested answer:
+The installer asks these questions. Press Enter to accept a suggested answer:
 
 1. Your hotel's domain, for example `myhotel.com`
 2. The WebSocket address the game connects to. The default, `wss://myhotel.com/ws`, needs no extra Cloudflare setup.
 3. The hotel name
 4. The username for your admin account
 5. The email for your admin account
+6. A Discord webhook URL for health alerts (optional, press Enter to skip). See [Health check and Discord alerts](#health-check-and-discord-alerts).
+7. Only with the advanced guide on Linux: whether to install CrowdSec (default no). See [CrowdSec](#crowdsec-advanced-guide-linux).
 
 After you confirm, the installer runs on its own in about 10 minutes.
 
@@ -54,7 +56,7 @@ After you confirm, the installer runs on its own in about 10 minutes.
 
 The **simple** guide is the default. The **advanced** guide includes a manual checklist for administrator access, firewall rules and maintenance. Both contain the full Cloudflare certificate generation and server import steps.
 
-**This selects instructions only. Selecting this guide does not change SSH, RDP, firewall, updates or backups.** There is no advanced provisioning mode in this release. Both guides get the same server protection, described in [How it works](#how-it-works).
+**This selects instructions only. Selecting this guide does not change SSH, RDP, firewall, updates or backups.** Both guides get the same server protection, described in [How it works](#how-it-works). The one extra is a question in the advanced guide on Linux: whether to install [CrowdSec](#crowdsec-advanced-guide-linux). It is off unless you answer yes.
 
 For downloaded scripts, use `sudo bash install.sh --guide-mode advanced` on Linux or `.\install.ps1 -GuideMode advanced` in Administrator PowerShell. Use `simple` instead to choose the simple guide.
 
@@ -143,11 +145,12 @@ Every step is logged. If a step fails, the installer shows the last lines of the
    - The `ufw` firewall allows only SSH, HTTP and HTTPS. The database and the emulator stay private.
    - HTTPS is accepted only from Cloudflare's addresses, so nobody can go around Cloudflare to reach the hotel. HTTP stays open for the setup guide and the redirects, but nginx answers the hotel's own names only for Cloudflare and this server. `plusemu-cloudflare-ips` downloads Cloudflare's address lists every Sunday at 03:00 and updates the firewall and nginx. When a download fails, it changes nothing. If the download fails during a new install, HTTPS stays open to every address until the next successful run, and the installer says so.
 9. Secures the server:
-   - `fail2ban` bans an address for 1 hour after 5 failed SSH logins in 10 minutes.
+   - `fail2ban` bans an address for 1 hour after 5 failed SSH logins in 10 minutes. When CrowdSec runs, CrowdSec bans SSH attackers instead and fail2ban is off (see [CrowdSec](#crowdsec-advanced-guide-linux)).
    - Security updates from Debian or Ubuntu install every day at 05:00 server time with `unattended-upgrades`. The server restarts right after, but only when an update needs it. Unused packages are removed. The emulator, the client, the website and PHP are not touched: update them with `plusemu-update` and the PHP script below.
    - Network settings in `/etc/sysctl.d/90-plusemu.conf` turn on SYN cookies and raise the queues for new connections, so a flood of connections does not stop the server.
    - Installer, update, backup and Cloudflare address logs and the website log rotate daily and are kept for 14 days. The emulator logs to the system journal, which keeps 14 days and at most 1 GB.
    - A nightly backup runs at 04:00 (see [Nightly backups](#nightly-backups)).
+   - A health check runs every 5 minutes (see [Health check and Discord alerts](#health-check-and-discord-alerts)).
    - SSH lets root log in with a key only. SSH password login goes off only when your login uses an SSH key (this session, or the account that ran `sudo` has a key in `~/.ssh/authorized_keys`). Otherwise password login stays on, and the installer says so. The settings are in `/etc/ssh/sshd_config.d/10-plusemu.conf`.
 10. Writes your setup guide.
 11. Connects your hotel to Cloudflare when you paste an API token (see [Connect Cloudflare automatically](#connect-cloudflare-automatically)).
@@ -161,6 +164,8 @@ Every step is logged. If a step fails, the installer shows the last lines of the
 - An account lockout policy: an account locks for 10 minutes after 10 wrong passwords in 10 minutes, the default of new Windows versions. A lower limit would let an attacker keep the built-in Administrator locked out. RDP and SSH are not opened or changed.
 - The *PlusEMU log cleanup* task removes emulator, website and IIS logs older than 14 days, every day at 03:30. Windows has SYN flood protection built in and has no settings for it, so the installer changes nothing there.
 - The *PlusEMU nightly backup* task makes the nightly backup at 04:00 (see [Nightly backups](#nightly-backups)).
+- The *PlusEMU health check* task checks the hotel every 5 minutes (see [Health check and Discord alerts](#health-check-and-discord-alerts)).
+- No CrowdSec: the Windows installer does not install it (see [CrowdSec](#crowdsec-advanced-guide-linux)).
 - Windows Update installs updates every day at 05:00 and restarts the server only when an update needs it. Windows has no security-only updates, so all quality updates install. Driver updates are left out. The installer sets these Windows Update policies under `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU`: `NoAutoUpdate=0`, `AUOptions=4`, `ScheduledInstallDay=0`, `ScheduledInstallTime=5`, `AlwaysAutoRebootAtScheduledTime=1` and `AlwaysAutoRebootAtScheduledTimeMinutes=15`, plus `ExcludeWUDriversInQualityUpdate=1` one level up. A domain Group Policy can replace them.
 - IIS Dynamic IP Restrictions: each visitor gets at most 50 open requests and 1500 requests in 10 seconds, read from the address Cloudflare forwards. Over the limit, IIS answers 403. IIS cannot limit single pages, so the login limits come from Atom CMS itself (5 attempts per minute). Uploads are limited to 20 MB, and request headers must arrive within 10 seconds.
 - The `Strict-Transport-Security` header (for the hotel domain only, not its subdomains) and the `Permissions-Policy` header
@@ -181,6 +186,8 @@ The pages the installer generates, such as the setup guide and the client config
 | Nightly backups | `/var/backups/plusemu/nightly` | `C:\ProgramData\PlusEMU\backups\nightly` |
 | Backup log | `/var/log/plusemu-backup.log` | `C:\ProgramData\PlusEMU\backup.log` |
 | Make a backup now | `sudo plusemu-backup` | `Start-ScheduledTask 'PlusEMU nightly backup'` |
+| Health check log | `/var/log/plusemu-health.log` | `C:\ProgramData\PlusEMU\health.log` |
+| Check the hotel now | `sudo plusemu-health` | `& C:\ProgramData\PlusEMU\plusemu-health.ps1` |
 | Cloudflare address log | `/var/log/plusemu-cloudflare-ips.log` | `C:\ProgramData\PlusEMU\cloudflare-ips.log` |
 | Refresh Cloudflare's addresses now | `sudo plusemu-cloudflare-ips` | `Start-ScheduledTask 'PlusEMU Cloudflare addresses'` |
 | Restart the emulator | `sudo systemctl restart plusemu` | `Restart-Service PlusEMU` |
@@ -225,6 +232,60 @@ sudo systemctl start plusemu
 ```
 
 To get files back, unpack the file you need from `hotel.tar.gz`, for example `sudo tar -xzf /var/backups/plusemu/nightly/<time>/hotel.tar.gz -C /var/www/hotel emulator/Config`.
+
+## Health check and Discord alerts
+
+Every 5 minutes, the health check looks at your hotel (Linux: cron runs `/usr/local/sbin/plusemu-health`; Windows: the *PlusEMU health check* task runs `C:\ProgramData\PlusEMU\plusemu-health.ps1`). It checks that:
+
+- The emulator service runs, and the game port 2096 and the emulator API port 8080 answer on `127.0.0.1`.
+- The web server (nginx or IIS) runs, and the website answers on this server.
+- MariaDB answers.
+- The disk with the hotel has more than 2 GB free.
+- The newest nightly backup is younger than 36 hours. A new hotel has no backup before its first night, so this check waits for it.
+- The HTTPS certificate is valid for more than 30 more days (Linux: `/etc/ssl/plusemu/cert.pem`; Windows: the hotel's HTTPS binding).
+- The last Cloudflare address refresh worked and is younger than 8 days.
+
+Each run writes its result to the health log (see [Files and everyday commands](#files-and-everyday-commands)). Run it by hand at any time with `sudo plusemu-health` on Linux, or `& C:\ProgramData\PlusEMU\plusemu-health.ps1` in Administrator PowerShell on Windows. The installer also runs it once at the end. While an update, a nightly backup or the installer runs, the check skips its run, because they stop or restart services on purpose.
+
+With a Discord webhook, you get one message when a check starts failing and one when it works again. The message says what failed in plain words and gives the command to look at it. You get no message while nothing changes. When Discord does not take a message, the next run tries again. Messages contain no passwords or tokens. To make a webhook in Discord, open your server's **Server Settings → Integrations → Webhooks → New Webhook**, choose the channel and click **Copy Webhook URL**. When you add a webhook, the installer sends one message so you see that alerts work. If that message fails, the installer says why and goes on.
+
+The webhook is saved with your other settings (`DISCORD_WEBHOOK` in `/etc/plusemu/hotel.env` or `DiscordWebhook` in `C:\ProgramData\PlusEMU\hotel.json`), which only root or Administrators can read. It is never written to the installer log. Reruns keep it. To change it, run the installer again with the new URL; use `off` to turn alerts off:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo env PLUSEMU_DISCORD_WEBHOOK=https://discord.com/api/webhooks/... bash
+```
+
+```powershell
+$env:PLUSEMU_DISCORD_WEBHOOK = 'https://discord.com/api/webhooks/...'
+irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.ps1 | iex
+Remove-Item Env:\PLUSEMU_DISCORD_WEBHOOK
+```
+
+## CrowdSec (advanced guide, Linux)
+
+With the advanced guide, the Linux installer asks: *Install CrowdSec to detect and block attackers (shared blocklist)?* The answer is saved, and reruns keep it. For an unattended install, set `PLUSEMU_CROWDSEC=1`. The simple guide never installs CrowdSec.
+
+[CrowdSec](https://www.crowdsec.net/) reads your server's logs and finds attack patterns, such as password guessing on SSH or scans for known website weaknesses. It bans the addresses that attack you. It also shares the attacks it sees and uses a blocklist of known bad addresses that other CrowdSec users report. The installer:
+
+- Installs CrowdSec from CrowdSec's own package repository, with the `crowdsecurity/sshd`, `crowdsecurity/nginx`, `crowdsecurity/base-http-scenarios` and `crowdsecurity/http-cve` collections. It reads the nginx access and error logs and the SSH journal.
+- Installs two bouncers, the programs that apply a ban: `crowdsec-firewall-bouncer-iptables` blocks banned addresses at the firewall (for example SSH), and `crowdsec-nginx-bouncer` blocks banned visitors on the website. The website bouncer uses the visitor's real address, which nginx restores from Cloudflare. Ubuntu 22.04's nginx has no Lua module, so there CrowdSec bans at the firewall only, and the installer says so.
+- Never bans Cloudflare's addresses or this server. A ban on a Cloudflare address would cut off real players, so a whitelist (`/etc/crowdsec/parsers/s02-enrich/plusemu-whitelist.yaml`) lists `127.0.0.1` and Cloudflare's ranges. `plusemu-cloudflare-ips` updates it every week.
+- Moves CrowdSec's local API to `127.0.0.1:8085`, because the emulator uses port 8080.
+- Turns fail2ban off while CrowdSec and its firewall bouncer run, so one tool owns SSH bans and one command unbans an address. When CrowdSec does not install or start, fail2ban stays on.
+
+Everyday commands:
+
+```bash
+sudo cscli decisions list                   # see who is banned and why
+sudo cscli decisions delete --ip 192.0.2.7  # unban an address
+sudo cscli alerts list                      # see the attacks CrowdSec found
+```
+
+Optional: see your server in the free [CrowdSec console](https://app.crowdsec.net/). Sign up, copy the enrollment command from the engines page and run it on your server (`sudo cscli console enroll <key>`). Accept the server in the console, then run `sudo systemctl restart crowdsec`.
+
+To stop managing CrowdSec, run the installer again with `PLUSEMU_CROWDSEC=0`. fail2ban comes back on. CrowdSec stays installed until you remove it: `sudo apt purge crowdsec crowdsec-firewall-bouncer-iptables crowdsec-nginx-bouncer`.
+
+**Windows:** the Windows installer does not install CrowdSec. CrowdSec reads the visitor's address from the web server log, and IIS logs the address that connects to it, which is always Cloudflare's. CrowdSec on Windows would ban Cloudflare instead of attackers, or with Cloudflare on its whitelist, it could never ban a website visitor.
 
 ## One-command updates
 

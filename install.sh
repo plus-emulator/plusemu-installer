@@ -12,6 +12,8 @@
 # PLUSEMU_HOTEL_NAME, PLUSEMU_ADMIN_USER, PLUSEMU_ADMIN_EMAIL, PLUSEMU_YES=1.
 # PLUSEMU_GUIDE_MODE=simple|advanced selects the final instructions only.
 # PLUSEMU_CLOUDFLARE_TOKEN sets up Cloudflare with that API token; it is never saved.
+# PLUSEMU_DISCORD_WEBHOOK sends health alerts to that Discord webhook ("off" turns them off).
+# PLUSEMU_CROWDSEC=1 installs CrowdSec with the advanced guide (0 keeps it off).
 set -Eeuo pipefail
 shopt -u patsub_replacement 2> /dev/null || true # bash 5.2 would expand "&" in template values
 
@@ -55,6 +57,20 @@ ORIGIN_CA_ROOT_URL=https://developers.cloudflare.com/ssl/static/origin_ca_rsa_ro
 TTY=/dev/tty
 LOGROTATE_CONF=/etc/logrotate.d/plusemu
 JOURNALD_DROPIN=/etc/systemd/journald.conf.d/90-plusemu.conf
+FAIL2BAN_JAIL=/etc/fail2ban/jail.d/plusemu.local
+HEALTH_COMMAND=/usr/local/sbin/plusemu-health
+HEALTH_CRON=/etc/cron.d/plusemu-health
+HEALTH_LOG=/var/log/plusemu-health.log
+HEALTH_STATE=/var/lib/plusemu/health.state
+CROWDSEC_DIR=/etc/crowdsec
+CROWDSEC_REPO=https://packagecloud.io/crowdsec/crowdsec
+CROWDSEC_KEYRING=/etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg
+CROWDSEC_SOURCES=/etc/apt/sources.list.d/crowdsec_crowdsec.list
+CROWDSEC_PIN=/etc/apt/preferences.d/crowdsec
+CROWDSEC_WHITELIST=$CROWDSEC_DIR/parsers/s02-enrich/plusemu-whitelist.yaml
+CROWDSEC_NGINX_CONF=/etc/nginx/conf.d/crowdsec_nginx.conf
+# The emulator's API already uses 8080, CrowdSec's default port.
+CROWDSEC_LAPI=127.0.0.1:8085
 MODE=install
 PHP=8.5
 NODE_MAJOR=22
@@ -180,6 +196,8 @@ GUIDE_TOKEN='$GUIDE_TOKEN'
 GUIDE_MODE='${GUIDE_MODE:-simple}'
 CLOUDFLARE_SETUP='${CLOUDFLARE_SETUP:-}'
 CLOUDFLARE_CERT_EXPIRES='${CLOUDFLARE_CERT_EXPIRES:-}'
+DISCORD_WEBHOOK='${DISCORD_WEBHOOK:-}'
+CROWDSEC='${CROWDSEC:-}'
 EOF
     chmod 600 "$STATE_FILE"
     umask 022
@@ -343,8 +361,67 @@ select_guide_mode() {
     esac
 }
 
+valid_webhook() { [[ $1 =~ ^https://(discord|discordapp)\.com/api/webhooks/[A-Za-z0-9._~/?=\&-]+$ ]]; }
+
+choose_discord_webhook() { # sets DISCORD_WEBHOOK; reruns keep the saved one unless PLUSEMU_DISCORD_WEBHOOK changes it
+    local url=${PLUSEMU_DISCORD_WEBHOOK:-} question="Discord webhook URL for alerts when something is wrong with your hotel (optional, press Enter to skip)"
+    if [ "$url" = off ]; then
+        DISCORD_WEBHOOK=
+        return
+    fi
+    if [ -z "$url" ] && [ -n "${DISCORD_WEBHOOK+saved}" ]; then return; fi
+    DISCORD_WEBHOOK=
+    while true; do
+        if [ -z "$url" ] && [ "${PLUSEMU_YES:-0}" != 1 ]; then
+            printf '  %s: ' "$question" >&3
+            IFS= read -r url < "$TTY" 2> /dev/null || url=
+            url=${url//[[:space:]]/}
+        fi
+        if [ -z "$url" ] || valid_webhook "$url"; then break; fi
+        say "  ${yellow}That is not a Discord webhook URL. It starts with https://discord.com/api/webhooks/${reset}"
+        [ "${PLUSEMU_YES:-0}" != 1 ] || die "PLUSEMU_DISCORD_WEBHOOK is not a Discord webhook URL. Copy it again in Discord, or set it to off."
+        url=
+    done
+    DISCORD_WEBHOOK=$url
+}
+
+choose_crowdsec() { # sets CROWDSEC to yes or no; only the advanced guide offers it
+    local choice
+    if [ "$GUIDE_MODE" != advanced ]; then
+        if [ "${PLUSEMU_CROWDSEC:-}" = 1 ]; then say "  ${yellow}CrowdSec is offered with the advanced guide only (--guide-mode advanced).${reset}"; fi
+        return
+    fi
+    case ${PLUSEMU_CROWDSEC:-} in
+        1) CROWDSEC=yes ;;
+        0) CROWDSEC=no ;;
+        *)
+            if [ -z "${CROWDSEC:-}" ] && [ "${PLUSEMU_YES:-0}" = 1 ]; then
+                CROWDSEC=no
+            elif [ -z "${CROWDSEC:-}" ]; then
+                ask choice "Install CrowdSec to detect and block attackers (shared blocklist)? (y/n)" "n"
+                if [[ $choice =~ ^[Yy] ]]; then CROWDSEC=yes; else CROWDSEC=no; fi
+            fi
+            ;;
+    esac
+}
+
+# A trace (bash -x) would print the webhook, so the code that reads it runs without one.
+# Traced code reads HEALTH_ALERTS (on or off) instead.
+choose_options() { # the optional answers; DISCORD_WEBHOOK_NEW=1 when a webhook was added or changed
+    local trace=${-//[^x]/} previous
+    { set +x; } 2> /dev/null
+    previous=${DISCORD_WEBHOOK:-}
+    choose_discord_webhook
+    DISCORD_WEBHOOK_NEW=0 HEALTH_ALERTS=off
+    if [ -n "$DISCORD_WEBHOOK" ]; then HEALTH_ALERTS=on; fi
+    if [ -n "$DISCORD_WEBHOOK" ] && [ "$DISCORD_WEBHOOK" != "$previous" ]; then DISCORD_WEBHOOK_NEW=1; fi
+    if [ -n "$trace" ]; then set -x; fi
+    choose_crowdsec
+}
+
 ask_questions() {
     select_guide_mode
+    unset DISCORD_WEBHOOK CROWDSEC
     say ""
     say "${bold}Welcome to the PlusEMU hotel installer!${reset}"
     say "This sets up your emulator, client and website on this server in about 10 minutes."
@@ -352,13 +429,21 @@ ask_questions() {
 
     if [ -f "$STATE_FILE" ]; then
         GUIDE_MODE=simple
+        # An older state file has no answer for these, so the questions are asked once.
+        local trace=${-//[^x]/}
+        { set +x; } 2> /dev/null
         # shellcheck disable=SC1090
         . "$STATE_FILE"
+        if [ -n "$trace" ]; then set -x; fi
         select_guide_mode "$GUIDE_MODE"
         if [ -z "${GUIDE_TOKEN:-}" ]; then GUIDE_TOKEN=$(random_secret 12); fi
-        save_state
         say "Found the settings of an earlier run for ${bold}$DOMAIN${reset}; continuing that installation."
         say "  Setup guide: $GUIDE_MODE. Selecting this guide does not change SSH, RDP, firewall, updates or backups."
+        choose_options
+        save_state
+        if [ "$HEALTH_ALERTS" = on ]; then
+            say "  Health alerts are on: they go to your Discord webhook. To change it, run the installer again with PLUSEMU_DISCORD_WEBHOOK=<new URL>, or with PLUSEMU_DISCORD_WEBHOOK=off to turn alerts off."
+        fi
         return
     fi
 
@@ -402,6 +487,7 @@ ask_questions() {
         say "  ${yellow}That doesn't look like an email address.${reset}"
         ADMIN_EMAIL=
     done
+    choose_options
     ADMIN_PASSWORD=$(admin_password)
     DB_PASSWORD=$(random_secret 32)
     GUIDE_TOKEN=$(random_secret 12)
@@ -412,6 +498,8 @@ ask_questions() {
     say "  Hotel name: ${bold}$HOTEL_NAME${reset}"
     say "  Admin:      ${bold}$ADMIN_USER${reset} ($ADMIN_EMAIL)"
     say "  Setup guide: $GUIDE_MODE. Selecting this guide does not change SSH, RDP, firewall, updates or backups."
+    if [ "$HEALTH_ALERTS" = on ]; then say "  Health alerts: Discord"; else say "  Health alerts: log only (no Discord webhook)"; fi
+    if [ "$GUIDE_MODE" = advanced ]; then say "  CrowdSec:    $CROWDSEC"; fi
     if [ "${PLUSEMU_YES:-0}" != 1 ]; then
         local go
         ask go "Start the installation? (y/n)" "y"
@@ -788,6 +876,9 @@ refresh_cloudflare() {
         fi
         systemctl try-reload-or-restart nginx
     fi
+    if [ -d "$(dirname "$CROWDSEC_WHITELIST")" ] && crowdsec_whitelist; then
+        systemctl reload crowdsec || cloudflare_warn "$(date) CrowdSec did not reload; it reads the new Cloudflare ranges when it restarts."
+    fi
     echo "$(date) HTTPS is accepted only from Cloudflare's $(wc -l <<< "$ranges") address ranges."
 }
 
@@ -798,8 +889,8 @@ install_cloudflare_command() {
         echo '# Installed by the PlusEMU installer. Cron runs it every Sunday at 03:00; run it by hand with: sudo plusemu-cloudflare-ips'
         echo 'set -Eeuo pipefail'
         echo 'PATH=$PATH:/usr/local/sbin:/usr/sbin:/sbin'
-        declare -p REAL_IP_CONF CLOUDFLARE_TAG UFW_DEFAULTS
-        declare -f cloudflare_ranges real_ip_conf allow_https_from cloudflare_warn refresh_cloudflare
+        declare -p REAL_IP_CONF CLOUDFLARE_TAG UFW_DEFAULTS CROWDSEC_WHITELIST
+        declare -f cloudflare_ranges real_ip_conf allow_https_from cloudflare_warn crowdsec_whitelist refresh_cloudflare
         echo 'refresh_cloudflare'
     } > "$CLOUDFLARE_COMMAND"
     chmod 700 "$CLOUDFLARE_COMMAND"
@@ -1038,7 +1129,8 @@ configure_firewall() {
     ufw --force enable
     ok "Firewall on: only SSH, HTTP and HTTPS are open (the database and emulator stay private)"
     install_cloudflare_command
-    if "$CLOUDFLARE_COMMAND"; then
+    # The health check reads the result from the log.
+    if "$CLOUDFLARE_COMMAND" 2>&1 | tee -a "$CLOUDFLARE_LOG"; then
         ok "HTTPS is accepted only from Cloudflare's addresses, refreshed every Sunday at 03:00"
     elif ufw show added | grep -qF "comment '$CLOUDFLARE_TAG'"; then
         say "      ${yellow}Could not refresh Cloudflare's addresses; HTTPS keeps the previous ones. Try again later: sudo plusemu-cloudflare-ips${reset}"
@@ -1140,8 +1232,15 @@ harden_ssh() { # sets SSH_PASSWORDS to on, off or none
 }
 
 protect_ssh_logins() {
-    mkdir -p /etc/fail2ban/jail.d
-    cat > /etc/fail2ban/jail.d/plusemu.local <<'EOF'
+    mkdir -p "$(dirname "$FAIL2BAN_JAIL")"
+    if crowdsec_bans_ssh; then
+        # One tool bans SSH attackers, so one unban command is enough.
+        printf '# Written by the PlusEMU installer. CrowdSec bans SSH attackers, so this jail is off.\n[sshd]\nenabled = false\n' > "$FAIL2BAN_JAIL"
+        systemctl disable --now fail2ban || true
+        ok "CrowdSec bans SSH attackers, so fail2ban is off"
+        return
+    fi
+    cat > "$FAIL2BAN_JAIL" <<'EOF'
 # Written by the PlusEMU installer. Bans an address for 1 hour after 5 failed SSH logins in 10 minutes.
 [sshd]
 enabled = true
@@ -1296,14 +1395,290 @@ install_backup_command() {
     ok "Nightly backups at 04:00 in $NIGHTLY_ROOT (the newest $KEEP_NIGHTLY are kept)"
 }
 
+# ---------------------------------------------------------------- health check
+
+# Each check: its name (the function health_<name>), what it checks, and the command that shows more.
+HEALTH_CHECKS=(
+    "emulator|The emulator service|sudo journalctl -u plusemu -n 100"
+    "game_port|The game connection (port 2096)|sudo journalctl -u plusemu -n 100"
+    "api_port|The emulator API (port 8080)|sudo journalctl -u plusemu -n 100"
+    "web_server|The web server (nginx)|sudo systemctl status nginx"
+    "website|The website|sudo tail -n 50 /var/log/nginx/error.log"
+    "database|The database (MariaDB)|sudo systemctl status mariadb"
+    "disk|Free disk space|df -h $HOTEL_ROOT"
+    "backup|The nightly backup|sudo tail -n 20 $BACKUP_LOG"
+    "certificate|The HTTPS certificate|sudo openssl x509 -in $SSL_DIR/cert.pem -noout -enddate"
+    "cloudflare|The Cloudflare address refresh|sudo tail -n 20 $CLOUDFLARE_LOG"
+)
+
+port_answers() { # port_answers <port>: a program on this server accepts connections on that port
+    timeout 5 bash -c ": > /dev/tcp/127.0.0.1/$1" 2> /dev/null
+}
+
+health_emulator() { systemctl is-active --quiet plusemu || { echo "The plusemu service is not running."; return 1; }; }
+health_game_port() { port_answers 2096 || { echo "Nothing answers on port 2096."; return 1; }; }
+health_api_port() { port_answers 8080 || { echo "Nothing answers on port 8080."; return 1; }; }
+health_web_server() { systemctl is-active --quiet nginx || { echo "The nginx service is not running."; return 1; }; }
+
+health_website() {
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H "Host: $DOMAIN" http://127.0.0.1/) || true
+    case $code in
+        [234]??) return 0 ;;
+        '' | 000) echo "https://$DOMAIN does not answer on this server." ;;
+        *) echo "https://$DOMAIN answers with error $code on this server." ;;
+    esac
+    return 1
+}
+
+health_database() { [ "$(mariadb --protocol=socket -uroot -N -e 'SELECT 1' 2> /dev/null)" = 1 ] || { echo "MariaDB does not answer."; return 1; }; }
+
+health_disk() {
+    local free_mb
+    free_mb=$(df -Pm "$HOTEL_ROOT" | awk 'NR == 2 {print $4}')
+    [ "${free_mb:-0}" -gt 2048 ] || { echo "Only ${free_mb:-0} MB is free on the disk of $HOTEL_ROOT. Keep more than 2048 MB free."; return 1; }
+}
+
+health_backup() {
+    local backups
+    backups=$(find "$NIGHTLY_ROOT" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' ! -name '*.partial' 2> /dev/null || true)
+    if [ -n "$backups" ] && [ -n "$(find "$NIGHTLY_ROOT" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' ! -name '*.partial' -mmin -2160)" ]; then return 0; fi
+    # A new hotel has no backup before its first night.
+    if [ -z "$backups" ] && [ -n "$(find "$BACKUP_COMMAND" -mmin -2160 2> /dev/null)" ]; then return 0; fi
+    echo "The newest nightly backup in $NIGHTLY_ROOT is older than 36 hours."
+    return 1
+}
+
+health_certificate() {
+    openssl x509 -in "$SSL_DIR/cert.pem" -noout -checkend 2592000 > /dev/null 2>&1 ||
+        { echo "The certificate in $SSL_DIR/cert.pem expires within 30 days, or cannot be read."; return 1; }
+}
+
+health_cloudflare() {
+    local log line=''
+    # The daily log rotation can leave the newest line in the rotated file.
+    for log in "$CLOUDFLARE_LOG" "$CLOUDFLARE_LOG.1"; do
+        line=$(grep -v '^[[:space:]]*$' "$log" 2> /dev/null | tail -n 1) || true
+        if [ -n "$line" ]; then break; fi
+    done
+    if [ -z "$line" ]; then
+        echo "The refresh never ran."
+        return 1
+    fi
+    if [[ $line != *"HTTPS is accepted only from Cloudflare's"* ]]; then
+        echo "The last refresh did not work: $line"
+        return 1
+    fi
+    if [ -z "$(find "$log" -mmin -11520)" ]; then
+        echo "The last refresh that worked is older than 8 days."
+        return 1
+    fi
+}
+
+json_string() { # json_string <text>: the text as a JSON string
+    local text
+    text=$(printf '%s' "$1" | tr -d '\001-\010\013-\037')
+    text=${text//'\'/'\\'}
+    text=${text//'"'/'\"'}
+    text=${text//$'\n'/'\n'}
+    printf '"%s"' "${text//$'\t'/ }"
+}
+
+discord_send() { # discord_send <webhook> <text>: prints the reason when Discord did not take the message
+    local body out code
+    body=$(printf '{"username": "PlusEMU", "content": %s, "allowed_mentions": {"parse": []}}' "$(json_string "$2")")
+    # The webhook reaches curl on its input, never on its command line.
+    out=$(curl -sS -o /dev/null -w '\n%{http_code}' --max-time 15 -H 'Content-Type: application/json' --data-binary "$body" -K - <<< "url = \"$1\"" 2>&1) || true
+    code=${out##*$'\n'}
+    case $code in
+        2??) return 0 ;;
+        '' | 000) echo "Discord could not be reached (${out%%$'\n'*})." ;;
+        *) echo "Discord answered with HTTP status $code. Check that the webhook still exists." ;;
+    esac
+    return 1
+}
+
+# The plusemu-health command. Discord hears about every check that starts or stops failing, once.
+health_check() {
+    local entry name label look reason now changes='' short='' count=0 sent=1 failed=()
+    local -A was=()
+    DOMAIN='' HOTEL_NAME=PlusEMU DISCORD_WEBHOOK=''
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+    now=$(date '+%F %T')
+    # An update stops the emulator for a while, and an installer run restarts services.
+    if ! flock -n "$LOCK_FILE" true 2> /dev/null; then
+        echo "$now Skipped: an update, a backup or the installer is running."
+        return 0
+    fi
+    if [ -f "$HEALTH_STATE" ]; then
+        while read -r name; do if [ -n "$name" ]; then was[$name]=1; fi; done < "$HEALTH_STATE"
+    fi
+    for entry in "${HEALTH_CHECKS[@]}"; do
+        IFS='|' read -r name label look <<< "$entry"
+        count=$((count + 1))
+        if reason=$("health_$name" 2>&1); then
+            if [ -n "${was[$name]:-}" ]; then changes+="✅ $label works again."$'\n' short+="✅ $label works again."$'\n'; fi
+            continue
+        fi
+        failed+=("$name")
+        echo "$now PROBLEM: $label: $reason Look at it with: $look"
+        if [ -z "${was[$name]:-}" ]; then
+            changes+="❌ $label does not work. $reason Look at it with: \`$look\`"$'\n'
+            short+="❌ $label does not work."$'\n'
+        fi
+    done
+    if [ "${#failed[@]}" = 0 ]; then
+        echo "$now OK: all $count checks passed."
+    else
+        echo "$now ${#failed[@]} of $count checks failed."
+    fi
+    # Discord takes at most 2000 characters, so a long list names the checks only.
+    if [ "${#changes}" -gt 1800 ]; then changes="$short"$'\n'"Run sudo plusemu-health on the server to see why."; fi
+    if [ -n "$changes" ] && [ -n "$DISCORD_WEBHOOK" ]; then
+        if reason=$(discord_send "$DISCORD_WEBHOOK" "**$HOTEL_NAME** health check"$'\n'"$changes"); then
+            echo "$now Told Discord what changed."
+        else
+            sent=0
+            echo "$now Could not tell Discord what changed: $reason The next run tries again."
+        fi
+    fi
+    # After a failed message, the old state stays, so the next run sends the same changes.
+    if [ "$sent" = 1 ]; then
+        install -d -m 700 "$(dirname "$HEALTH_STATE")"
+        if [ "${#failed[@]}" = 0 ]; then : > "$HEALTH_STATE"; else printf '%s\n' "${failed[@]}" > "$HEALTH_STATE"; fi
+    fi
+    [ "${#failed[@]}" = 0 ]
+}
+
+install_health_check() {
+    local entry functions=(port_answers json_string discord_send health_check) reason
+    for entry in "${HEALTH_CHECKS[@]}"; do functions+=("health_${entry%%|*}"); done
+    mkdir -p "$(dirname "$HEALTH_COMMAND")" "$(dirname "$HEALTH_CRON")"
+    {
+        echo '#!/usr/bin/env bash'
+        echo '# Installed by the PlusEMU installer. Cron runs it every 5 minutes; run it by hand with: sudo plusemu-health'
+        echo 'set -Eeuo pipefail'
+        echo 'shopt -u patsub_replacement 2> /dev/null || true'
+        echo 'PATH=$PATH:/usr/local/sbin:/usr/sbin:/sbin'
+        declare -p STATE_FILE HOTEL_ROOT NIGHTLY_ROOT BACKUP_COMMAND SSL_DIR CLOUDFLARE_LOG LOCK_FILE HEALTH_STATE HEALTH_LOG HEALTH_CHECKS
+        declare -f "${functions[@]}"
+        echo 'health_check 2>&1 | tee -a "$HEALTH_LOG"'
+    } > "$HEALTH_COMMAND"
+    chmod 700 "$HEALTH_COMMAND"
+    echo "*/5 * * * * root $HEALTH_COMMAND > /dev/null 2>&1" > "$HEALTH_CRON"
+    ok "Health check every 5 minutes (log: $HEALTH_LOG, run it now: sudo plusemu-health)"
+    if [ "${HEALTH_ALERTS:-off}" = off ]; then
+        say "      Discord alerts are off. To turn them on, run the installer again with PLUSEMU_DISCORD_WEBHOOK=<webhook URL>."
+        return
+    fi
+    if [ "${DISCORD_WEBHOOK_NEW:-0}" = 1 ]; then
+        local trace=${-//[^x]/}
+        { set +x; } 2> /dev/null
+        if reason=$(discord_send "$DISCORD_WEBHOOK" "✅ Health alerts for **$HOTEL_NAME** are on. You get a message here when something is wrong with your hotel, and when it works again."); then
+            DISCORD_WEBHOOK_NEW=0
+        else
+            say "      ${yellow}Could not send the first message to Discord: $reason The health check still runs. Check the webhook, then run the installer again.${reset}"
+        fi
+        if [ -n "$trace" ]; then set -x; fi
+    fi
+    ok "Discord alerts are on. To change the webhook, run the installer again with PLUSEMU_DISCORD_WEBHOOK=<new URL> (or off)"
+}
+
+# ---------------------------------------------------------------- CrowdSec
+
+crowdsec_bans_ssh() {
+    [ "${CROWDSEC:-}" = yes ] && systemctl is-active --quiet crowdsec && systemctl is-active --quiet crowdsec-firewall-bouncer
+}
+
+# CrowdSec never bans Cloudflare's edges or this server: a firewall ban on an edge would cut off real players.
+# The ranges are the ones nginx trusts (cloudflare-real-ip.conf). Fails when the file stays the same.
+crowdsec_whitelist() {
+    local range ips=() cidrs=() conf
+    for range in $(awk '$1 == "set_real_ip_from" {sub(";", "", $2); print $2}' "$REAL_IP_CONF"); do
+        if [[ $range == */* ]]; then cidrs+=("$range"); else ips+=("$range"); fi
+    done
+    conf=$(
+        echo "# Written by the PlusEMU installer and plusemu-cloudflare-ips."
+        echo "name: plusemu/cloudflare-whitelist"
+        echo "description: \"Never ban Cloudflare's edges or this server\""
+        echo "whitelist:"
+        echo "  reason: \"Cloudflare edge or this server\""
+        echo "  ip:"
+        for range in 127.0.0.1 ::1 "${ips[@]}"; do echo "    - \"$range\""; done
+        if [ "${#cidrs[@]}" -gt 0 ]; then
+            echo "  cidr:"
+            for range in "${cidrs[@]}"; do echo "    - \"$range\""; done
+        fi
+    )
+    [ "$(cat "$CROWDSEC_WHITELIST" 2> /dev/null)" != "$conf" ] || return 1
+    mkdir -p "$(dirname "$CROWDSEC_WHITELIST")"
+    printf '%s\n' "$conf" > "$CROWDSEC_WHITELIST"
+}
+
+install_crowdsec() { # fails when CrowdSec or its firewall bouncer could not be set up
+    local file
+    install -d -m 755 "$(dirname "$CROWDSEC_KEYRING")" "$CROWDSEC_DIR/acquis.d" || return 1
+    curl -fsSL "$CROWDSEC_REPO/gpgkey" | gpg --dearmor > "$CROWDSEC_KEYRING.new" && mv "$CROWDSEC_KEYRING.new" "$CROWDSEC_KEYRING" || return 1
+    echo "deb [signed-by=$CROWDSEC_KEYRING] $CROWDSEC_REPO/any any main" > "$CROWDSEC_SOURCES"
+    # Ubuntu ships an old CrowdSec; this keeps the one from CrowdSec's own repository.
+    printf 'Package: *\nPin: release o=packagecloud.io/crowdsec/crowdsec,a=any,n=any,c=main\nPin-Priority: 1001\n' > "$CROWDSEC_PIN"
+    # The package starts CrowdSec, so its port is set first. The bouncers read the port from it.
+    printf 'api:\n  server:\n    listen_uri: %s\n' "$CROWDSEC_LAPI" > "$CROWDSEC_DIR/config.yaml.local"
+    apt-get update || return 1
+    apt-get install -y crowdsec crowdsec-firewall-bouncer-iptables || return 1
+    for file in "$CROWDSEC_DIR/local_api_credentials.yaml" "$CROWDSEC_DIR"/bouncers/*.yaml "$CROWDSEC_DIR"/bouncers/*.conf; do
+        if [ -f "$file" ]; then sed -i "s#127.0.0.1:8080#$CROWDSEC_LAPI#g; s#localhost:8080#$CROWDSEC_LAPI#g" "$file"; fi
+    done
+    cscli hub update && cscli hub upgrade || return 1
+    cscli collections install crowdsecurity/sshd crowdsecurity/nginx crowdsecurity/base-http-scenarios crowdsecurity/http-cve || return 1
+    # The same file names as CrowdSec's own setup, so a package upgrade replaces them instead of reading the logs twice.
+    printf '# Written by the PlusEMU installer.\nfilenames:\n  - /var/log/nginx/access.log\n  - /var/log/nginx/error.log\nlabels:\n  type: nginx\n' > "$CROWDSEC_DIR/acquis.d/nginx.yaml"
+    printf '# Written by the PlusEMU installer.\nsource: journalctl\njournalctl_filter:\n  - "_SYSTEMD_UNIT=ssh.service"\nlabels:\n  type: syslog\n' > "$CROWDSEC_DIR/acquis.d/sshd.yaml"
+    crowdsec_whitelist || true
+    systemctl enable crowdsec crowdsec-firewall-bouncer && systemctl restart crowdsec && systemctl restart crowdsec-firewall-bouncer || return 1
+}
+
+install_nginx_bouncer() {
+    if ! apt-cache show libnginx-mod-http-lua > /dev/null 2>&1; then
+        say "      ${yellow}This nginx has no Lua module, so CrowdSec cannot block visitors on the website. It still blocks attackers at the firewall.${reset}"
+        return
+    fi
+    if apt-get install -y crowdsec-nginx-bouncer && nginx -t; then
+        systemctl reload nginx
+        ok "CrowdSec blocks banned visitors on the website by their real address (nginx bouncer)"
+        return
+    fi
+    # The website matters more than the bouncer.
+    apt-get purge -y crowdsec-nginx-bouncer || true
+    rm -f "$CROWDSEC_NGINX_CONF"
+    nginx -t && systemctl reload nginx
+    say "      ${yellow}nginx did not accept the CrowdSec nginx bouncer, so it was removed. CrowdSec still blocks attackers at the firewall. See $LOG.${reset}"
+}
+
+setup_crowdsec() {
+    if [ "${CROWDSEC:-}" = no ] && command -v cscli > /dev/null; then
+        say "      CrowdSec stays installed but is no longer managed. Remove it with: sudo apt purge crowdsec crowdsec-firewall-bouncer-iptables crowdsec-nginx-bouncer"
+    fi
+    if [ "$GUIDE_MODE" != advanced ] || [ "${CROWDSEC:-}" != yes ]; then return; fi
+    if ! install_crowdsec; then
+        say "      ${yellow}CrowdSec could not be installed (see $LOG). fail2ban keeps protecting SSH. Run the installer again to try again.${reset}"
+        return
+    fi
+    ok "CrowdSec reads the SSH and nginx logs, bans attackers and uses the shared blocklist (see the bans: sudo cscli decisions list)"
+    install_nginx_bouncer
+}
+
 secure_server() {
-    step "Securing the server (SSH, failed logins, updates, logs and backups)"
+    step "Securing the server (SSH, failed logins, updates, logs, backups and health checks)"
+    setup_crowdsec
     protect_ssh_logins
     harden_ssh
     install_security_updates
     tune_network
     rotate_logs
     install_backup_command
+    install_health_check
 }
 
 # ---------------------------------------------------------------- Cloudflare API setup
@@ -1609,10 +1984,28 @@ render_guide() { # the guide in its manual form, or in its connected form after 
     render "$TEMPLATES/setup-guide.html" "$HOTEL_ROOT/setup-guide/index.html" "$TEMPLATES/certificate-linux.html"
 }
 
+run_health_check() {
+    local result
+    [ -x "$HEALTH_COMMAND" ] || return 0
+    # The health check skips its run while the installer holds the lock.
+    flock -u 9 2> /dev/null || true
+    if result=$("$HEALTH_COMMAND"); then
+        say "  Health check: all checks passed."
+    else
+        say "  ${yellow}Health check: something does not work yet:${reset}"
+        { grep ' PROBLEM: ' <<< "$result" || true; } | sed 's/^[0-9-]* [0-9:]* PROBLEM: /    /' | while IFS= read -r line; do say "$line"; done
+    fi
+}
+
 finish() {
-    systemctl is-active --quiet plusemu || systemctl restart plusemu
+    if ! systemctl is-active --quiet plusemu; then
+        systemctl restart plusemu
+        wait_for_emulator || true
+    fi
     say ""
     say "${green}${bold}🎉 Your hotel is installed!${reset}"
+    say ""
+    run_health_check
     say ""
     if [ "${CLOUDFLARE_SETUP:-}" = "done" ]; then
         say "  Cloudflare is connected. Open https://$DOMAIN, log in and enter the hotel to check it."
@@ -1638,6 +2031,7 @@ finish() {
     say "  Retrieve saved passwords: sudo cat $STATE_FILE"
     say "  Update the emulator and the client later with: sudo plusemu-update"
     say "  Nightly backups of the database and your settings: $NIGHTLY_ROOT"
+    say "  Check the hotel now: sudo plusemu-health (it runs every 5 minutes; log: $HEALTH_LOG)"
     if [ "${SSH_PASSWORDS:-}" = on ]; then
         say "  ${yellow}SSH password login is still on.${reset} To turn it off, add your SSH key, log in with it and run the installer again."
     fi
@@ -2067,6 +2461,9 @@ main() {
     select_guide_mode
     trap 'on_error $LINENO' ERR
     preflight
+    # Updates, backups and the health check wait for the installer.
+    exec 9> "$LOCK_FILE"
+    flock -n 9 || die "An update or a backup is running. Try again in a few minutes."
     : > "$LOG"
     chmod 600 "$LOG"
     exec >> "$LOG" 2>&1
