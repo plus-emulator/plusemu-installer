@@ -113,11 +113,12 @@ Every step is logged. If a step fails, the installer shows the last lines of the
    - It limits each visitor: 5 login, registration or password reset attempts per minute (plus a burst of 5), 30 housekeeping pages per minute (plus a burst of 20), 50 open requests and 20 game connections (many players can share one address, for example at a school). Over the limit, nginx answers 429. The game client and the hotel files have no limits.
    - It drops slow connections after 10 seconds and sends the `Strict-Transport-Security` and `Permissions-Policy` headers. `Strict-Transport-Security` covers the hotel domain only, not its subdomains.
    - The `ufw` firewall allows only SSH, HTTP and HTTPS. The database and the emulator stay private.
+   - HTTPS is accepted only from Cloudflare's addresses, so nobody can go around Cloudflare to reach the hotel. HTTP stays open for the setup guide and the redirects, but nginx answers the hotel's own names only for Cloudflare and this server. `plusemu-cloudflare-ips` downloads Cloudflare's address lists every Sunday at 03:00 and updates the firewall and nginx. When a download fails, it changes nothing. If the download fails during a new install, HTTPS stays open to every address until the next successful run, and the installer says so.
 9. Secures the server:
    - `fail2ban` bans an address for 1 hour after 5 failed SSH logins in 10 minutes.
    - Security updates from Debian or Ubuntu install every day at 05:00 server time with `unattended-upgrades`. The server restarts right after, but only when an update needs it. Unused packages are removed. The emulator, the client, the website and PHP are not touched: update them with `plusemu-update` and the PHP script below.
    - Network settings in `/etc/sysctl.d/90-plusemu.conf` turn on SYN cookies and raise the queues for new connections, so a flood of connections does not stop the server.
-   - Installer, update and backup logs and the website log rotate daily and are kept for 14 days. The emulator logs to the system journal, which keeps 14 days and at most 1 GB.
+   - Installer, update, backup and Cloudflare address logs and the website log rotate daily and are kept for 14 days. The emulator logs to the system journal, which keeps 14 days and at most 1 GB.
    - A nightly backup runs at 04:00 (see [Nightly backups](#nightly-backups)).
    - SSH lets root log in with a key only. SSH password login goes off only when your login uses an SSH key (this session, or the account that ran `sudo` has a key in `~/.ssh/authorized_keys`). Otherwise password login stays on, and the installer says so. The settings are in `/etc/ssh/sshd_config.d/10-plusemu.conf`.
 10. Writes your setup guide.
