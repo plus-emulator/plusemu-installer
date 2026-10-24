@@ -251,6 +251,11 @@ try {
     $renderer = Get-Content (Join-Path $clientConfig 'renderer-config.json') -Raw | ConvertFrom-Json
     Assert ($renderer.'socket.url' -eq 'ws://localhost/ws' -and $renderer.'furnidata.url' -eq 'http://localhost/api/gamedata/furnidata') "Renderer: $($renderer.'socket.url') $($renderer.'furnidata.url')"
 
+    # The emulator's per-IP limits are off: every local player comes from 127.0.0.1.
+    $emulator = '{"Database":{},"Flash":{},"Nitro":{"MaxConnectionsPerIp":20},"Rcon":{}}' | ConvertFrom-Json
+    Disable-EmulatorLimits $emulator
+    Assert ($emulator.Nitro.MaxConnectionsPerIp -eq 0 -and $emulator.LoginThrottle.MaxFailuresPerIp -eq 0) 'The emulator limits stay on in local mode'
+
     $cms = Join-Path $HotelRoot 'cms'
     New-Item -ItemType Directory -Force -Path $cms | Out-Null
     Set-Content (Join-Path $cms '.env') 'APP_URL=http://example.test'

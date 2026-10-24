@@ -203,6 +203,18 @@ only_localhost "$config/renderer-config.json" "$config/ui-config.json" "$config/
 [ "$(jq -r '."furnidata.url"' "$config/renderer-config.json")" = http://localhost/api/gamedata/furnidata ]
 [ "$(jq -r .apiBaseUrl "$config/client-mode.json")" = http://localhost ]
 
+# The emulator's per-IP limits are off: every local player comes from 127.0.0.1.
+emulator_config=$TEST_DIR/config.json
+echo '{"Database":{},"Flash":{},"Nitro":{"MaxConnectionsPerIp":20},"Rcon":{}}' > "$emulator_config"
+DB_PASSWORD=secret write_emulator_config "$emulator_config"
+[ "$(jq -r '.Nitro.MaxConnectionsPerIp' "$emulator_config")" = 0 ]
+[ "$(jq -r '.LoginThrottle.MaxFailuresPerIp' "$emulator_config")" = 0 ]
+[ "$(jq -r '.Database.Password' "$emulator_config")" = secret ]
+echo '{"Database":{},"Flash":{},"Nitro":{"MaxConnectionsPerIp":20},"Rcon":{}}' > "$emulator_config"
+(LOCAL=no DB_PASSWORD=secret write_emulator_config "$emulator_config")
+[ "$(jq -r '.Nitro.MaxConnectionsPerIp' "$emulator_config")" = 20 ]
+[ "$(jq -r '.LoginThrottle' "$emulator_config")" = null ]
+
 printf 'APP_URL=http://example.test\n' > "$HOTEL_ROOT/cms/.env.example"
 # Atom's setup already ran, and the settings the installer writes into the database are kept.
 sql() { if [[ " $* " == *' -e '* ]]; then echo 1; else cat >> "$FAKE_DIR/sql"; fi; }

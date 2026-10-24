@@ -96,7 +96,7 @@ What a local install does not do, so your PC stays as it is:
 - No firewall changes. Linux does not install or turn on `ufw`. Windows adds no firewall rules.
 - On Linux: no SSH changes, no fail2ban, no automatic security updates or restarts, no network (`sysctl`) settings, no system journal limits and no CrowdSec.
 - On Windows: no account lockout policy, no Windows Update policy and no change to the header timeout of Windows' web stack.
-- No per-visitor request limits. Every local visitor is `127.0.0.1`, so the limits would only block your own logins and test clients.
+- No per-visitor request limits, in the web server or in the emulator (`Nitro.MaxConnectionsPerIp` and `LoginThrottle.MaxFailuresPerIp` are set to 0). Every local visitor is `127.0.0.1`, so the limits would only block your own logins and test clients.
 - Your own Node.js stays as it is. The installer unpacks Node.js 22 into `/opt/plusemu-node` (Linux) or `C:\ProgramData\PlusEMU\node` (Windows) and uses it only while it runs.
 
 What it does install: nginx, MariaDB and PHP 8.5 on Linux (PHP 8.5 becomes the default `php` command), and IIS, MariaDB, PHP in `C:\PHP`, Git and Composer on Windows. It turns off nginx's own welcome page on Linux and IIS's own *Default Web Site* on Windows, because they answer on every address. A default site that you changed stays. Other nginx sites that listen on port 80 for every address no longer answer on `localhost`, because the hotel takes `127.0.0.1` and `::1`; the installer names them.
