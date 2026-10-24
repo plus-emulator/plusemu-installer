@@ -2300,6 +2300,28 @@ function Invoke-Update([switch]$Check, [switch]$Yes, [switch]$Rollback, [switch]
     }
 }
 
+function Install-Hotel {
+    Get-InstallerFiles
+    Read-Answers
+    Say "  Admin and database passwords are saved in $StateFile. Retrieve them in Administrator PowerShell: Get-Content $StateFile"
+    Get-Derived
+    Install-WebServer
+    Install-Toolchains
+    Install-Database
+    Get-Releases
+    Initialize-HotelDatabase
+    Get-HotelFiles
+    Start-Emulator
+    Write-ClientConfig
+    Install-Cms
+    Set-IisSite
+    Protect-Server
+    Write-Guide
+    Write-UpdateCommand
+    Connect-Cloudflare
+    Complete-Install
+}
+
 try {
     if ($Update) {
         Invoke-Update -Check:$Check -Yes:$Yes -Rollback:$Rollback -Assets:$Assets
@@ -2308,25 +2330,7 @@ try {
         # Updates, backups and the health check wait for the installer.
         try { $script:InstallLock = [IO.File]::Open($LockFile, 'OpenOrCreate', 'ReadWrite', 'None') }
         catch { throw 'An update or a backup is running. Try again in a few minutes.' }
-        Get-InstallerFiles
-        Read-Answers
-        Say "  Admin and database passwords are saved in $StateFile. Retrieve them in Administrator PowerShell: Get-Content $StateFile"
-        Get-Derived
-        Install-WebServer
-        Install-Toolchains
-        Install-Database
-        Get-Releases
-        Initialize-HotelDatabase
-        Get-HotelFiles
-        Start-Emulator
-        Write-ClientConfig
-        Install-Cms
-        Set-IisSite
-        Protect-Server
-        Write-Guide
-        Write-UpdateCommand
-        Connect-Cloudflare
-        Complete-Install
+        Install-Hotel
     }
 } catch {
     Write-Log "ERROR: $_`n$($_.ScriptStackTrace)"
