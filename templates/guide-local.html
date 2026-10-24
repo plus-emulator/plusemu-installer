@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{HOTEL_NAME}} - local hotel guide</title>
+<style>
+    :root { --ink: #1d2433; --muted: #5b6475; --line: #e3e7ef; --bg: #f5f7fb; --card: #fff; --accent: #f38020; --ok: #1a8f4c; --warn: #b35c00; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--ink); background: var(--bg); }
+    main { max-width: 820px; margin: 0 auto; padding: 32px 20px 80px; }
+    header { text-align: center; margin-bottom: 28px; }
+    header h1 { font-size: 30px; margin: 0 0 6px; }
+    header p { color: var(--muted); margin: 0; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 22px 26px; margin: 18px 0; }
+    .card h2 { margin: 0 0 8px; font-size: 20px; }
+    ol, ul { padding-left: 22px; }
+    li { margin: 6px 0; }
+    code { font-family: ui-monospace, Consolas, monospace; background: #eef1f7; border-radius: 6px; padding: 2px 7px; font-size: 14px; }
+    pre { overflow-x: auto; background: #eef1f7; border-radius: 8px; padding: 14px; line-height: 1.5; font-size: 13px; }
+    pre code { background: none; padding: 0; font-size: inherit; }
+    p, li, td { overflow-wrap: anywhere; }
+    table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 15px; }
+    td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+    .warn { background: #fff5e8; border-left: 4px solid var(--warn); padding: 10px 14px; border-radius: 8px; margin: 12px 0; }
+    .done { text-align: center; }
+    .done a.button { display: inline-block; background: var(--accent); color: #fff; text-decoration: none; font-weight: 700; padding: 12px 26px; border-radius: 10px; margin-top: 6px; }
+    @media (max-width: 520px) {
+        main { padding: 20px 12px 60px; }
+        .card { padding: 18px 16px; }
+        td { padding: 6px; }
+    }
+</style>
+</head>
+<body>
+<main>
+<header>
+    <h1>🎉 {{HOTEL_NAME}} runs on this PC</h1>
+    <p>Your emulator, game client and website are installed on this PC.<br>
+       Only this PC can open them, at <b>{{SITE_URL}}</b>.</p>
+</header>
+
+<div class="card done">
+    <a class="button" href="{{SITE_URL}}" target="_blank" rel="noopener">Open {{SITE_URL}}</a>
+</div>
+
+<div class="card">
+    <h2>Open your hotel</h2>
+    <ol>
+        <li>Open <a href="{{SITE_URL}}" target="_blank" rel="noopener">{{SITE_URL}}</a> in your browser.</li>
+        <li>Log in with the username <code>{{ADMIN_USER}}</code> and the password the installer showed you. The password is also saved in <code>{{CREDENTIALS_FILE}}</code>. Show it with <code>{{CREDENTIALS_COMMAND}}</code>.</li>
+        <li>Change your password under <b>Settings → Password</b>.</li>
+        <li>Click <b>Enter hotel</b>. The game client opens and connects.</li>
+    </ol>
+    <p>Manage your hotel (news, users, ranks, shop) in housekeeping at <a href="{{SITE_URL}}/housekeeping" target="_blank" rel="noopener">{{SITE_URL}}/housekeeping</a>.</p>
+</div>
+
+<div class="card">
+    <h2>Start, stop and logs</h2>
+    <p>The emulator, the website and the database start when your PC starts.</p>
+    <table>
+        <tr><td>Start the emulator</td><td><code>{{START_COMMAND}}</code></td></tr>
+        <tr><td>Stop the emulator</td><td><code>{{STOP_COMMAND}}</code></td></tr>
+        <tr><td>Restart the emulator</td><td><code>{{RESTART_COMMAND}}</code></td></tr>
+        <tr><td>Watch the emulator log</td><td><code>{{LOG_COMMAND}}</code></td></tr>
+        <tr><td>Stop the emulator, the website and the database</td><td><code>{{STOP_ALL_COMMAND}}</code></td></tr>
+        <tr><td>Check that every part works</td><td><code>{{HEALTH_RUN}}</code></td></tr>
+    </table>
+</div>
+
+<div class="card">
+    <h2>Update</h2>
+    <p>Get the newest emulator, client and hotel files with <code>{{UPDATE_RUN}}</code>. It makes a backup first and keeps your settings.</p>
+</div>
+
+<div class="card">
+    <h2>Backups</h2>
+    <p>Every night at 04:00, when this PC is on, the installer backs up the database and your settings to <code>{{BACKUP_DIR}}</code>. It keeps the newest 7 backups. Make a backup now with <code>{{BACKUP_RUN}}</code>.</p>
+    <p>The backups are on this PC. Copy them to another place if your hotel matters to you.</p>
+</div>
+
+<div class="card">
+    <h2>Connect to your database</h2>
+    <p>Connect to MariaDB at <code>127.0.0.1:3306</code>, database <code>plus</code>, username <code>hotel</code>. The password is in <code>{{CREDENTIALS_FILE}}</code>: <code>DB_PASSWORD</code> on Linux, <code>DbPassword</code> on Windows.</p>
+</div>
+
+<div class="card">
+    <h2>What this local hotel does not do</h2>
+    <div class="warn">This hotel is for this PC only. Other computers and phones cannot open it. It has no HTTPS, no Cloudflare and no protection for a public hotel. Do not use it as your public hotel.</div>
+    <p>The installer did not change your firewall, SSH, system updates or network settings.</p>
+</div>
+
+<div class="card">
+    <h2>Move to a real server later</h2>
+    <ol>
+        <li>On your server, run the installer without <code>--local</code>:
+            <pre><code>{{SERVER_INSTALL}}</code></pre>
+            It asks for your domain and sets up HTTPS, Cloudflare and the server protection. This makes a new, empty hotel.</li>
+        <li>To keep your users, rooms and furniture, copy <code>database.sql.gz</code> from a backup in <code>{{BACKUP_DIR}}</code> to the server. On a Linux server, run in the folder with the file:
+            <pre><code>sudo systemctl stop plusemu
+gunzip -c database.sql.gz | sudo mariadb plus
+sudo systemctl start plusemu</code></pre></li>
+        <li>Run the installer on the server once more. It writes the server's own addresses into the website settings. Your accounts keep the passwords they had on this PC.</li>
+    </ol>
+</div>
+</main>
+</body>
+</html>
