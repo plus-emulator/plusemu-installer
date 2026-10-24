@@ -415,7 +415,7 @@ install_packages() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y ca-certificates curl git unzip jq gnupg openssl cron ufw nginx mariadb-server mariadb-client libicu-dev xz-utils \
-        fail2ban python3-systemd
+        fail2ban python3-systemd unattended-upgrades
     if ! apt-cache show "php$PHP-fpm" > /dev/null 2>&1; then
         # PHP 8.5 isn't in these releases yet: use the well-known Sury/Ondřej packages.
         if [ "$OS_ID" = ubuntu ]; then
@@ -1014,10 +1014,43 @@ EOF
     fi
 }
 
+install_security_updates() {
+    cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+    # The emulator, client, website and the PHP packages are not from these sources:
+    # plusemu-update and php-update.sh update them.
+    cat > /etc/apt/apt.conf.d/52plusemu-security-updates <<'EOF'
+// Written by the PlusEMU installer: security updates only, with a restart only when an update needs one.
+#clear Unattended-Upgrade::Allowed-Origins;
+#clear Unattended-Upgrade::Origins-Pattern;
+Unattended-Upgrade::Origins-Pattern {
+    "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+    "origin=Ubuntu,archive=${distro_codename}-security";
+    "origin=UbuntuESMApps,archive=${distro_codename}-apps-security";
+    "origin=UbuntuESM,archive=${distro_codename}-infra-security";
+};
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-Time "now";
+EOF
+    # The package lists refresh at 04:30, after the nightly backup, and updates install at 05:00.
+    mkdir -p /etc/systemd/system/apt-daily.timer.d /etc/systemd/system/apt-daily-upgrade.timer.d
+    printf '[Timer]\nOnCalendar=\nOnCalendar=*-*-* 04:30\nRandomizedDelaySec=0\n' > /etc/systemd/system/apt-daily.timer.d/plusemu.conf
+    printf '[Timer]\nOnCalendar=\nOnCalendar=*-*-* 05:00\nRandomizedDelaySec=0\n' > /etc/systemd/system/apt-daily-upgrade.timer.d/plusemu.conf
+    systemctl daemon-reload
+    systemctl enable apt-daily.timer apt-daily-upgrade.timer
+    systemctl restart apt-daily.timer apt-daily-upgrade.timer
+    ok "Security updates install every day at 05:00 server time; the server restarts only when an update needs it"
+}
+
 secure_server() {
-    step "Securing the server (SSH and failed logins)"
+    step "Securing the server (SSH, failed logins and security updates)"
     protect_ssh_logins
     harden_ssh
+    install_security_updates
 }
 
 # shellcheck disable=SC2034 # the {{KEY}} values are read by render() through ${!key}

@@ -977,8 +977,24 @@ function Set-HotelPermissions {
     Run icacls.exe (Join-Path (Join-Path $HotelRoot 'emulator') 'Config') /inheritance:r /grant:r 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F'
 }
 
+# Windows Update policy: install every day at 05:00 and restart only when an update needs it.
+# Windows ships security fixes inside cumulative updates, so they cannot be installed alone.
+function Set-WindowsUpdates {
+    $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $au = "$policy\AU"
+    # New-Item -Force on an existing registry key would remove its other values.
+    if (-not (Test-Path $au)) { New-Item -Path $au -Force | Out-Null }
+    $values = [ordered]@{
+        NoAutoUpdate = 0; AUOptions = 4; ScheduledInstallDay = 0; ScheduledInstallTime = 5
+        AlwaysAutoRebootAtScheduledTime = 1; AlwaysAutoRebootAtScheduledTimeMinutes = 15
+    }
+    foreach ($name in $values.Keys) { New-ItemProperty -Path $au -Name $name -Value $values[$name] -PropertyType DWord -Force | Out-Null }
+    New-ItemProperty -Path $policy -Name ExcludeWUDriversInQualityUpdate -Value 1 -PropertyType DWord -Force | Out-Null
+    Ok 'Windows updates install every day at 05:00; the server restarts only when an update needs it'
+}
+
 function Protect-Server {
-    Step 'Securing the server (failed logins)'
+    Step 'Securing the server (failed logins and Windows updates)'
     # A domain controller would apply this to the whole domain, so its own policy is left alone.
     if ((Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4) {
         Say '      This server is a domain controller: the account lockout policy was left as it is.' 'Yellow'
@@ -991,6 +1007,7 @@ function Protect-Server {
         Run net.exe accounts /lockoutwindow:10
         Ok 'An account locks for 10 minutes after 10 wrong passwords in 10 minutes (RDP and SSH were not opened or changed)'
     }
+    Set-WindowsUpdates
 }
 
 function Write-Guide {
