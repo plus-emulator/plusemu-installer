@@ -1157,22 +1157,41 @@ function Protect-Server {
 
 function Write-Guide {
     Step 'Writing your setup guide'
+    Write-GuideFile
+    Ok 'Guide written (also on your desktop)'
+}
+
+# The guide in its manual form, or in its connected form after the Cloudflare step.
+function Write-GuideFile {
     $mode = if ($state.GuideMode) { $state.GuideMode } else { 'simple' }
+    $status = ''; $manualStart = ''; $manualEnd = ''; $gameAddress = ''
+    $intro = 'Now connect <b>{{DOMAIN}}</b> through Cloudflare and install its origin certificate.'
+    if ($state.CloudflareSetup -eq 'done') {
+        $intro = 'Cloudflare is connected. Check your hotel below.'
+        $status = [IO.File]::ReadAllText((Join-Path $Templates 'cloudflare-connected.html'))
+        $manualStart = '<details class="card manual"><summary>If you need to do this by hand</summary>'
+        $manualEnd = '</details>'
+    }
+    if ($script:CloudflareError) { $status += [IO.File]::ReadAllText((Join-Path $Templates 'cloudflare-failed.html')) }
+    if ($WsHost -notin $state.Domain, "www.$($state.Domain)") { $gameAddress = ", the game address <code>$WsHost</code>" }
     $wsRow = ''
     if ($WsHost -ne $state.Domain) {
         $label = if ($WsHost.EndsWith(".$($state.Domain)")) { $WsHost.Substring(0, $WsHost.Length - $state.Domain.Length - 1) } else { $WsHost }
         $wsRow = "<tr><td>A</td><td><code>$label</code></td><td><code>$ServerIp</code></td><td>Proxied (orange cloud)</td></tr>"
     }
-    New-Item -ItemType Directory -Force -Path "$HotelRoot\setup-guide" | Out-Null
-    Render "$Templates\setup-guide.html" "$HotelRoot\setup-guide\index.html" @{
+    $guide = Join-Path (Join-Path $HotelRoot 'setup-guide') 'index.html'
+    New-Item -ItemType Directory -Force -Path (Split-Path $guide) | Out-Null
+    # The fragments come first, so the placeholders inside them are filled too.
+    Render (Join-Path $Templates 'setup-guide.html') $guide ([ordered]@{
+        CLOUDFLARE_STATUS = $status; MANUAL_START = $manualStart; MANUAL_END = $manualEnd; GUIDE_INTRO = $intro; GAME_ADDRESS_ITEM = $gameAddress
+        CERTIFICATE_EXPIRES = $state.CloudflareCertExpires; CLOUDFLARE_ERROR_HTML = [Net.WebUtility]::HtmlEncode("$script:CloudflareError")
         DOMAIN = $state.Domain; SERVER_IP = $ServerIp; HOTEL_NAME = $state.HotelName; WS_DNS_ROW = $wsRow; WS_HOST = $WsHost
         GUIDE_MODE_TITLE = (Get-Culture).TextInfo.ToTitleCase($mode)
-        GUIDE_MODE_DETAILS = [IO.File]::ReadAllText("$Templates\guide-$mode.html")
+        GUIDE_MODE_DETAILS = [IO.File]::ReadAllText((Join-Path $Templates "guide-$mode.html"))
         CREDENTIALS_FILE = $StateFile; RESTART_COMMAND = 'Restart-Service PlusEMU'
         LOG_COMMAND = "Get-Content $HotelRoot\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 50 -Wait"
-    } "$Templates\certificate-windows.html"
-    Copy-Item "$HotelRoot\setup-guide\index.html" "$([Environment]::GetFolderPath('Desktop'))\Hotel setup guide.html" -Force
-    Ok 'Guide written (also on your desktop)'
+    }) (Join-Path $Templates 'certificate-windows.html')
+    Copy-Item $guide "$([Environment]::GetFolderPath('Desktop'))\Hotel setup guide.html" -Force
 }
 
 function Complete-Install {

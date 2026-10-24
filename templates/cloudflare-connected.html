@@ -1,0 +1,21 @@
+<div class="card connected">
+    <h2>✓ Cloudflare is connected</h2>
+    <p>The installer set up Cloudflare for <b>{{DOMAIN}}</b>:</p>
+    <ul>
+        <li><b>DNS:</b> <code>{{DOMAIN}}</code>{{GAME_ADDRESS_ITEM}} and <code>www.{{DOMAIN}}</code> point to <code>{{SERVER_IP}}</code> through Cloudflare (proxied, orange cloud).</li>
+        <li><b>Origin certificate</b> for <code>{{DOMAIN}}</code> and <code>*.{{DOMAIN}}</code>, valid until <b>{{CERTIFICATE_EXPIRES}}</b>.</li>
+        <li><b>SSL/TLS:</b> Full (strict), Always Use HTTPS and TLS 1.2 or newer.</li>
+        <li><b>WebSockets</b> on, for the game connection.</li>
+        <li><b>Bot Fight Mode</b>, <b>Browser Integrity Check</b> and security level <b>medium</b>.</li>
+        <li><b>Rate limit:</b> 10 sign-in, registration and password reset requests per 10 seconds per visitor. Over the limit, Cloudflare blocks that visitor for 10 seconds.</li>
+        <li><b>Firewall rules:</b> the game connection works only from <code>https://{{DOMAIN}}</code>, and visitors to housekeeping get a Cloudflare check first.</li>
+    </ul>
+    <h3>Check it now</h3>
+    <ol>
+        <li>Open <a href="https://{{DOMAIN}}" target="_blank" rel="noopener">https://{{DOMAIN}}</a>. The website loads over HTTPS.</li>
+        <li>Log in with the admin username and password the installer showed you. Change the password under <b>Settings → Password</b>.</li>
+        <li>Click <b>Enter hotel</b>. The game client opens and connects.</li>
+    </ol>
+    <p>If Cloudflare still shows your site as <b>Pending</b>, wait until it says <b>Active</b>, then check again.</p>
+    <p>You can delete the API token now: in Cloudflare, open <b>My Profile → API Tokens</b>, click <b>⋯</b> next to the token, then <b>Delete</b>. To run the setup again later, create a new token and run the installer again.</p>
+</div>
