@@ -12,6 +12,7 @@
 # PLUSEMU_HOTEL_NAME, PLUSEMU_ADMIN_USER, PLUSEMU_ADMIN_EMAIL, PLUSEMU_YES=1.
 # PLUSEMU_GUIDE_MODE=simple|advanced selects the final instructions only.
 # PLUSEMU_CLOUDFLARE_TOKEN sets up Cloudflare with that API token; it is never saved.
+# PLUSEMU_DISCORD_WEBHOOK sends health alerts to that Discord webhook ("off" turns them off).
 #
 # Update an installed hotel (PlusEMU, the Volt client and the hotel files) later with:
 #   plusemu-update [-Check] [-Yes] [-Assets] [-Rollback]
@@ -63,6 +64,9 @@ $KeepNightly   = 7
 $BackupLockWait = 3600
 $CloudflareScript = Join-Path $StateDir 'plusemu-cloudflare-ips.ps1'
 $CloudflareLog  = Join-Path $StateDir 'cloudflare-ips.log'
+$HealthScript   = Join-Path $StateDir 'plusemu-health.ps1'
+$HealthLog      = Join-Path $StateDir 'health.log'
+$HealthState    = Join-Path $StateDir 'health.json'
 $CloudflareApi  = 'https://api.cloudflare.com/client/v4'
 $OriginCaRootUrl = 'https://developers.cloudflare.com/ssl/static/origin_ca_rsa_root.pem'
 $UpdateLog     = Join-Path $StateDir 'update.log'
@@ -394,6 +398,33 @@ function Get-InstallerFiles {
     $script:Templates = (Get-ChildItem $tmp -Directory | Select-Object -First 1).FullName + '\templates'
 }
 
+function Test-DiscordWebhook($Url) { return "$Url" -cmatch '^https://(discord|discordapp)\.com/api/webhooks/[A-Za-z0-9._~/?=&-]+$' }
+
+# Reruns keep the saved webhook unless PLUSEMU_DISCORD_WEBHOOK changes it; "off" removes it.
+function Select-DiscordWebhook($Saved, [bool]$Asked) {
+    $url = Get-Setting 'PLUSEMU_DISCORD_WEBHOOK' ''
+    if ($url -eq 'off') { return '' }
+    if (-not $url -and $Asked) { return "$Saved" }
+    $unattended = (Get-Setting 'PLUSEMU_YES' '0') -eq '1'
+    while ($true) {
+        if (-not $url -and -not $unattended) {
+            $url = "$(Read-Host '  Discord webhook URL for alerts when something is wrong with your hotel (optional, press Enter to skip)')" -replace '\s', ''
+        }
+        if (-not $url -or (Test-DiscordWebhook $url)) { return "$url" }
+        Write-Host '  That is not a Discord webhook URL. It starts with https://discord.com/api/webhooks/' -ForegroundColor Yellow
+        if ($unattended) { throw 'PLUSEMU_DISCORD_WEBHOOK is not a Discord webhook URL. Copy it again in Discord, or set it to off.' }
+        $url = ''
+    }
+}
+
+# CrowdSec reads the visitor's address from the web server log. IIS logs Cloudflare's address instead,
+# so CrowdSec on Windows would block Cloudflare and cut off every player.
+function Write-CrowdSecNote($Mode) {
+    if ($Mode -eq 'advanced' -or (Get-Setting 'PLUSEMU_CROWDSEC' '') -eq '1') {
+        Say '  CrowdSec: the Windows installer does not install it. IIS logs show Cloudflare''s address instead of the visitor''s, so CrowdSec would block Cloudflare instead of attackers. The Linux installer can install it.'
+    }
+}
+
 function Read-Answers {
     $selectedMode = Resolve-GuideMode
     Write-Host ''
@@ -404,10 +435,19 @@ function Read-Answers {
     if (Test-Path $StateFile) {
         $script:state = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
         $selectedMode = Resolve-GuideMode $state.GuideMode
-        $state | Add-Member -MemberType NoteProperty -Name GuideMode -Value $selectedMode -Force
-        $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
         Say "Found the settings of an earlier run for $($state.Domain); continuing that installation."
         Say "  Setup guide: $selectedMode. Selecting this guide does not change SSH, RDP, firewall, updates or backups."
+        Write-CrowdSecNote $selectedMode
+        $previous = "$($state.DiscordWebhook)"
+        # An older state file has no answer for this, so the question is asked once.
+        $webhook = Select-DiscordWebhook $state.DiscordWebhook ($null -ne $state.PSObject.Properties['DiscordWebhook'])
+        $script:DiscordWebhookNew = [bool]($webhook -and $webhook -ne $previous)
+        $state | Add-Member -MemberType NoteProperty -Name GuideMode -Value $selectedMode -Force
+        $state | Add-Member -MemberType NoteProperty -Name DiscordWebhook -Value $webhook -Force
+        $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
+        if ($webhook) {
+            Say '  Health alerts are on: they go to your Discord webhook. To change it, run the installer again with $env:PLUSEMU_DISCORD_WEBHOOK set to the new URL, or to off to turn alerts off.'
+        }
         return
     }
 
@@ -452,6 +492,8 @@ function Read-Answers {
         Write-Host "  That doesn't look like an email address." -ForegroundColor Yellow
         $mail = ''
     }
+    $webhook = Select-DiscordWebhook '' $false
+    $script:DiscordWebhookNew = [bool]$webhook
 
     Write-Host ''
     Write-Host "  Website:    https://$domain"
@@ -459,6 +501,8 @@ function Read-Answers {
     Write-Host "  Hotel name: $name"
     Write-Host "  Admin:      $user ($mail)"
     Write-Host "  Setup guide: $selectedMode. Selecting this guide does not change SSH, RDP, firewall, updates or backups."
+    Write-Host "  Health alerts: $(if ($webhook) { 'Discord' } else { 'log only (no Discord webhook)' })"
+    Write-CrowdSecNote $selectedMode
     if ((Get-Setting 'PLUSEMU_YES' '0') -ne '1') {
         $go = Ask 'Start the installation? (y/n)' 'y'
         if ($go -notmatch '^[Yy]') { throw 'Installation cancelled. Nothing was changed.' }
@@ -466,7 +510,7 @@ function Read-Answers {
 
     $script:state = [pscustomobject]@{
         Domain = $domain; WsUrl = $ws; HotelName = $name; AdminUser = $user; AdminEmail = $mail
-        GuideMode = $selectedMode
+        GuideMode = $selectedMode; DiscordWebhook = $webhook
         AdminPassword = New-AdminPassword; DbPassword = New-Secret 32; DbRootPassword = New-Secret 32
     }
     $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
@@ -948,8 +992,11 @@ function Set-IisSite {
     }
     Ok 'Firewall allows HTTP and HTTPS (the database and emulator stay private)'
     Write-CloudflareCommand
+    # The health check reads the result from the Cloudflare log.
+    $installLog = $script:Log
+    $script:Log = $CloudflareLog
     try {
-        Update-CloudflareFirewall
+        try { Update-CloudflareFirewall } finally { $script:Log = $installLog }
         Ok "HTTP and HTTPS are accepted only from Cloudflare's addresses, refreshed every Sunday at 03:00 (task: PlusEMU Cloudflare addresses)"
     } catch {
         Write-Log "$_"
@@ -1140,7 +1187,7 @@ function Write-BackupCommand {
 }
 
 function Protect-Server {
-    Step 'Securing the server (failed logins, Windows updates, logs and backups)'
+    Step 'Securing the server (failed logins, Windows updates, logs, backups and health checks)'
     # A domain controller would apply this to the whole domain, so its own policy is left alone.
     if ((Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4) {
         Say '      This server is a domain controller: the account lockout policy was left as it is.' 'Yellow'
@@ -1156,6 +1203,193 @@ function Protect-Server {
     Set-WindowsUpdates
     Set-LogCleanup
     Write-BackupCommand
+    Write-HealthCommand
+}
+
+# ---------------------------------------------------------------- health check
+
+# Each check: its name (the function Test-Health<Name>), what it checks, and the command that shows more.
+function Get-HealthChecks {
+    return @(
+        @{ Name = 'Emulator'; Label = 'The emulator service'; Look = "Get-Content $HotelRoot\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 100" }
+        @{ Name = 'GamePort'; Label = 'The game connection (port 2096)'; Look = "Get-Content $HotelRoot\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 100" }
+        @{ Name = 'ApiPort'; Label = 'The emulator API (port 8080)'; Look = "Get-Content $HotelRoot\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 100" }
+        @{ Name = 'WebServer'; Label = 'The web server (IIS)'; Look = 'Get-Service W3SVC' }
+        @{ Name = 'Website'; Label = 'The website'; Look = "Get-ChildItem $env:SystemDrive\inetpub\logs\LogFiles -Recurse | Sort-Object LastWriteTime | Select-Object -Last 1 | Get-Content -Tail 50" }
+        @{ Name = 'Database'; Label = 'The database (MariaDB)'; Look = 'Get-Service MariaDB' }
+        @{ Name = 'Disk'; Label = 'Free disk space'; Look = 'Get-PSDrive C' }
+        @{ Name = 'Backup'; Label = 'The nightly backup'; Look = "Get-Content $BackupLog -Tail 20" }
+        @{ Name = 'Certificate'; Label = 'The HTTPS certificate'; Look = "Get-ChildItem Cert:\LocalMachine\My | Select-Object Subject, NotAfter" }
+        @{ Name = 'Cloudflare'; Label = 'The Cloudflare address refresh'; Look = "Get-Content $CloudflareLog -Tail 20" }
+    )
+}
+
+# Runs curl.exe without logging and returns its exit code and output.
+function Get-ProbeResult([string[]]$Arguments) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $output = & curl.exe @Arguments 2> $null
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $previous
+    return @{ Code = $code; Output = (@($output) -join '') }
+}
+
+# A program on this server accepts connections on the port.
+function Test-PortAnswers($Port) {
+    $client = New-Object Net.Sockets.TcpClient
+    try { return $client.ConnectAsync('127.0.0.1', $Port).Wait(5000) } catch { return $false } finally { $client.Dispose() }
+}
+
+function Get-FreeMegabytes($Path) { return [int64]((New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($Path))).AvailableFreeSpace / 1MB) }
+
+function Test-HealthEmulator { if ((Get-Service PlusEMU -ErrorAction SilentlyContinue).Status -ne 'Running') { return 'The PlusEMU service is not running.' } }
+function Test-HealthGamePort { if (-not (Test-PortAnswers 2096)) { return 'Nothing answers on port 2096.' } }
+function Test-HealthApiPort { if (-not (Test-PortAnswers 8080)) { return 'Nothing answers on port 8080.' } }
+function Test-HealthWebServer { if ((Get-Service W3SVC -ErrorAction SilentlyContinue).Status -ne 'Running') { return 'The IIS service (W3SVC) is not running.' } }
+
+function Test-HealthWebsite {
+    $domain = $state.Domain
+    $code = (Get-ProbeResult @('-s', '-o', 'NUL', '-w', '%{http_code}', '--max-time', '10', '--resolve', "$($domain):80:127.0.0.1", "http://$domain/")).Output
+    if ($code -match '^[234]\d\d$') { return }
+    if (-not $code -or $code -eq '000') { return "https://$domain does not answer on this server." }
+    return "https://$domain answers with error $code on this server."
+}
+
+function Test-HealthDatabase {
+    try { if ("$(Sql 'SELECT 1')".Trim() -eq '1') { return } } catch { }
+    return 'MariaDB does not answer.'
+}
+
+function Test-HealthDisk {
+    $free = Get-FreeMegabytes $HotelRoot
+    if ($free -le 2048) { return "Only $free MB is free on the disk of $HotelRoot. Keep more than 2048 MB free." }
+}
+
+function Test-HealthBackup {
+    $backups = @(Get-ChildItem $NightlyRoot -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d{8}-\d{6}-\d{3}$' })
+    $limit = (Get-Date).AddHours(-36)
+    if ($backups | Where-Object { $_.LastWriteTime -gt $limit }) { return }
+    # A new hotel has no backup before its first night.
+    if (-not $backups -and (Test-Path $BackupScript) -and (Get-Item $BackupScript).LastWriteTime -gt $limit) { return }
+    return "The newest nightly backup in $NightlyRoot is older than 36 hours."
+}
+
+function Test-HealthCertificate {
+    $certificate = Get-HotelCertificate
+    if (-not $certificate -or $certificate.NotAfter -lt (Get-Date).AddDays(30)) {
+        return "The certificate on the HTTPS binding of $($state.Domain) expires within 30 days, or is missing."
+    }
+}
+
+function Test-HealthCloudflare {
+    $line = $null
+    if (Test-Path $CloudflareLog) { $line = Get-Content $CloudflareLog | Where-Object { "$_".Trim() } | Select-Object -Last 1 }
+    if (-not $line) { return 'The refresh never ran.' }
+    if ("$line" -notmatch "The website accepts only Cloudflare's") { return "The last refresh did not work: $line" }
+    if ((Get-Item $CloudflareLog).LastWriteTime -lt (Get-Date).AddDays(-8)) { return 'The last refresh that worked is older than 8 days.' }
+}
+
+# Returns $null when Discord took the message, or the reason when it did not.
+function Send-Discord($Webhook, $Text) {
+    $body = @{ username = 'PlusEMU'; content = $Text; allowed_mentions = @{ parse = @() } } | ConvertTo-Json -Compress
+    try {
+        $null = Invoke-RestMethod -Method Post -Uri $Webhook -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 15
+        return $null
+    } catch {
+        if ($_.Exception.Response) { return "Discord answered with HTTP status $([int]$_.Exception.Response.StatusCode). Check that the webhook still exists." }
+        return "Discord could not be reached ($($_.Exception.Message))."
+    }
+}
+
+function Write-HealthLine($Text) { Write-Host $Text; Add-Content -Path $HealthLog -Value $Text -Encoding UTF8 }
+
+# The plusemu-health.ps1 command. Discord hears about every check that starts or stops failing, once.
+# Returns $true when every check passed; $script:HealthProblems lists the others.
+function Invoke-HealthCheck {
+    $now = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $script:HealthProblems = @()
+    $script:state = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ((Test-Path $HealthLog) -and (Get-Item $HealthLog).Length -gt 5MB) {
+        $keep = Get-Content $HealthLog -Tail 20000
+        Set-Content $HealthLog $keep -Encoding UTF8
+    }
+    # An update stops the emulator for a while, and an installer run restarts services.
+    try { ([IO.File]::Open($LockFile, 'OpenOrCreate', 'ReadWrite', 'None')).Dispose() }
+    catch { Write-HealthLine "$now Skipped: an update, a backup or the installer is running."; return $true }
+    $was = @()
+    if (Test-Path $HealthState) { $was = @(Get-Content $HealthState -Raw | ConvertFrom-Json) }
+    $failed = @()
+    $changes = ''
+    $short = ''
+    $checks = @(Get-HealthChecks)
+    foreach ($check in $checks) {
+        $reason = & "Test-Health$($check.Name)"
+        if (-not $reason) {
+            if ($was -contains $check.Name) {
+                $changes += "$([char]::ConvertFromUtf32(0x2705)) $($check.Label) works again.`n"
+                $short += "$([char]::ConvertFromUtf32(0x2705)) $($check.Label) works again.`n"
+            }
+            continue
+        }
+        $failed += $check.Name
+        $script:HealthProblems += "$($check.Label): $reason Look at it with: $($check.Look)"
+        Write-HealthLine "$now PROBLEM: $($check.Label): $reason Look at it with: $($check.Look)"
+        if ($was -notcontains $check.Name) {
+            $changes += "$([char]::ConvertFromUtf32(0x274C)) $($check.Label) does not work. $reason Look at it with: ``$($check.Look)```n"
+            $short += "$([char]::ConvertFromUtf32(0x274C)) $($check.Label) does not work.`n"
+        }
+    }
+    if ($failed.Count -eq 0) { Write-HealthLine "$now OK: all $($checks.Count) checks passed." }
+    else { Write-HealthLine "$now $($failed.Count) of $($checks.Count) checks failed." }
+    # Discord takes at most 2000 characters, so a long list names the checks only.
+    if ($changes.Length -gt 1800) { $changes = "$short`nRun $HealthScript on the server to see why." }
+    $sent = $true
+    if ($changes -and $state.DiscordWebhook) {
+        $reason = Send-Discord $state.DiscordWebhook "**$($state.HotelName)** health check`n$changes"
+        if ($reason) {
+            $sent = $false
+            Write-HealthLine "$now Could not tell Discord what changed: $reason The next run tries again."
+        } else {
+            Write-HealthLine "$now Told Discord what changed."
+        }
+    }
+    # After a failed message, the old state stays, so the next run sends the same changes.
+    if ($sent) { Write-Utf8 $HealthState (ConvertTo-Json -InputObject @($failed) -Compress) }
+    return ($failed.Count -eq 0)
+}
+
+# Writes plusemu-health.ps1 from the installer's own functions and runs it every 5 minutes.
+function Write-HealthCommand {
+    $text = "# Installed by the PlusEMU installer. The `"PlusEMU health check`" task runs this every 5 minutes. Run it by hand in Administrator PowerShell: & '$HealthScript'`r`n"
+    $text += "`$ErrorActionPreference = 'Stop'`r`n"
+    $text += "`$ProgressPreference = 'SilentlyContinue'`r`n"
+    $text += "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12`r`n"
+    foreach ($name in 'HotelRoot', 'StateFile', 'NightlyRoot', 'BackupScript', 'BackupLog', 'CloudflareLog', 'LockFile', 'HealthScript', 'HealthLog', 'HealthState') {
+        $text += "`$$name = '$((Get-Variable $name).Value)'`r`n"
+    }
+    $text += "`$script:Log = '$HealthLog'`r`n"
+    $text += "Import-Module WebAdministration -ErrorAction SilentlyContinue`r`n"
+    $functions = @('Write-Log', 'Write-Utf8', 'Find-MariaDb', 'Get-MariaDb', 'Sql', 'Get-HotelCertificate', 'Get-ProbeResult', 'Test-PortAnswers', 'Get-FreeMegabytes',
+                   'Get-HealthChecks', 'Send-Discord', 'Write-HealthLine', 'Invoke-HealthCheck') + @(Get-HealthChecks | ForEach-Object { "Test-Health$($_.Name)" })
+    foreach ($name in $functions) {
+        $text += "function $name {$((Get-Item "function:$name").Definition)}`r`n"
+    }
+    $text += "if (-not (Invoke-HealthCheck)) { exit 1 }`r`n"
+    Write-Utf8 $HealthScript $text
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$HealthScript`""
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
+    Register-ScheduledTask -TaskName 'PlusEMU health check' -Action $action -Trigger $trigger -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+    Ok "Health check every 5 minutes (task: PlusEMU health check, log: $HealthLog)"
+    if (-not $state.DiscordWebhook) {
+        Say '      Discord alerts are off. To turn them on, run the installer again with $env:PLUSEMU_DISCORD_WEBHOOK set to the webhook URL.'
+        return
+    }
+    if ($script:DiscordWebhookNew) {
+        $reason = Send-Discord $state.DiscordWebhook "$([char]::ConvertFromUtf32(0x2705)) Health alerts for **$($state.HotelName)** are on. You get a message here when something is wrong with your hotel, and when it works again."
+        if ($reason) { Say "      Could not send the first message to Discord: $reason The health check still runs. Check the webhook, then run the installer again." 'Yellow' }
+        else { $script:DiscordWebhookNew = $false }
+    }
+    Ok 'Discord alerts are on. To change the webhook, run the installer again with $env:PLUSEMU_DISCORD_WEBHOOK set to the new URL (or off)'
 }
 
 # ---------------------------------------------------------------- Cloudflare API setup
@@ -1551,9 +1785,21 @@ function Write-GuideFile {
     Copy-Item $guide "$([Environment]::GetFolderPath('Desktop'))\Hotel setup guide.html" -Force
 }
 
+# Runs the health check once; it skips its run while the installer holds the lock.
+function Invoke-InstallHealthCheck {
+    if (-not $HealthScript -or -not (Test-Path $HealthScript)) { return }
+    if ($script:InstallLock) { $script:InstallLock.Dispose(); $script:InstallLock = $null }
+    try { $passed = Invoke-HealthCheck 6> $null } catch { $passed = $false; $script:HealthProblems = @("$_") }
+    if ($passed) { Write-Host '  Health check: all checks passed.'; return }
+    Write-Host '  Health check: something does not work yet:' -ForegroundColor Yellow
+    foreach ($problem in $script:HealthProblems) { Write-Host "    $problem" }
+}
+
 function Complete-Install {
     Write-Host ''
     Write-Host 'Your hotel is installed!' -ForegroundColor Green
+    Write-Host ''
+    Invoke-InstallHealthCheck
     Write-Host ''
     if ($state.CloudflareSetup -eq 'done') {
         Write-Host "  Cloudflare is connected. Open https://$($state.Domain), log in and enter the hotel to check it."
@@ -1578,6 +1824,7 @@ function Complete-Install {
     Write-Host "  Retrieve saved passwords (Administrator PowerShell): Get-Content $StateFile"
     Write-Host '  Update the emulator, client and hotel files later (Administrator PowerShell): plusemu-update'
     Write-Host "  Nightly backups of the database and your settings: $NightlyRoot"
+    Write-Host "  Check the hotel now (Administrator PowerShell): & '$HealthScript' (it runs every 5 minutes; log: $HealthLog)"
     Write-Host '  Store passwords somewhere safe. Change the initial admin password after logging in;'
     Write-Host '  the saved file retains the initial password. Keep passwords out of shared logs and screenshots.'
     Write-Host ''
@@ -2044,6 +2291,9 @@ try {
         Invoke-Update -Check:$Check -Yes:$Yes -Rollback:$Rollback -Assets:$Assets
     } else {
         Test-Prerequisites
+        # Updates, backups and the health check wait for the installer.
+        try { $script:InstallLock = [IO.File]::Open($LockFile, 'OpenOrCreate', 'ReadWrite', 'None') }
+        catch { throw 'An update or a backup is running. Try again in a few minutes.' }
         Get-InstallerFiles
         Read-Answers
         Say "  Admin and database passwords are saved in $StateFile. Retrieve them in Administrator PowerShell: Get-Content $StateFile"
@@ -2082,6 +2332,7 @@ try {
         Write-Host '  It continues where it stopped.'
     }
 } finally {
+    if ($script:InstallLock) { $script:InstallLock.Dispose() }
     foreach ($name in 'MYSQL_PWD', 'ATOM_ADMIN_PASSWORD', 'ADMIN_PASSWORD') { Remove-Item "Env:\$name" -ErrorAction SilentlyContinue }
     $ErrorActionPreference = $SessionPreferences.ErrorAction
     $ProgressPreference = $SessionPreferences.Progress
