@@ -159,6 +159,7 @@ function Install-Msi($File, [string[]]$Properties = @()) {
 
 function Update-Path {
     $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+    if ($script:LocalNode) { $env:Path = "$script:LocalNode;$env:Path" }
 }
 
 function Add-MachinePath($Dir) {
@@ -665,21 +666,37 @@ function Install-Toolchains {
         Download 'https://getcomposer.org/download/latest-stable/composer.phar' "$PhpDir\composer.phar"
         $expected = ((Invoke-WebRequest 'https://getcomposer.org/download/latest-stable/composer.phar.sha256' -UseBasicParsing).Content -split '\s')[0]
         if ((Get-FileHash "$PhpDir\composer.phar" -Algorithm SHA256).Hash -ne $expected.ToUpper()) { Remove-Item "$PhpDir\composer.phar"; throw 'The Composer download is damaged. Run the installer again.' }
-        Set-Content "$PhpDir\composer.bat" "@php `"%~dp0composer.phar`" %*" -Encoding ASCII
     }
+    # Another PHP earlier on the PATH, as on many PCs, would run Composer without the hotel's extensions.
+    Set-Content "$PhpDir\composer.bat" "@`"%~dp0php.exe`" `"%~dp0composer.phar`" %*" -Encoding ASCII
     Ok 'Composer'
 }
 
 function Install-NodeJs {
+    if ($state.Local) {
+        # The PC's own node and npm stay as they are: this copy is only on the installer's PATH.
+        $script:LocalNode = Join-Path $StateDir 'node'
+        Update-Path
+    }
     $node = Get-Command node -ErrorAction SilentlyContinue
     if (-not $node -or -not ((& node --version) -like "v$NodeMajor.*")) {
         $base = "https://nodejs.org/dist/latest-v$NodeMajor.x"
         $sums = (Invoke-WebRequest "$base/SHASUMS256.txt" -UseBasicParsing).Content -split "`n"
-        $line = $sums | Where-Object { $_ -match 'node-v[\d.]+-x64\.msi$' } | Select-Object -First 1
+        $package = if ($state.Local) { 'node-v[\d.]+-win-x64\.zip$' } else { 'node-v[\d.]+-x64\.msi$' }
+        $line = $sums | Where-Object { $_ -match $package } | Select-Object -First 1
         $hash, $file = $line -split '\s+'
         Download "$base/$file" "$Downloads\$file"
         if ((Get-FileHash "$Downloads\$file" -Algorithm SHA256).Hash -ne $hash.ToUpper()) { throw 'The Node.js download is damaged. Run the installer again.' }
-        Install-Msi "$Downloads\$file"
+        if ($state.Local) {
+            $unpacked = Join-Path $Downloads 'node'
+            if (Test-Path $unpacked) { Remove-Item $unpacked -Recurse -Force }
+            Expand-Archive "$Downloads\$file" $unpacked
+            if (Test-Path $script:LocalNode) { Remove-Item $script:LocalNode -Recurse -Force }
+            # The archive holds one folder, node-v<version>-win-x64.
+            Move-Item ([IO.Directory]::GetDirectories($unpacked)[0]) $script:LocalNode
+        } else {
+            Install-Msi "$Downloads\$file"
+        }
         Update-Path
     }
     Ok "Node.js $(& node --version)"
@@ -2503,6 +2520,8 @@ try {
     }
 } finally {
     if ($script:InstallLock) { $script:InstallLock.Dispose() }
+    # irm | iex runs in the owner's own window, which keeps the PC's own Node.js afterwards.
+    if ($script:LocalNode) { $script:LocalNode = $null; Update-Path }
     foreach ($name in 'MYSQL_PWD', 'ATOM_ADMIN_PASSWORD', 'ADMIN_PASSWORD') { Remove-Item "Env:\$name" -ErrorAction SilentlyContinue }
     $ErrorActionPreference = $SessionPreferences.ErrorAction
     $ProgressPreference = $SessionPreferences.Progress
