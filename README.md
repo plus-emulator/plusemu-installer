@@ -110,6 +110,8 @@ Every step is logged. If a step fails, the installer shows the last lines of the
 8. Configures nginx and the firewall:
    - nginx starts with a temporary self-signed HTTPS certificate. The setup guide replaces it with a Cloudflare Origin CA certificate for **Full (strict)**.
    - It restores visitors' real IPs from Cloudflare and passes the game's WebSocket through to the emulator.
+   - It limits each visitor: 5 login, registration or password reset attempts per minute (plus a burst of 5), 30 housekeeping pages per minute (plus a burst of 20), 50 open requests and 20 game connections (many players can share one address, for example at a school). Over the limit, nginx answers 429. The game client and the hotel files have no limits.
+   - It drops slow connections after 10 seconds and sends the `Strict-Transport-Security` and `Permissions-Policy` headers. `Strict-Transport-Security` covers the hotel domain only, not its subdomains.
    - The `ufw` firewall allows only SSH, HTTP and HTTPS. The database and the emulator stay private.
 9. Writes your setup guide.
 
@@ -119,6 +121,8 @@ Every step is logged. If a step fails, the installer shows the last lines of the
 - MariaDB 11.4
 - The emulator as the `PlusEMU` Windows service
 - Windows Firewall rules for the website
+- IIS Dynamic IP Restrictions: each visitor gets at most 50 open requests and 1500 requests in 10 seconds, read from the address Cloudflare forwards. Over the limit, IIS answers 403. IIS cannot limit single pages, so the login limits come from Atom CMS itself (5 attempts per minute). Uploads are limited to 20 MB, and request headers must arrive within 10 seconds.
+- The `Strict-Transport-Security` header (for the hotel domain only, not its subdomains) and the `Permissions-Policy` header
 
 The pages the installer generates, such as the setup guide and the client configuration, come from the templates in [`templates/`](templates). When you run the installer through `curl | bash` or `irm | iex`, it downloads these templates from this repository's `main` branch, so a fix merged here reaches every new install.
 

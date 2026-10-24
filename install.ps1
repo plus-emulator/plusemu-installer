@@ -472,7 +472,7 @@ function Get-Derived {
 function Install-WebServer {
     Step 'Installing IIS with URL Rewrite, reverse proxy and WebSockets'
     $features = 'Web-Server', 'Web-Static-Content', 'Web-Default-Doc', 'Web-Http-Errors', 'Web-Http-Logging',
-                'Web-Stat-Compression', 'Web-Dyn-Compression', 'Web-Filtering', 'Web-CGI', 'Web-WebSockets', 'Web-Mgmt-Console'
+                'Web-Stat-Compression', 'Web-Dyn-Compression', 'Web-Filtering', 'Web-IP-Security', 'Web-CGI', 'Web-WebSockets', 'Web-Mgmt-Console'
     $result = Install-WindowsFeature -Name $features
     if (-not $result.Success) { throw 'Installing IIS failed.' }
     Import-Module WebAdministration
@@ -924,6 +924,7 @@ function Set-IisSite {
     Set-HotelPermissions
     foreach ($dir in "$HotelRoot\cms\storage", "$HotelRoot\cms\bootstrap\cache") { Run icacls.exe $dir /grant "IIS AppPool\$($pool):(OI)(CI)M" /T /Q }
     Run icacls.exe "$HotelRoot\cms\.env" /inheritance:r /grant:r 'Administrators:F' 'SYSTEM:F' "IIS AppPool\$($pool):R"
+    Set-IisLimits $site
     Start-Website -Name $site -ErrorAction SilentlyContinue
     if ((Get-WebAppPoolState -Name $pool).Value -eq 'Started') { Restart-WebAppPool -Name $pool } else { Start-WebAppPool -Name $pool }
     Ok "IIS serves https://$domain"
@@ -934,6 +935,37 @@ function Set-IisSite {
         }
     }
     Ok 'Firewall allows HTTP and HTTPS (the database and emulator stay private)'
+}
+
+# Per-visitor limits and security headers for the hotel site.
+function Set-IisLimits($Site) {
+    $apphost = 'MACHINE/WEBROOT/APPHOST'
+    # Visitors arrive through Cloudflare, so the visitor's address is read from X-Forwarded-For.
+    # The game client loads hundreds of hotel files at once, so the request rate stays high.
+    $dynamic = 'system.webServer/security/dynamicIpSecurity'
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $dynamic -Name 'enableProxyMode' -Value 'True'
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $dynamic -Name 'denyAction' -Value 'Forbidden'
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByConcurrentRequests" -Name 'enabled' -Value 'True'
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByConcurrentRequests" -Name 'maxConcurrentRequests' -Value 50
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByRequestRate" -Name 'enabled' -Value 'True'
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByRequestRate" -Name 'maxRequests' -Value 1500
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByRequestRate" -Name 'requestIntervalInMilliseconds' -Value 10000
+    $requestLimits = 'system.webServer/security/requestFiltering/requestLimits'
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $requestLimits -Name 'maxAllowedContentLength' -Value 20971520
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $requestLimits -Name 'maxUrl' -Value 4096
+    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $requestLimits -Name 'maxQueryString' -Value 2048
+    # Slow clients that never finish sending their request headers are dropped after 10 seconds.
+    & cmd.exe /c 'netsh http delete timeout timeouttype=headerwaittimeout >nul 2>&1'
+    try { Run netsh.exe http add timeout timeouttype=headerwaittimeout value=10 }
+    catch { Say "      Could not set the 10 second header timeout ($_). The website works without it." 'Yellow' }
+
+    $headers = 'system.webServer/httpProtocol/customHeaders'
+    foreach ($header in @(@('Strict-Transport-Security', 'max-age=31536000'), @('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), usb=()'))) {
+        if (Get-WebConfiguration -PSPath $apphost -Location $Site -Filter "$headers/add[@name='$($header[0])']") {
+            Remove-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $headers -Name 'collection' -AtElement @{ name = $header[0] }
+        }
+        Add-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $headers -Name '.' -Value @{ name = $header[0]; value = $header[1] }
+    }
 }
 
 function Set-HotelPermissions {

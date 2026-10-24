@@ -691,10 +691,29 @@ cloudflare_real_ip() {
     } > /etc/nginx/conf.d/cloudflare-real-ip.conf
 }
 
+request_limits() {
+    cat > /etc/nginx/conf.d/plusemu-limits.conf <<'EOF'
+# Per-visitor limits. The visitor's address comes from cloudflare-real-ip.conf.
+# Only POSTs to the login forms count, so opening the pages is never limited.
+# The game client and hotel files have no limits: the client loads hundreds of them at once.
+map $request_method $plusemu_login_key {
+    POST $binary_remote_addr;
+    default "";
+}
+limit_req_zone $plusemu_login_key zone=plusemu_login:10m rate=5r/m;
+limit_req_zone $binary_remote_addr zone=plusemu_housekeeping:10m rate=30r/m;
+limit_conn_zone $binary_remote_addr zone=plusemu_conn:10m;
+limit_conn_zone $binary_remote_addr zone=plusemu_ws:10m;
+limit_req_status 429;
+limit_conn_status 429;
+EOF
+}
+
 ws_location() { # the nginx block that hands the game connection to the emulator
     cat <<EOF
     location = $WS_PATH {
         if (\$http_origin != "https://$DOMAIN") { return 403; }
+        limit_conn plusemu_ws 20;
         proxy_pass http://127.0.0.1:2096;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
@@ -716,6 +735,7 @@ configure_web() {
         chmod 600 "$ssl/key.pem"
     fi
     cloudflare_real_ip
+    request_limits
     # Added to nginx's own list; .hab and .nitro already fall back to application/octet-stream.
     echo 'types { application/json jsonc; }' > /etc/nginx/conf.d/hotel-mime.conf
 
@@ -727,6 +747,11 @@ configure_web() {
     listen [::]:443 ssl;
     http2 on;"
     fi
+
+    # Slow clients that hold connections open without sending a request are dropped.
+    local timeouts="client_header_timeout 10s;
+    client_body_timeout 10s;
+    keepalive_timeout 20s;"
 
     local ws_main="" ws_server=""
     if [ "$WS_HOST" = "$DOMAIN" ]; then
@@ -741,6 +766,7 @@ server {
     server_name $WS_HOST;
     ssl_certificate $ssl/cert.pem;
     ssl_certificate_key $ssl/key.pem;
+    $timeouts
 $(ws_location)
     location / { return 404; }
 }
@@ -756,6 +782,7 @@ server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
+    $timeouts
     location /$GUIDE_TOKEN/ { alias $HOTEL_ROOT/setup-guide/; index index.html; }
     location / { return 444; }
 }
@@ -766,6 +793,7 @@ server {
     server_name _;
     ssl_certificate $ssl/cert.pem;
     ssl_certificate_key $ssl/key.pem;
+    $timeouts
     return 444;
 }
 
@@ -776,6 +804,7 @@ server {
     server_name www.$DOMAIN;
     ssl_certificate $ssl/cert.pem;
     ssl_certificate_key $ssl/key.pem;
+    $timeouts
     return 301 https://$DOMAIN\$request_uri;
 }
 
@@ -792,9 +821,12 @@ server {
     charset utf-8;
     client_max_body_size 20m;
     server_tokens off;
+    $timeouts
 
     add_header X-Content-Type-Options nosniff always;
     add_header Referrer-Policy strict-origin-when-cross-origin always;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), usb=()" always;
 
     gzip on;
     gzip_types text/plain text/css application/json application/javascript text/javascript image/svg+xml application/wasm;
@@ -821,11 +853,26 @@ $ws_main
         expires 7d;
     }
 
+    # Atom CMS sign-in, registration and password reset forms.
+    location ~ ^/(login|register|forgot-password|reset-password/[^/]+|two-factor-challenge)\$ {
+        limit_req zone=plusemu_login burst=5 nodelay;
+        limit_conn plusemu_conn 50;
+        try_files \$uri /index.php?\$query_string;
+    }
+
+    location /housekeeping {
+        limit_req zone=plusemu_housekeeping burst=20 nodelay;
+        limit_conn plusemu_conn 50;
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
     location / {
+        limit_conn plusemu_conn 50;
         try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
     location ~ \.php\$ {
+        limit_conn plusemu_conn 50;
         fastcgi_pass unix:$php_sock;
         fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
         fastcgi_param HTTPS on;
