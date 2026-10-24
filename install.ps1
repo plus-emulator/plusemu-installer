@@ -516,6 +516,8 @@ function Read-Answers {
     $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
 }
 
+function Assert-FreePorts { throw 'Assert-FreePorts is not implemented yet.' }
+
 function Get-Derived {
     $rest = $state.WsUrl.Substring($state.WsUrl.IndexOf('://') + 3)
     $script:WsHost = $rest.Split('/')[0]

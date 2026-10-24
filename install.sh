@@ -43,6 +43,7 @@ KEEP_NIGHTLY=7
 BACKUP_COMMAND=/usr/local/sbin/plusemu-backup
 BACKUP_CRON=/etc/cron.d/plusemu-backup
 BACKUP_LOG=/var/log/plusemu-backup.log
+CMS_CRON=/etc/cron.d/atom-cms
 SSL_DIR=/etc/ssl/plusemu
 LOCK_FILE=/run/plusemu-update.lock
 SSHD_DROPIN=/etc/ssh/sshd_config.d/10-plusemu.conf
@@ -115,7 +116,7 @@ ask() { # ask <variable> <question> [default]
     local var=$1 question=$2 default=${3:-} answer
     if [ -n "$default" ]; then question="$question ${bold}[$default]${reset}"; fi
     printf '  %s: ' "$question" >&3
-    if ! read -r answer < /dev/tty 2> /dev/null; then
+    if ! read -r answer < "$TTY" 2> /dev/null; then
         # No terminal (an unattended run): only questions with a default can be answered.
         [ -n "$default" ] || die "No answer for \"$2\". Run the installer in a terminal, or preset the PLUSEMU_* answers."
     fi
@@ -320,6 +321,8 @@ EOF
 }
 
 # ---------------------------------------------------------------- steps
+
+check_local_ports() { die "check_local_ports is not implemented yet."; }
 
 preflight() { # preflight [free GB needed]
     [ "$(id -u)" -eq 0 ] || die "Please run this as root, with sudo."
@@ -783,7 +786,7 @@ EOF
     php artisan optimize
     chown -R www-data:www-data storage bootstrap/cache
     chgrp www-data "$env"
-    echo "* * * * * www-data cd $cms && php artisan schedule:run > /dev/null 2>&1" > /etc/cron.d/atom-cms
+    echo "* * * * * www-data cd $cms && php artisan schedule:run > /dev/null 2>&1" > "$CMS_CRON"
     cd /
     ok "Website installed (admin: $ADMIN_USER)"
 }
