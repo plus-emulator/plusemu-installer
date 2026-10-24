@@ -635,18 +635,7 @@ function Install-Toolchains {
     }
     Ok "$(& git --version)"
 
-    $node = Get-Command node -ErrorAction SilentlyContinue
-    if (-not $node -or -not ((& node --version) -like "v$NodeMajor.*")) {
-        $base = "https://nodejs.org/dist/latest-v$NodeMajor.x"
-        $sums = (Invoke-WebRequest "$base/SHASUMS256.txt" -UseBasicParsing).Content -split "`n"
-        $line = $sums | Where-Object { $_ -match 'node-v[\d.]+-x64\.msi$' } | Select-Object -First 1
-        $hash, $file = $line -split '\s+'
-        Download "$base/$file" "$Downloads\$file"
-        if ((Get-FileHash "$Downloads\$file" -Algorithm SHA256).Hash -ne $hash.ToUpper()) { throw 'The Node.js download is damaged. Run the installer again.' }
-        Install-Msi "$Downloads\$file"
-        Update-Path
-    }
-    Ok "Node.js $(& node --version)"
+    Install-NodeJs
 
     if (-not (Test-Path "$PhpDir\php-cgi.exe")) {
         # PHP needs the Visual C++ runtime.
@@ -679,6 +668,21 @@ function Install-Toolchains {
         Set-Content "$PhpDir\composer.bat" "@php `"%~dp0composer.phar`" %*" -Encoding ASCII
     }
     Ok 'Composer'
+}
+
+function Install-NodeJs {
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $node -or -not ((& node --version) -like "v$NodeMajor.*")) {
+        $base = "https://nodejs.org/dist/latest-v$NodeMajor.x"
+        $sums = (Invoke-WebRequest "$base/SHASUMS256.txt" -UseBasicParsing).Content -split "`n"
+        $line = $sums | Where-Object { $_ -match 'node-v[\d.]+-x64\.msi$' } | Select-Object -First 1
+        $hash, $file = $line -split '\s+'
+        Download "$base/$file" "$Downloads\$file"
+        if ((Get-FileHash "$Downloads\$file" -Algorithm SHA256).Hash -ne $hash.ToUpper()) { throw 'The Node.js download is damaged. Run the installer again.' }
+        Install-Msi "$Downloads\$file"
+        Update-Path
+    }
+    Ok "Node.js $(& node --version)"
 }
 
 function Install-Database {
