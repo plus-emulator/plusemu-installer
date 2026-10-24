@@ -2,7 +2,7 @@
     "distObfuscationEnabled": false,
     "secureAssetsEnabled": false,
     "secureApiEnabled": false,
-    "apiBaseUrl": "https://{{DOMAIN}}",
+    "apiBaseUrl": "{{SITE_URL}}",
     "plainConfigBaseUrl": "",
-    "plainGamedataBaseUrl": "https://{{DOMAIN}}/hotel-files/gamedata/"
+    "plainGamedataBaseUrl": "{{SITE_URL}}/hotel-files/gamedata/"
 }

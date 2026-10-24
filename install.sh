@@ -152,7 +152,7 @@ render() { # render <template> <output> [certificate fragment]: replace {{KEY}} 
     if [ -n "${3-}" ]; then certificate_steps=$(< "$3"); fi
     content=${content//"{{CERTIFICATE_STEPS}}"/"$certificate_steps"}
     # The fragments come first, so the placeholders inside them are filled too.
-    for key in CLOUDFLARE_STATUS MANUAL_START MANUAL_END GUIDE_INTRO GAME_ADDRESS_ITEM DOMAIN SOCKET_URL FURNIDATA_URL SERVER_IP WS_HOST HOTEL_NAME ADMIN_USER ADMIN_EMAIL \
+    for key in CLOUDFLARE_STATUS MANUAL_START MANUAL_END GUIDE_INTRO GAME_ADDRESS_ITEM DOMAIN SITE_URL SOCKET_URL FURNIDATA_URL SERVER_IP WS_HOST HOTEL_NAME ADMIN_USER ADMIN_EMAIL \
         CREDENTIALS_FILE RESTART_COMMAND LOG_COMMAND WS_DNS_ROW GUIDE_MODE_TITLE GUIDE_MODE_DETAILS CERTIFICATE_EXPIRES CLOUDFLARE_ERROR_HTML; do
         content=${content//"{{$key}}"/${!key-}}
     done
@@ -511,10 +511,11 @@ ask_questions() {
 
 # shellcheck disable=SC2034 # the {{KEY}} values are read by render() through ${!key}
 derive_settings() {
-    local rest=${WS_URL#wss://}
+    local rest=${WS_URL#*://}
     WS_HOST=${rest%%/*}
     WS_PATH=/${rest#*/}
     [ "$rest" != "$WS_HOST" ] || WS_PATH=/
+    SITE_URL=https://$DOMAIN
     SOCKET_URL=$WS_URL
     SERVER_IP=$(curl -4 -fsS --max-time 5 https://api.ipify.org || curl -4 -fsS --max-time 5 https://ipv4.icanhazip.com || hostname -I | awk '{print $1}')
     SERVER_IP=$(printf '%s' "$SERVER_IP" | tr -d '[:space:]')
@@ -622,7 +623,7 @@ write_client_config() { # write_client_config [dir]
     # Newer emulators build FurnitureData.json from the furniture table; older ones need the static file.
     FURNIDATA_URL='${gamedata.url}/FurnitureData.json?t=%timestamp%'
     if curl -fsS -o /dev/null http://127.0.0.1:8080/api/gamedata/furnidata; then
-        FURNIDATA_URL="https://$DOMAIN/api/gamedata/furnidata"
+        FURNIDATA_URL="$SITE_URL/api/gamedata/furnidata"
     fi
     local config=${1:-$HOTEL_ROOT/client/configuration} file
     for file in renderer-config.json ui-config.json client-mode.json; do
@@ -727,7 +728,7 @@ install_cms() {
     set_env "$env" APP_NAME "$HOTEL_NAME"
     set_env "$env" APP_ENV production
     set_env "$env" APP_DEBUG false
-    set_env "$env" APP_URL "https://$DOMAIN"
+    set_env "$env" APP_URL "$SITE_URL"
     set_env "$env" LOG_LEVEL warning
     set_env "$env" DB_CONNECTION mariadb
     set_env "$env" DB_HOST 127.0.0.1
@@ -737,7 +738,7 @@ install_cms() {
     set_env "$env" DB_PASSWORD "$DB_PASSWORD"
     set_env "$env" EMULATOR_DRIVER plus
     set_env "$env" CLIENT_NITRO_ENABLED true
-    set_env "$env" NITRO_CLIENT_PATH "https://$DOMAIN/client"
+    set_env "$env" NITRO_CLIENT_PATH "$SITE_URL/client"
     set_env "$env" RCON_HOST 127.0.0.1
     set_env "$env" RCON_PORT 30001
     set_env "$env" FORCE_HTTPS true
@@ -770,11 +771,11 @@ PHP
     fi
     sql plus <<EOF
 UPDATE website_settings SET value = CASE \`key\`
-    WHEN 'nitro_path' THEN 'https://$DOMAIN/client'
+    WHEN 'nitro_path' THEN '$SITE_URL/client'
     WHEN 'rcon_ip' THEN '127.0.0.1'
     WHEN 'rcon_port' THEN '30001'
-    WHEN 'badges_path' THEN 'https://$DOMAIN/hotel-files/c_images/album1584'
-    WHEN 'furniture_icons_path' THEN 'https://$DOMAIN/hotel-files/c_images/hof_furni/icons'
+    WHEN 'badges_path' THEN '$SITE_URL/hotel-files/c_images/album1584'
+    WHEN 'furniture_icons_path' THEN '$SITE_URL/hotel-files/c_images/hof_furni/icons'
     ELSE value END
 WHERE \`key\` IN ('nitro_path', 'rcon_ip', 'rcon_port', 'badges_path', 'furniture_icons_path');
 EOF
@@ -932,7 +933,7 @@ EOF
 ws_location() { # the nginx block that hands the game connection to the emulator
     cat <<EOF
     location = $WS_PATH {
-        if (\$http_origin != "https://$DOMAIN") { return 403; }
+        if (\$http_origin != "$SITE_URL") { return 403; }
         limit_conn plusemu_ws 20;
         proxy_pass http://127.0.0.1:2096;
         proxy_http_version 1.1;
@@ -1117,7 +1118,7 @@ EOF
     nginx -t
     systemctl enable --now "php$PHP-fpm" nginx
     systemctl reload nginx
-    ok "nginx serves https://$DOMAIN"
+    ok "nginx serves $SITE_URL"
     configure_firewall
 }
 
