@@ -37,6 +37,8 @@ BACKUP_ROOT=/var/backups/plusemu
 KEEP_BACKUPS=3
 LOCK_FILE=/run/plusemu-update.lock
 SSHD_DROPIN=/etc/ssh/sshd_config.d/10-plusemu.conf
+LOGROTATE_CONF=/etc/logrotate.d/plusemu
+JOURNALD_DROPIN=/etc/systemd/journald.conf.d/90-plusemu.conf
 MODE=install
 PHP=8.5
 NODE_MAJOR=22
@@ -1046,11 +1048,68 @@ EOF
     ok "Security updates install every day at 05:00 server time; the server restarts only when an update needs it"
 }
 
+tune_network() {
+    # Only raise the queues for new connections; a bigger server may already have more.
+    local backlog somaxconn
+    backlog=$(sysctl -n net.ipv4.tcp_max_syn_backlog 2> /dev/null || true)
+    somaxconn=$(sysctl -n net.core.somaxconn 2> /dev/null || true)
+    if ! [[ $backlog =~ ^[0-9]+$ ]] || [ "$backlog" -lt 4096 ]; then backlog=4096; fi
+    if ! [[ $somaxconn =~ ^[0-9]+$ ]] || [ "$somaxconn" -lt 4096 ]; then somaxconn=4096; fi
+    cat > /etc/sysctl.d/90-plusemu.conf <<EOF
+# Written by the PlusEMU installer: survive floods of new connections.
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_syn_backlog = $backlog
+net.core.somaxconn = $somaxconn
+net.ipv4.tcp_fin_timeout = 15
+EOF
+    if sysctl --system; then
+        ok "Network settings for floods of new connections (/etc/sysctl.d/90-plusemu.conf)"
+    else
+        say "      ${yellow}Some network settings could not be applied (this happens in some containers). See $LOG.${reset}"
+    fi
+}
+
+rotate_logs() {
+    cat > "$LOGROTATE_CONF" <<EOF
+# Written by the PlusEMU installer.
+/var/log/plusemu-*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 600 root root
+}
+
+$HOTEL_ROOT/cms/storage/logs/laravel.log {
+    su www-data www-data
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+    # The emulator logs to the journal. A rerun leaves the journal running when nothing changed.
+    local journal=$'[Journal]\nSystemMaxUse=1G\nMaxRetentionSec=14day'
+    if [ "$(cat "$JOURNALD_DROPIN" 2> /dev/null)" != "$journal" ]; then
+        mkdir -p "$(dirname "$JOURNALD_DROPIN")"
+        printf '%s\n' "$journal" > "$JOURNALD_DROPIN"
+        systemctl restart systemd-journald
+    fi
+    ok "Logs are kept for 14 days (the system journal uses at most 1 GB)"
+}
+
 secure_server() {
-    step "Securing the server (SSH, failed logins and security updates)"
+    step "Securing the server (SSH, failed logins, updates, network and logs)"
     protect_ssh_logins
     harden_ssh
     install_security_updates
+    tune_network
+    rotate_logs
 }
 
 # shellcheck disable=SC2034 # the {{KEY}} values are read by render() through ${!key}

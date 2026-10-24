@@ -54,6 +54,7 @@ $StateFile  = "$StateDir\hotel.json"
 $VersionsFile  = Join-Path $StateDir 'versions.json'
 $BackupRoot    = Join-Path $StateDir 'backups'
 $UpdateCommand = Join-Path $StateDir 'plusemu-update.ps1'
+$CleanupScript = Join-Path $StateDir 'plusemu-cleanup.ps1'
 $UpdateLog     = Join-Path $StateDir 'update.log'
 $LockFile      = Join-Path $StateDir 'update.lock'
 $KeepBackups   = 3
@@ -993,8 +994,23 @@ function Set-WindowsUpdates {
     Ok 'Windows updates install every day at 05:00; the server restarts only when an update needs it'
 }
 
+# The emulator's service log, the website log and the IIS logs are removed after 14 days.
+function Set-LogCleanup {
+    Write-Utf8 $CleanupScript @"
+# Installed by the PlusEMU installer. The "PlusEMU log cleanup" task runs this every day.
+`$limit = (Get-Date).AddDays(-14)
+foreach (`$pattern in '$HotelRoot\emulator\service\*.log', '$HotelRoot\cms\storage\logs\*.log', "`$env:SystemDrive\inetpub\logs\LogFiles\*\*.log") {
+    Get-ChildItem `$pattern -File -ErrorAction SilentlyContinue | Where-Object LastWriteTime -lt `$limit | Remove-Item -Force -ErrorAction SilentlyContinue
+}
+"@
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$CleanupScript`""
+    $trigger = New-ScheduledTaskTrigger -Daily -At '03:30'
+    Register-ScheduledTask -TaskName 'PlusEMU log cleanup' -Action $action -Trigger $trigger -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+    Ok 'Logs older than 14 days are removed every day at 03:30 (task: PlusEMU log cleanup)'
+}
+
 function Protect-Server {
-    Step 'Securing the server (failed logins and Windows updates)'
+    Step 'Securing the server (failed logins, Windows updates and logs)'
     # A domain controller would apply this to the whole domain, so its own policy is left alone.
     if ((Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4) {
         Say '      This server is a domain controller: the account lockout policy was left as it is.' 'Yellow'
@@ -1008,6 +1024,7 @@ function Protect-Server {
         Ok 'An account locks for 10 minutes after 10 wrong passwords in 10 minutes (RDP and SSH were not opened or changed)'
     }
     Set-WindowsUpdates
+    Set-LogCleanup
 }
 
 function Write-Guide {

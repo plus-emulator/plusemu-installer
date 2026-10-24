@@ -100,4 +100,29 @@ rm -f "$SSHD_DROPIN"
     [ ! -e "$SSHD_DROPIN" ] && [ "$SSH_PASSWORDS" = none ]
 )
 
+# ---------------------------------------------------------------- logs
+
+LOGROTATE_CONF=$TEST_DIR/logrotate.d/plusemu
+JOURNALD_DROPIN=$TEST_DIR/journald.conf.d/90-plusemu.conf
+HOTEL_ROOT=$TEST_DIR/hotel
+mkdir -p "$(dirname "$LOGROTATE_CONF")"
+
+# The first run writes the journal limits and restarts the journal.
+: > "$TEST_DIR/calls"
+rotate_logs
+grep -qx 'SystemMaxUse=1G' "$JOURNALD_DROPIN"
+grep -q '/var/log/plusemu-\*.log' "$LOGROTATE_CONF"
+expect_call 'systemctl restart systemd-journald'
+
+# A rerun leaves the journal running under the emulator.
+: > "$TEST_DIR/calls"
+rotate_logs
+expect_no_call 'systemctl restart systemd-journald'
+
+# Changed limits are written again and the journal restarts.
+echo 'SystemMaxUse=4G' >> "$JOURNALD_DROPIN"
+rotate_logs
+expect_call 'systemctl restart systemd-journald'
+[ "$(grep -c SystemMaxUse "$JOURNALD_DROPIN")" = 1 ]
+
 printf 'Bash hardening checks passed\n' >&4
