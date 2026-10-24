@@ -60,6 +60,8 @@ $BackupScript  = Join-Path $StateDir 'plusemu-backup.ps1'
 $BackupLog     = Join-Path $StateDir 'backup.log'
 $KeepNightly   = 7
 $BackupLockWait = 3600
+$CloudflareScript = Join-Path $StateDir 'plusemu-cloudflare-ips.ps1'
+$CloudflareLog  = Join-Path $StateDir 'cloudflare-ips.log'
 $UpdateLog     = Join-Path $StateDir 'update.log'
 $LockFile      = Join-Path $StateDir 'update.lock'
 $KeepBackups   = 3
@@ -761,7 +763,7 @@ function Install-Cms {
     Push-Location $cms
     if (-not (Test-Path $envFile)) { Copy-Item .env.example $envFile }
     # Laravel trusts the visitor address Cloudflare forwards, but only from Cloudflare itself.
-    $cloudflare = try { ((Invoke-WebRequest 'https://www.cloudflare.com/ips-v4' -UseBasicParsing).Content.Trim() -split '\s+') + ((Invoke-WebRequest 'https://www.cloudflare.com/ips-v6' -UseBasicParsing).Content.Trim() -split '\s+') }
+    $cloudflare = try { Get-CloudflareRanges }
     catch {
         @('173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20',
           '188.114.96.0/20', '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13', '104.24.0.0/14', '172.64.0.0/13',
@@ -935,12 +937,68 @@ function Set-IisSite {
     if ((Get-WebAppPoolState -Name $pool).Value -eq 'Started') { Restart-WebAppPool -Name $pool } else { Start-WebAppPool -Name $pool }
     Ok "IIS serves https://$domain"
 
+    # A new rule lets every address in until Update-CloudflareFirewall has limited it to Cloudflare.
     foreach ($port in 80, 443) {
         if (-not (Get-NetFirewallRule -Name "PlusEMU-$port" -ErrorAction SilentlyContinue)) {
             New-NetFirewallRule -Name "PlusEMU-$port" -DisplayName "Hotel website (TCP $port)" -Direction Inbound -Protocol TCP -LocalPort $port -Action Allow | Out-Null
         }
     }
     Ok 'Firewall allows HTTP and HTTPS (the database and emulator stay private)'
+    Write-CloudflareCommand
+    try {
+        Update-CloudflareFirewall
+        Ok "HTTP and HTTPS are accepted only from Cloudflare's addresses, refreshed every Sunday at 03:00 (task: PlusEMU Cloudflare addresses)"
+    } catch {
+        Write-Log "$_"
+        Say "      Could not download Cloudflare's addresses, so the website firewall was left as it is. Try again later: Start-ScheduledTask 'PlusEMU Cloudflare addresses'" 'Yellow'
+    }
+}
+
+# Cloudflare's published address ranges. Throws unless both lists download and every entry is a range of the right kind.
+function Get-CloudflareRanges {
+    $ranges = @()
+    foreach ($version in 4, 6) {
+        $text = (Invoke-WebRequest "https://www.cloudflare.com/ips-v$version" -UseBasicParsing -TimeoutSec 20).Content
+        $list = @("$text" -split '\s+' | Where-Object { $_ })
+        if (-not $list) { throw "Cloudflare's IPv$version list is empty." }
+        $shape = if ($version -eq 4) { '^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$' } else { '^[0-9a-fA-F:]*:[0-9a-fA-F:]*/\d{1,3}$' }
+        $bits = if ($version -eq 4) { 32 } else { 128 }
+        foreach ($range in $list) {
+            $address = $null
+            $parts = $range -split '/'
+            if ($range -notmatch $shape -or -not [Net.IPAddress]::TryParse($parts[0], [ref]$address) -or [int]$parts[1] -gt $bits) {
+                throw "Cloudflare's IPv$version list has an entry that is not an address range: $range"
+            }
+        }
+        $ranges += $list
+    }
+    return $ranges
+}
+
+# Lets only Cloudflare reach the website. Nothing changes unless both lists downloaded and passed the checks.
+function Update-CloudflareFirewall {
+    $ranges = Get-CloudflareRanges
+    foreach ($port in 80, 443) { Set-NetFirewallRule -Name "PlusEMU-$port" -RemoteAddress $ranges -ErrorAction Stop }
+    # IIS adds its own rules that let every address in, and any one allow rule is enough for Windows.
+    Disable-NetFirewallRule -Name 'IIS-WebServerRole-HTTP-In-TCP', 'IIS-WebServerRole-HTTPS-In-TCP' -ErrorAction SilentlyContinue
+    Write-Log "$(Get-Date -Format s) The website accepts only Cloudflare's $($ranges.Count) address ranges."
+}
+
+# Writes plusemu-cloudflare-ips.ps1 from the installer's own functions and runs it every Sunday at 03:00.
+function Write-CloudflareCommand {
+    $text = "# Installed by the PlusEMU installer. The `"PlusEMU Cloudflare addresses`" task runs this every Sunday at 03:00.`r`n"
+    $text += "`$ErrorActionPreference = 'Stop'`r`n"
+    $text += "`$ProgressPreference = 'SilentlyContinue'`r`n"
+    $text += "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12`r`n"
+    $text += "`$script:Log = '$CloudflareLog'`r`n"
+    foreach ($name in 'Write-Log', 'Get-CloudflareRanges', 'Update-CloudflareFirewall') {
+        $text += "function $name {$((Get-Item "function:$name").Definition)}`r`n"
+    }
+    $text += "try { Update-CloudflareFirewall } catch { Write-Log `"`$(Get-Date -Format s) Cloudflare's addresses were not updated, so the firewall was left as it is: `$_`"; exit 1 }`r`n"
+    Write-Utf8 $CloudflareScript $text
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$CloudflareScript`""
+    $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At '03:00'
+    Register-ScheduledTask -TaskName 'PlusEMU Cloudflare addresses' -Action $action -Trigger $trigger -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
 }
 
 # Per-visitor limits and security headers for the hotel site.

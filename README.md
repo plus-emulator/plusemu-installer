@@ -128,7 +128,7 @@ Every step is logged. If a step fails, the installer shows the last lines of the
 - IIS with URL Rewrite, the reverse proxy and WebSockets
 - MariaDB 11.4
 - The emulator as the `PlusEMU` Windows service
-- Windows Firewall rules for the website
+- Windows Firewall rules for the website: HTTP and HTTPS are accepted only from Cloudflare's addresses, so nobody can go around Cloudflare to reach the hotel. Windows needs no open HTTP port, because the setup guide is a file on the desktop. The *PlusEMU Cloudflare addresses* task updates the addresses every Sunday at 03:00. When a download fails, it changes nothing. If the download fails during a new install, the website stays open to every address until the next successful run, and the installer says so. The installer turns off the *World Wide Web Services* rules that IIS adds, because they let every address in. A rule that you add yourself for ports 80 or 443 also lets every address in.
 - An account lockout policy: an account locks for 10 minutes after 10 wrong passwords in 10 minutes, the default of new Windows versions. A lower limit would let an attacker keep the built-in Administrator locked out. RDP and SSH are not opened or changed.
 - The *PlusEMU log cleanup* task removes emulator, website and IIS logs older than 14 days, every day at 03:30. Windows has SYN flood protection built in and has no settings for it, so the installer changes nothing there.
 - The *PlusEMU nightly backup* task makes the nightly backup at 04:00 (see [Nightly backups](#nightly-backups)).
@@ -151,6 +151,8 @@ The pages the installer generates, such as the setup guide and the client config
 | Nightly backups | `/var/backups/plusemu/nightly` | `C:\ProgramData\PlusEMU\backups\nightly` |
 | Backup log | `/var/log/plusemu-backup.log` | `C:\ProgramData\PlusEMU\backup.log` |
 | Make a backup now | `sudo plusemu-backup` | `Start-ScheduledTask 'PlusEMU nightly backup'` |
+| Cloudflare address log | `/var/log/plusemu-cloudflare-ips.log` | `C:\ProgramData\PlusEMU\cloudflare-ips.log` |
+| Refresh Cloudflare's addresses now | `sudo plusemu-cloudflare-ips` | `Start-ScheduledTask 'PlusEMU Cloudflare addresses'` |
 | Restart the emulator | `sudo systemctl restart plusemu` | `Restart-Service PlusEMU` |
 | Watch the emulator log | `sudo journalctl -u plusemu -f` | `Get-Content C:\Hotel\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 50 -Wait` |
 
