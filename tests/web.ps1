@@ -88,6 +88,25 @@ try {
     Expect-Config "$websocket/serverVariables|.|name=HTTP_X_REAL_IP;value={HTTP_CF_CONNECTING_IP}"
     Expect-Config "$websocket/conditions|.|input={HTTP_ORIGIN};pattern=^https://example\.com$"
     Expect-Config "$websocket/action|url|http://127.0.0.1:2096/"
+
+    # A local install removes IIS's own welcome site, which answers on every address. A site the owner changed stays.
+    $script:state = [pscustomobject]@{ Domain = 'localhost'; WsUrl = 'ws://localhost/ws'; Local = $true }
+    $WsHost = 'localhost'; $WsPath = 'ws'
+    $script:DefaultSite = [pscustomobject]@{ Name = 'Default Web Site'; physicalPath = '%SystemDrive%\inetpub\wwwroot'
+        bindings = [pscustomobject]@{ Collection = @([pscustomobject]@{ protocol = 'http'; bindingInformation = '*:80:' }) } }
+    function Get-Website($Name) { if ($Name -eq 'Default Web Site') { return $script:DefaultSite } }
+    Reset-Iis
+    Set-IisSite *> $null
+    Assert ($script:Calls -contains 'Remove-Website Default Web Site') "IIS's welcome site stays open: $($script:Calls -join '; ')"
+    $script:DefaultSite.physicalPath = 'C:\sites\mine'
+    Reset-Iis
+    Set-IisSite *> $null
+    Assert ($script:Calls -notcontains 'Remove-Website Default Web Site') 'A site the owner changed was removed'
+    $script:DefaultSite.physicalPath = '%SystemDrive%\inetpub\wwwroot'
+    $script:DefaultSite.bindings.Collection += [pscustomobject]@{ protocol = 'http'; bindingInformation = '*:8081:' }
+    Reset-Iis
+    Set-IisSite *> $null
+    Assert ($script:Calls -notcontains 'Remove-Website Default Web Site') 'A site with the owner''s own binding was removed'
     Write-Host 'PowerShell web server checks passed'
 } finally {
     Remove-Item $testDir -Recurse -Force
