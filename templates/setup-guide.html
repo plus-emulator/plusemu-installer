@@ -34,6 +34,9 @@
     details { margin: 10px 0; }
     summary { cursor: pointer; font-weight: 600; }
     h3 { margin: 18px 0 6px; font-size: 17px; }
+    .connected { border-left: 6px solid var(--ok); }
+    .connected h2 { margin-top: 0; color: var(--ok); }
+    details.manual > summary { font-size: 18px; }
     @media (max-width: 520px) {
         main { padding: 20px 12px 60px; }
         .card { padding: 18px 16px; }
@@ -49,8 +52,10 @@
     <h1>🎉 {{HOTEL_NAME}} is installed!</h1>
     <p>{{GUIDE_MODE_TITLE}} setup guide</p>
     <p>Your emulator, game client and website are running on this server.<br>
-       Now connect <b>{{DOMAIN}}</b> through Cloudflare and install its origin certificate.</p>
+       {{GUIDE_INTRO}}</p>
 </header>
+
+{{CLOUDFLARE_STATUS}}
 
 {{GUIDE_MODE_DETAILS}}
 
@@ -63,6 +68,7 @@
     Cloudflare has a free plan. Its proxy protects website traffic and provides HTTPS for visitors. The steps below also secure the connection to your server.
 </div>
 
+{{MANUAL_START}}
 <div class="card step">
     <div class="num">1</div>
     <div>
@@ -91,8 +97,64 @@
     </div>
 </div>
 
-<div class="card step">
+<div class="card step" id="connect-cloudflare-automatically">
     <div class="num">3</div>
+    <div>
+        <h2>Connect Cloudflare automatically</h2>
+        <p>The installer can set up Cloudflare for you: the DNS records, the origin certificate, Full (strict) and extra protection. You give it an <b>API token</b>: a key that lets it change only the settings of <code>{{DOMAIN}}</code>. This takes about 5 minutes. If you skip it, follow steps 4 to 6 by hand.</p>
+
+        <h3>A. Before you start</h3>
+        <p>Do steps 1 and 2 first: add <code>{{DOMAIN}}</code> to Cloudflare on the <b>Free</b> plan and change the nameservers where you bought the domain. Wait until Cloudflare shows <b>Active</b> next to your domain on the <b>Account home</b> page. Cloudflare also sends you an email.</p>
+
+        <h3>B. Create the token</h3>
+        <ol>
+            <li>In the <a href="https://dash.cloudflare.com" target="_blank" rel="noopener">Cloudflare dashboard</a>, click the <b>profile icon</b> at the top right, then <b>My Profile</b>.</li>
+            <li>On the left, click <b>API Tokens</b>. Click <b>Create Token</b>.</li>
+            <li>At the bottom, next to <b>Create Custom Token</b>, click <b>Get started</b>.</li>
+            <li>Under <b>Token name</b>, type <code>PlusEMU installer</code>.</li>
+            <li>Under <b>Permissions</b>, add these 6 rows. Choose the three menus of each row from left to right. Click <b>+ Add more</b> for the next row.
+                <table>
+                    <tr><th>First menu</th><th>Second menu</th><th>Third menu</th></tr>
+                    <tr><td>Zone</td><td>Zone</td><td>Read</td></tr>
+                    <tr><td>Zone</td><td>DNS</td><td>Edit</td></tr>
+                    <tr><td>Zone</td><td>SSL and Certificates</td><td>Edit</td></tr>
+                    <tr><td>Zone</td><td>Zone Settings</td><td>Edit</td></tr>
+                    <tr><td>Zone</td><td>Zone WAF</td><td>Edit</td></tr>
+                    <tr><td>Zone</td><td>Bot Management</td><td>Edit</td></tr>
+                </table>
+            </li>
+            <li>Under <b>Zone Resources</b>, choose <b>Include</b>, then <b>Specific zone</b>, then <code>{{DOMAIN}}</code>.</li>
+            <li>Leave <b>Client IP Address Filtering</b> and <b>TTL</b> as they are. Click <b>Continue to summary</b>, then <b>Create Token</b>.</li>
+            <li>Click <b>Copy</b> next to the token. Cloudflare shows it only once. Keep that page open until the installer has accepted the token.</li>
+        </ol>
+
+        <h3>C. Paste it into the installer</h3>
+        <p>Go back to the installer window. It asks: <i>Paste your Cloudflare API token, or press Enter to skip and follow the manual steps in the guide.</i> Paste the token and press <b>Enter</b>. On Linux, paste with a right-click or <b>Ctrl+Shift+V</b>; in PowerShell, with a right-click. Nothing appears while you paste. This is normal: the token stays hidden.</p>
+        <p>The installer uses the token only while it runs. It never saves the token in a file, a log or this guide. When the installer says that Cloudflare is connected, you can delete the token: on the <b>API Tokens</b> page, click <b>⋯</b> next to <code>PlusEMU installer</code>, then <b>Delete</b>.</p>
+        <p>Did the installer already finish? Run it again with the same command. It keeps your hotel and asks for the token again.</p>
+
+        <h3>D. What the installer does with the token</h3>
+        <ul>
+            <li>Adds or updates the <b>A</b> records for <code>{{DOMAIN}}</code>{{GAME_ADDRESS_ITEM}} and <code>www.{{DOMAIN}}</code>, pointing to <code>{{SERVER_IP}}</code>, proxied. It changes no other records.</li>
+            <li>Requests a Cloudflare <b>Origin CA certificate</b> for <code>{{DOMAIN}}</code> and <code>*.{{DOMAIN}}</code>, valid for 15 years. The private key is made on this server and never leaves it. The installer checks the certificate before it replaces the temporary one. On Windows, it also adds Cloudflare's Origin CA root certificate to the trusted root certificates, so Windows accepts the new certificate.</li>
+            <li>Turns on <b>Full (strict)</b>, <b>Always Use HTTPS</b>, TLS 1.2 or newer, <b>WebSockets</b>, <b>Browser Integrity Check</b>, security level <b>medium</b> and <b>Bot Fight Mode</b>. When <b>I'm Under Attack</b> mode is on, it stays on.</li>
+            <li>Adds a <b>rate limiting rule</b>: 10 requests per 10 seconds per visitor to the sign-in, registration and password reset pages. Over the limit, Cloudflare blocks that visitor for 10 seconds. The Free plan allows one such rule.</li>
+            <li>Adds two <b>custom rules</b>: the game connection works only from <code>https://{{DOMAIN}}</code>, and visitors to housekeeping get a Cloudflare check first.</li>
+        </ul>
+        <p>Running it again is safe: it updates its own records and rules instead of adding copies.</p>
+
+        <h3>E. Check it afterwards</h3>
+        <p>Reload this guide. A green box at the top lists what was set up. Then follow step 7 to open your hotel.</p>
+        <p>If a step fails, the installer names the step and the missing permission, and this guide shows the reason at the top. Add the permission to the token (<b>API Tokens → Edit</b>) and try again, or follow steps 4 to 6 by hand.</p>
+    </div>
+</div>
+
+<div class="card">
+    <b>Did the installer connect Cloudflare?</b> Then skip steps 4 to 6 and go to step 7. Otherwise, follow steps 4 to 6 to set up Cloudflare by hand.
+</div>
+
+<div class="card step">
+    <div class="num">4</div>
     <div>
         <h2>Add your DNS records</h2>
         <p>In Cloudflare, open your domain and go to <b>DNS → Records</b>.</p>
@@ -111,7 +173,7 @@
 </div>
 
 <div class="card step">
-    <div class="num">4</div>
+    <div class="num">5</div>
     <div>
         <h2>Install your Cloudflare origin certificate</h2>
         <p>The installer starts with a self-signed certificate. Replace it with a Cloudflare Origin CA certificate before enabling <b>Full (strict)</b>.</p>
@@ -125,7 +187,7 @@
 </div>
 
 <div class="card step">
-    <div class="num">5</div>
+    <div class="num">6</div>
     <div>
         <h2>Enable Full (strict)</h2>
         <ol>
@@ -137,9 +199,10 @@
         <p>If this Cloudflare zone also serves other websites, check their origin certificates before changing the zone-wide setting.</p>
     </div>
 </div>
+{{MANUAL_END}}
 
 <div class="card step">
-    <div class="num">6</div>
+    <div class="num">7</div>
     <div>
         <h2>Open your hotel</h2>
         <ol>
