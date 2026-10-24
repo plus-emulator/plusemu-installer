@@ -10,16 +10,18 @@ Set up a complete Habbo hotel on your own server with one command. The installer
 
 Everything runs on your server. Cloudflare sits in front of it to provide HTTPS and to hide your server's IP address.
 
+To try PlusEMU or to work on it on your own PC, use a [local install](#local-install) instead. It needs no domain and no Cloudflare.
+
 ## Requirements
 
 | | Linux | Windows |
 |---|---|---|
-| System | Debian 12/13 or Ubuntu 22.04/24.04/26.04 | Windows Server 2019/2022/2025 |
+| System | Debian 12/13 or Ubuntu 22.04/24.04/26.04 | Windows Server 2019/2022/2025 (Windows 10/11 for a [local install](#local-install)) |
 | Processor | 64-bit (x86_64 or arm64) | 64-bit |
 | Free disk space | 10 GB | 15 GB on `C:` |
 | Access | root (`sudo`) | PowerShell as Administrator |
 
-You also need:
+You also need (not for a [local install](#local-install)):
 
 - A domain name, for example `myhotel.com`
 - A free [Cloudflare](https://dash.cloudflare.com) account
@@ -50,11 +52,72 @@ The installer asks these questions. Press Enter to accept a suggested answer:
 6. A Discord webhook URL for health alerts (optional, press Enter to skip). See [Health check and Discord alerts](#health-check-and-discord-alerts).
 7. Only with the advanced guide on Linux: whether to install CrowdSec (default no). See [CrowdSec](#crowdsec-advanced-guide-linux).
 
-After you confirm, the installer runs on its own in about 10 minutes.
+After you confirm, the installer runs on its own in about 10 minutes. A [local install](#local-install) asks only questions 3 to 5.
+
+## Local install
+
+A local install puts the whole hotel on your own PC, to try PlusEMU or to develop on it. The hotel runs at `http://localhost`, and only this PC can open it. **It is not for a public hotel:** it has no HTTPS, no Cloudflare and no server protection.
+
+**Linux** (Debian 12/13 or Ubuntu 22.04/24.04/26.04, desktop editions too), as root or with `sudo`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo env PLUSEMU_LOCAL=1 bash
+```
+
+With a downloaded script: `sudo bash install.sh --local`.
+
+**Windows 10 or 11** (Windows Server works too): open PowerShell as Administrator and run:
+
+```powershell
+$env:PLUSEMU_LOCAL = '1'
+irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.ps1 | iex
+Remove-Item Env:\PLUSEMU_LOCAL
+```
+
+With a downloaded script: `.\install.ps1 -Local`.
+
+The installer asks three questions. Press Enter to accept the suggested answer: the hotel name (`PlusEMU`), the admin username (`admin`) and the admin email (`admin@localhost.test`).
+
+Before it installs anything, it checks the ports the hotel needs: 80 (website), 3306 (MariaDB), 2096 (game), 8080 (emulator API) and 30001 (RCON). When another program uses one of them, the installer names the port and the program, stops and keeps no settings. Stop that program, for example another web server or database, and run the installer again. The hotel's own programs may use these ports, so a rerun works.
+
+What a local install sets up:
+
+- The website at `http://localhost`, housekeeping at `http://localhost/housekeeping`, and the game connection at `ws://localhost/ws` on the same web server. Every web address the installer writes into the website and client settings is `http://localhost`. The emulator talks to MariaDB and the website on `127.0.0.1`, as on a server.
+- nginx (Linux) listens on `127.0.0.1` and `[::1]` port 80 only. The IIS site (Windows) is bound to `127.0.0.1` and `[::1]` with the name `localhost` only, and your other IIS sites stay.
+- On Windows 10 and 11, IIS comes from the optional Windows features.
+- The emulator, the website and MariaDB, which start with the PC.
+- Log rotation for the hotel's own logs, the [nightly backup](#nightly-backups) at 04:00 (it runs when the PC is on) and the [health check](#health-check-and-discord-alerts) every 5 minutes, without Discord, the certificate check and the Cloudflare check.
+- `plusemu-update`, which works the same as on a server.
+- A short guide for this PC instead of the Cloudflare guide. Linux prints its address, `http://localhost/<token>/`. Windows opens it in your browser and saves *Hotel setup guide* on your desktop. The guide explains how to log in, open housekeeping, start, stop and update the hotel, see the logs and find the backups, and how to move to a server.
+
+What a local install does not do, so your PC stays as it is:
+
+- No HTTPS, no HSTS and no Cloudflare: no certificate, no Cloudflare API token step and no Cloudflare address list. HSTS on `localhost` would make the browser use HTTPS for every other project on your PC.
+- No firewall changes. Linux does not install or turn on `ufw`. Windows adds no firewall rules.
+- On Linux: no SSH changes, no fail2ban, no automatic security updates or restarts, no network (`sysctl`) settings, no system journal limits and no CrowdSec.
+- On Windows: no account lockout policy, no Windows Update policy and no change to the header timeout of Windows' web stack.
+- No per-visitor request limits. Every local visitor is `127.0.0.1`, so the limits would only block your own logins and test clients.
+- Your own Node.js stays as it is. The installer unpacks Node.js 22 into `/opt/plusemu-node` (Linux) or `C:\ProgramData\PlusEMU\node` (Windows) and uses it only while it runs.
+
+What it does install: nginx, MariaDB and PHP 8.5 on Linux (PHP 8.5 becomes the default `php` command), and IIS, MariaDB, PHP in `C:\PHP`, Git and Composer on Windows. It turns off nginx's own welcome page on Linux and IIS's own *Default Web Site* on Windows, because they answer on every address. A default site that you changed stays. Other nginx sites that listen on port 80 for every address no longer answer on `localhost`, because the hotel takes `127.0.0.1` and `::1`; the installer names them.
+
+The choice is saved with your settings, so reruns and `plusemu-update` keep it. The installer does not turn a local install into a server install, or a server install into a local one. It says so and changes nothing.
+
+**Move to a server later:** run the normal [install](#install) on your server, without `--local` or `-Local`. This makes a new hotel. To keep your users, rooms and furniture, copy `database.sql.gz` from a [nightly backup](#nightly-backups) on your PC to the server. On a Linux server, run this in the folder with the file:
+
+```bash
+sudo systemctl stop plusemu
+gunzip -c database.sql.gz | sudo mariadb plus
+sudo systemctl start plusemu
+```
+
+Then run the installer on the server once more. It writes the server's own addresses into the website settings. Your accounts keep the passwords they had on your PC.
 
 ### Choose the setup guide
 
 The **simple** guide is the default. The **advanced** guide includes a manual checklist for administrator access, firewall rules and maintenance. Both contain the full Cloudflare certificate generation and server import steps.
+
+A [local install](#local-install) has its own short guide and no guide choice.
 
 **This selects instructions only. Selecting this guide does not change SSH, RDP, firewall, updates or backups.** Both guides get the same server protection, described in [How it works](#how-it-works). The one extra is a question in the advanced guide on Linux: whether to install [CrowdSec](#crowdsec-advanced-guide-linux). It is off unless you answer yes.
 
@@ -78,7 +141,7 @@ The choice is saved with your existing installation settings and reused on rerun
 
 The installer generates passwords automatically and prints your initial admin login and database connection details, including the database password. On Windows it also prints the MariaDB root password. These passwords are saved before installation starts; the installer tells you where to retrieve them even if a later step fails. The final password summary is shown in the terminal, not written to the installer log or browser setup guide.
 
-It also shows you a **setup guide** with instructions for connecting your domain through Cloudflare and installing an origin certificate. The guide includes commands for your server's operating system and contains no passwords or private keys.
+It also shows you a **setup guide** with instructions for connecting your domain through Cloudflare and installing an origin certificate. A [local install](#local-install) gets a short guide for your PC instead. The guide includes commands for your server's operating system and contains no passwords or private keys.
 
 - **Linux:** open `http://<your server IP>/<token>/`. The installer prints the exact address. The token is random so that strangers can't find the page.
 - **Windows:** the guide opens in your browser. A copy named *Hotel setup guide* is saved on your desktop.
@@ -139,7 +202,7 @@ Every step is logged. If a step fails, the installer shows the last lines of the
 7. Installs the Atom CMS website and creates your admin account.
 8. Configures nginx and the firewall:
    - nginx starts with a temporary self-signed HTTPS certificate. The Cloudflare step or the setup guide replaces it with a Cloudflare Origin CA certificate for **Full (strict)**.
-   - It restores visitors' real IPs from Cloudflare and passes the game's WebSocket through to the emulator.
+   - It restores visitors' real IPs from Cloudflare and passes the game's WebSocket through to the emulator. The game connection carries the visitor's address in the `X-Real-IP` and `X-Forwarded-For` headers, because the emulator sees nginx as the peer.
    - It limits each visitor: 5 login, registration or password reset attempts per minute (plus a burst of 5), 30 housekeeping pages per minute (plus a burst of 20), 50 open requests and 20 game connections (many players can share one address, for example at a school). Over the limit, nginx answers 429. The game client and the hotel files have no limits.
    - It drops slow connections after 10 seconds and sends the `Strict-Transport-Security` and `Permissions-Policy` headers. `Strict-Transport-Security` covers the hotel domain only, not its subdomains.
    - The `ufw` firewall allows only SSH, HTTP and HTTPS. The database and the emulator stay private.
@@ -157,7 +220,7 @@ Every step is logged. If a step fails, the installer shows the last lines of the
 
 **Windows** (`install.ps1`) follows the same steps with Windows equivalents:
 
-- IIS with URL Rewrite, the reverse proxy and WebSockets
+- IIS with URL Rewrite, the reverse proxy and WebSockets. The game connection carries the visitor's address in the `X-Real-IP` header (from Cloudflare's `CF-Connecting-IP`), and the reverse proxy adds `X-Forwarded-For` without the port. On Windows 10 and 11, IIS comes from the optional Windows features.
 - MariaDB 11.4
 - The emulator as the `PlusEMU` Windows service
 - Windows Firewall rules for the website: HTTP and HTTPS are accepted only from Cloudflare's addresses, so nobody can go around Cloudflare to reach the hotel. Windows needs no open HTTP port, because the setup guide is a file on the desktop. The *PlusEMU Cloudflare addresses* task updates the addresses every Sunday at 03:00. When a download fails, it changes nothing. If the download fails during a new install, the website stays open to every address until the next successful run, and the installer says so. The installer turns off the *World Wide Web Services* rules that IIS adds, because they let every address in. A rule that you add yourself for ports 80 or 443 also lets every address in.
@@ -192,6 +255,10 @@ The pages the installer generates, such as the setup guide and the client config
 | Refresh Cloudflare's addresses now | `sudo plusemu-cloudflare-ips` | `Start-ScheduledTask 'PlusEMU Cloudflare addresses'` |
 | Restart the emulator | `sudo systemctl restart plusemu` | `Restart-Service PlusEMU` |
 | Watch the emulator log | `sudo journalctl -u plusemu -f` | `Get-Content C:\Hotel\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 50 -Wait` |
+| Setup guide | `/var/www/hotel/setup-guide/index.html`, at `http://<server IP>/<token>/` (local install: `http://localhost/<token>/`) | `C:\Hotel\setup-guide\index.html` and *Hotel setup guide* on the desktop |
+| Node.js of a local install | `/opt/plusemu-node` | `C:\ProgramData\PlusEMU\node` |
+
+A [local install](#local-install) has no Cloudflare address log and no Cloudflare refresh command.
 
 Only root (Linux) or Administrators (Windows) can read the file with passwords.
 
@@ -242,12 +309,12 @@ Every 5 minutes, the health check looks at your hotel (Linux: cron runs `/usr/lo
 - MariaDB answers.
 - The disk with the hotel has more than 2 GB free.
 - The newest nightly backup is younger than 36 hours. A new hotel has no backup before its first night, so this check waits for it.
-- The HTTPS certificate is valid for more than 30 more days (Linux: `/etc/ssl/plusemu/cert.pem`; Windows: the hotel's HTTPS binding).
-- The last Cloudflare address refresh worked and is younger than 8 days.
+- The HTTPS certificate is valid for more than 30 more days (Linux: `/etc/ssl/plusemu/cert.pem`; Windows: the hotel's HTTPS binding). Not on a [local install](#local-install).
+- The last Cloudflare address refresh worked and is younger than 8 days. Not on a local install.
 
 Each run writes its result to the health log (see [Files and everyday commands](#files-and-everyday-commands)). Run it by hand at any time with `sudo plusemu-health` on Linux, or `& C:\ProgramData\PlusEMU\plusemu-health.ps1` in Administrator PowerShell on Windows. The installer also runs it once at the end. While an update, a nightly backup or the installer runs, the check skips its run, because they stop or restart services on purpose.
 
-With a Discord webhook, you get one message when a check starts failing and one when it works again. The message says what failed in plain words and gives the command to look at it. You get no message while nothing changes. When Discord does not take a message, the next run tries again. Messages contain no passwords or tokens. To make a webhook in Discord, open your server's **Server Settings → Integrations → Webhooks → New Webhook**, choose the channel and click **Copy Webhook URL**. When you add a webhook, the installer sends one message so you see that alerts work. If that message fails, the installer says why and goes on.
+A local install has no Discord alerts; the result is in the health log only. With a Discord webhook, you get one message when a check starts failing and one when it works again. The message says what failed in plain words and gives the command to look at it. You get no message while nothing changes. When Discord does not take a message, the next run tries again. Messages contain no passwords or tokens. To make a webhook in Discord, open your server's **Server Settings → Integrations → Webhooks → New Webhook**, choose the channel and click **Copy Webhook URL**. When you add a webhook, the installer sends one message so you see that alerts work. If that message fails, the installer says why and goes on.
 
 The webhook is saved with your other settings (`DISCORD_WEBHOOK` in `/etc/plusemu/hotel.env` or `DiscordWebhook` in `C:\ProgramData\PlusEMU\hotel.json`), which only root or Administrators can read. It is never written to the installer log. Reruns keep it. To change it, run the installer again with the new URL; use `off` to turn alerts off:
 
@@ -415,11 +482,12 @@ To install without questions, set the answers in environment variables:
 
 | Variable | Meaning |
 |---|---|
-| `PLUSEMU_DOMAIN` | Hotel domain (required) |
+| `PLUSEMU_LOCAL=1` | [Local install](#local-install) on this PC at `http://localhost` (the same as `--local` or `-Local`). `PLUSEMU_LOCAL=0` asks for a server install. A saved install keeps its choice. |
+| `PLUSEMU_DOMAIN` | Hotel domain (required, except for a local install) |
 | `PLUSEMU_WS_URL` | WebSocket address (default `wss://<domain>/ws`) |
 | `PLUSEMU_HOTEL_NAME` | Hotel name |
 | `PLUSEMU_ADMIN_USER` | Admin username (default `admin`) |
-| `PLUSEMU_ADMIN_EMAIL` | Admin email (default `admin@<domain>`) |
+| `PLUSEMU_ADMIN_EMAIL` | Admin email (default `admin@<domain>`, or `admin@localhost.test` for a local install) |
 | `PLUSEMU_YES=1` | Skip the confirmation question |
 | `PLUSEMU_CLOUDFLARE_TOKEN` | Cloudflare API token for [Connect Cloudflare automatically](#connect-cloudflare-automatically). It is used once and never saved. Without it, `PLUSEMU_YES=1` skips that step. |
 
@@ -438,6 +506,8 @@ Advanced overrides:
 - **The installer stopped with an error:** read the log lines it printed, fix the cause, then run the command again. It continues where it stopped.
 - **Atom reports that the password needs a symbol:** rerun the current installer. It replaces an invalid saved admin password while CMS setup is incomplete and saves the replacement before retrying. Completed installations keep their existing admin password; database passwords are reused.
 - **Cloudflare errors 521, 522, 526, "too many redirects", or the client won't connect:** see *Something isn't working?* at the bottom of your setup guide.
+- **Local install: "The hotel needs ports that another program uses":** the message names the port and the program. Stop that program, for example with `sudo systemctl stop apache2` on Linux, or in *Services* on Windows, then run the installer again.
+- **Local install: "cannot turn it into a server install" (or "into a local install"):** an install keeps its choice. Use the server installer on a server, and the local installer on another PC.
 - **Still stuck:** ask on DevBest and include the installer log.
 
 ## Licence
