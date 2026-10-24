@@ -36,10 +36,11 @@ UPDATE_COMMAND=/usr/local/sbin/plusemu-update
 BACKUP_ROOT=/var/backups/plusemu
 KEEP_BACKUPS=3
 LOCK_FILE=/run/plusemu-update.lock
+SSHD_DROPIN=/etc/ssh/sshd_config.d/10-plusemu.conf
 MODE=install
 PHP=8.5
 NODE_MAJOR=22
-TOTAL_STEPS=9
+TOTAL_STEPS=10
 STEP=0
 
 # ---------------------------------------------------------------- output
@@ -413,7 +414,8 @@ install_packages() {
     step "Installing system packages (nginx, MariaDB, PHP $PHP)"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y ca-certificates curl git unzip jq gnupg openssl cron ufw nginx mariadb-server mariadb-client libicu-dev xz-utils
+    apt-get install -y ca-certificates curl git unzip jq gnupg openssl cron ufw nginx mariadb-server mariadb-client libicu-dev xz-utils \
+        fail2ban python3-systemd
     if ! apt-cache show "php$PHP-fpm" > /dev/null 2>&1; then
         # PHP 8.5 isn't in these releases yet: use the well-known Sury/Ondřej packages.
         if [ "$OS_ID" = ubuntu ]; then
@@ -900,6 +902,124 @@ EOF
     ok "Firewall on: only SSH, HTTP and HTTPS are open (the database and emulator stay private)"
 }
 
+# ---------------------------------------------------------------- server hardening
+
+sshd_installed() { command -v sshd > /dev/null; }
+
+session_sshd_pids() { # the sshd processes this run descends from
+    local pid=$$ comm
+    while [ "${pid:-0}" -gt 1 ]; do
+        comm=$(ps -o comm= -p "$pid" 2> /dev/null) || return 0
+        case $comm in sshd | sshd-session) printf '%s\n' "$pid" ;; esac
+        pid=$(ps -o ppid= -p "$pid" 2> /dev/null | tr -d ' ') || return 0
+    done
+}
+
+sshd_session_log() { # sshd_session_log <pid>: what sshd logged for that process
+    journalctl -q --no-pager -o cat "_PID=$1" 2> /dev/null || true
+    grep -h "sshd[a-z-]*\[$1\]:" /var/log/auth.log 2> /dev/null || true
+}
+
+ssh_login_used_key() { # the SSH login of this session was made with a key
+    local pid
+    if [[ ${SSH_AUTH_INFO_0:-} == publickey* ]]; then return 0; fi
+    for pid in $(session_sshd_pids); do
+        if [[ $(sshd_session_log "$pid") == *'Accepted publickey '* ]]; then return 0; fi
+    done
+    return 1
+}
+
+sudo_user() { # the account that ran sudo, unless it is root
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then printf '%s' "$SUDO_USER"; fi
+}
+
+sudo_user_has_keys() {
+    local user home
+    user=$(sudo_user)
+    [ -n "$user" ] || return 1
+    home=$(getent passwd "$user" | cut -d: -f6)
+    [ -n "$home" ] && grep -qE '^[^#[:space:]]' "$home/.ssh/authorized_keys" 2> /dev/null
+}
+
+harden_ssh() { # sets SSH_PASSWORDS to on, off or none
+    SSH_PASSWORDS=on
+    if ! sshd_installed; then
+        SSH_PASSWORDS=none
+        ok "No SSH server is installed; nothing to change"
+        return
+    fi
+    local previous='' root_keys=0
+    if [ -f "$SSHD_DROPIN" ]; then previous=$(< "$SSHD_DROPIN"); fi
+    # Password login only goes off when a key login is known to work, so the owner is never locked out.
+    if ssh_login_used_key || sudo_user_has_keys || [[ $previous == *'PasswordAuthentication no'* ]]; then
+        SSH_PASSWORDS=off
+        root_keys=1
+    elif [ -n "$(sudo_user)" ]; then
+        root_keys=1
+    fi
+    if [ "$root_keys" = 0 ]; then
+        say "      ${yellow}SSH password login stays on: this session did not log in with an SSH key. The setup guide explains how to turn it off.${reset}"
+        return
+    fi
+    mkdir -p "$(dirname "$SSHD_DROPIN")"
+    # sshd -t needs this folder, which only exists once the SSH service has started.
+    install -d -m 755 /run/sshd 2> /dev/null || true
+    {
+        echo "# Written by the PlusEMU installer. sshd uses the first value it reads, so this file sorts before the other drop-ins."
+        echo "PermitRootLogin prohibit-password"
+        if [ "$SSH_PASSWORDS" = off ]; then
+            echo "PasswordAuthentication no"
+            echo "KbdInteractiveAuthentication no"
+        fi
+    } > "$SSHD_DROPIN"
+    if ! sshd -t; then
+        if [ -n "$previous" ]; then printf '%s\n' "$previous" > "$SSHD_DROPIN"; else rm -f "$SSHD_DROPIN"; fi
+        SSH_PASSWORDS=on
+        say "      ${yellow}SSH was left as it is: sshd did not accept the new settings (see $LOG).${reset}"
+        return
+    fi
+    if ! systemctl try-reload-or-restart ssh.service; then
+        say "      ${yellow}The SSH service did not reload; the new SSH settings apply after a restart.${reset}"
+    fi
+    if [ "$SSH_PASSWORDS" = off ]; then
+        if [[ $(sshd -T 2> /dev/null) != *'passwordauthentication no'* ]]; then
+            SSH_PASSWORDS=on
+            say "      ${yellow}SSH password login stays on: another SSH setting turns it on. Check: sudo sshd -T | grep -i passwordauthentication${reset}"
+            return
+        fi
+        ok "SSH: key login only (password login is off, root may log in with a key only)"
+    else
+        ok "SSH: root may log in with a key only"
+        say "      ${yellow}SSH password login stays on: $(sudo_user) has no SSH key. The setup guide explains how to turn it off.${reset}"
+    fi
+}
+
+protect_ssh_logins() {
+    mkdir -p /etc/fail2ban/jail.d
+    cat > /etc/fail2ban/jail.d/plusemu.local <<'EOF'
+# Written by the PlusEMU installer. Bans an address for 1 hour after 5 failed SSH logins in 10 minutes.
+[sshd]
+enabled = true
+backend = systemd
+banaction = ufw
+maxretry = 5
+findtime = 10m
+bantime = 1h
+EOF
+    systemctl enable fail2ban
+    if systemctl restart fail2ban; then
+        ok "fail2ban bans an address for 1 hour after 5 failed SSH logins"
+    else
+        say "      ${yellow}fail2ban did not start. See: journalctl -u fail2ban -n 50${reset}"
+    fi
+}
+
+secure_server() {
+    step "Securing the server (SSH and failed logins)"
+    protect_ssh_logins
+    harden_ssh
+}
+
 # shellcheck disable=SC2034 # the {{KEY}} values are read by render() through ${!key}
 write_guide() {
     step "Writing your setup guide"
@@ -940,6 +1060,9 @@ finish() {
     say ""
     say "  Retrieve saved passwords: sudo cat $STATE_FILE"
     say "  Update the emulator and the client later with: sudo plusemu-update"
+    if [ "${SSH_PASSWORDS:-}" = on ]; then
+        say "  ${yellow}SSH password login is still on.${reset} To turn it off, add your SSH key, log in with it and run the installer again."
+    fi
     say "  Store passwords somewhere safe. Change the initial admin password after logging in;"
     say "  the saved file retains the initial password. Keep passwords out of shared logs and screenshots."
     say ""
@@ -1382,6 +1505,7 @@ main() {
     write_client_config
     install_cms
     configure_web
+    secure_server
     write_guide
     install_update_command
     finish

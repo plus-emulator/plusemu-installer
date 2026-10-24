@@ -113,7 +113,10 @@ Every step is logged. If a step fails, the installer shows the last lines of the
    - It limits each visitor: 5 login, registration or password reset attempts per minute (plus a burst of 5), 30 housekeeping pages per minute (plus a burst of 20), 50 open requests and 20 game connections (many players can share one address, for example at a school). Over the limit, nginx answers 429. The game client and the hotel files have no limits.
    - It drops slow connections after 10 seconds and sends the `Strict-Transport-Security` and `Permissions-Policy` headers. `Strict-Transport-Security` covers the hotel domain only, not its subdomains.
    - The `ufw` firewall allows only SSH, HTTP and HTTPS. The database and the emulator stay private.
-9. Writes your setup guide.
+9. Secures the server:
+   - `fail2ban` bans an address for 1 hour after 5 failed SSH logins in 10 minutes.
+   - SSH lets root log in with a key only. SSH password login goes off only when your login uses an SSH key (this session, or the account that ran `sudo` has a key in `~/.ssh/authorized_keys`). Otherwise password login stays on, and the installer says so. The settings are in `/etc/ssh/sshd_config.d/10-plusemu.conf`.
+10. Writes your setup guide.
 
 **Windows** (`install.ps1`) follows the same steps with Windows equivalents:
 
@@ -121,6 +124,10 @@ Every step is logged. If a step fails, the installer shows the last lines of the
 - MariaDB 11.4
 - The emulator as the `PlusEMU` Windows service
 - Windows Firewall rules for the website
+- An account lockout policy: an account locks for 10 minutes after 10 wrong passwords in 10 minutes, the default of new Windows versions. A lower limit would let an attacker keep the built-in Administrator locked out. RDP and SSH are not opened or changed.
+- The *PlusEMU log cleanup* task removes emulator, website and IIS logs older than 14 days, every day at 03:30. Windows has SYN flood protection built in and has no settings for it, so the installer changes nothing there.
+- The *PlusEMU nightly backup* task makes the nightly backup at 04:00 (see [Nightly backups](#nightly-backups)).
+- Windows Update installs updates every day at 05:00 and restarts the server only when an update needs it. Windows has no security-only updates, so all quality updates install. Driver updates are left out. The installer sets these Windows Update policies under `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU`: `NoAutoUpdate=0`, `AUOptions=4`, `ScheduledInstallDay=0`, `ScheduledInstallTime=5`, `AlwaysAutoRebootAtScheduledTime=1` and `AlwaysAutoRebootAtScheduledTimeMinutes=15`, plus `ExcludeWUDriversInQualityUpdate=1` one level up. A domain Group Policy can replace them.
 - IIS Dynamic IP Restrictions: each visitor gets at most 50 open requests and 1500 requests in 10 seconds, read from the address Cloudflare forwards. Over the limit, IIS answers 403. IIS cannot limit single pages, so the login limits come from Atom CMS itself (5 attempts per minute). Uploads are limited to 20 MB, and request headers must arrive within 10 seconds.
 - The `Strict-Transport-Security` header (for the hotel domain only, not its subdomains) and the `Permissions-Policy` header
 

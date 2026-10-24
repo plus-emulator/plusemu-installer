@@ -62,7 +62,7 @@ $script:Log        = "$StateDir\install.log"
 $PhpDir     = 'C:\PHP'
 $NodeMajor  = 22
 $MariaDbSeries = '11.4'
-$script:TotalSteps = 10
+$script:TotalSteps = 11
 $script:Step = 0
 
 # `irm | iex` runs in the user's own session, so these are restored at the end.
@@ -977,6 +977,22 @@ function Set-HotelPermissions {
     Run icacls.exe (Join-Path (Join-Path $HotelRoot 'emulator') 'Config') /inheritance:r /grant:r 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F'
 }
 
+function Protect-Server {
+    Step 'Securing the server (failed logins)'
+    # A domain controller would apply this to the whole domain, so its own policy is left alone.
+    if ((Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4) {
+        Say '      This server is a domain controller: the account lockout policy was left as it is.' 'Yellow'
+    } else {
+        # Windows refuses a counting window longer than the lockout, so the window shrinks first
+        # when it can, and the lockout is set before the window when it cannot.
+        Run net.exe accounts /lockoutthreshold:10
+        & net.exe accounts /lockoutwindow:10 *> $null
+        Run net.exe accounts /lockoutduration:10
+        Run net.exe accounts /lockoutwindow:10
+        Ok 'An account locks for 10 minutes after 10 wrong passwords in 10 minutes (RDP and SSH were not opened or changed)'
+    }
+}
+
 function Write-Guide {
     Step 'Writing your setup guide'
     $mode = if ($state.GuideMode) { $state.GuideMode } else { 'simple' }
@@ -1499,6 +1515,7 @@ try {
         Write-ClientConfig
         Install-Cms
         Set-IisSite
+        Protect-Server
         Write-Guide
         Write-UpdateCommand
         Complete-Install
