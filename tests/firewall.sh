@@ -17,6 +17,7 @@ CLOUDFLARE_CRON=$TEST_DIR/cron.d/plusemu-cloudflare-ips
 CLOUDFLARE_LOG=$TEST_DIR/plusemu-cloudflare-ips.log
 REAL_IP_CONF=$TEST_DIR/nginx/cloudflare-real-ip.conf
 UFW_DEFAULTS=$TEST_DIR/default-ufw
+CROWDSEC_WHITELIST=$TEST_DIR/crowdsec/parsers/s02-enrich/plusemu-whitelist.yaml
 export FAKE_DIR=$TEST_DIR/fake
 mkdir -p "$TEST_DIR/fakebin" "$FAKE_DIR" "$(dirname "$REAL_IP_CONF")"
 : > "$FAKE_DIR/rules"
@@ -146,6 +147,10 @@ expect_call 'systemctl try-reload-or-restart nginx'
 [ -x "$CLOUDFLARE_COMMAND" ]
 grep -qxF "0 3 * * 0 root $CLOUDFLARE_COMMAND >> $CLOUDFLARE_LOG 2>&1" "$CLOUDFLARE_CRON"
 grep -q 'HTTPS is accepted only from Cloudflare' "$TEST_DIR/terminal"
+# The health check reads the result from the Cloudflare log.
+grep -q "HTTPS is accepted only from Cloudflare's 5 address ranges." "$CLOUDFLARE_LOG"
+# Without CrowdSec, the refresh writes no CrowdSec whitelist.
+[ ! -e "$(dirname "$CROWDSEC_WHITELIST")" ]
 
 # fail2ban puts its bans first; they stay first through every refresh.
 ufw insert 1 deny from 203.0.113.9 to any > /dev/null
@@ -191,6 +196,22 @@ for kept in 173.245.48.0/20 104.16.0.0/13 2400:cb00::/32 2606:4700::/32; do expe
 grep -qx 'set_real_ip_from 131.0.72.0/22;' "$REAL_IP_CONF"
 if grep -q '103.21.244.0/22' "$REAL_IP_CONF"; then echo 'nginx still trusts a removed range'; exit 1; fi
 expect_call 'systemctl try-reload-or-restart nginx'
+
+# With CrowdSec, the refresh gives it the new ranges, so it never bans a Cloudflare edge.
+mkdir -p "$(dirname "$CROWDSEC_WHITELIST")"
+cloudflare_lists $'173.245.48.0/20\n104.16.0.0/13\n198.41.128.0/17' $'2400:cb00::/32\n2606:4700::/32'
+: > "$FAKE_DIR/calls"
+"$CLOUDFLARE_COMMAND" >> "$CLOUDFLARE_LOG" 2>&1
+grep -qxF '    - "198.41.128.0/17"' "$CROWDSEC_WHITELIST"
+grep -qxF '    - "127.0.0.1"' "$CROWDSEC_WHITELIST"
+if grep -qF '131.0.72.0/22' "$CROWDSEC_WHITELIST"; then echo 'CrowdSec still trusts a removed range'; exit 1; fi
+expect_call 'systemctl reload crowdsec'
+: > "$FAKE_DIR/calls"
+"$CLOUDFLARE_COMMAND" >> "$CLOUDFLARE_LOG" 2>&1
+expect_no_call 'systemctl reload crowdsec'
+rm -r "$TEST_DIR/crowdsec"
+cloudflare_lists $'173.245.48.0/20\n104.16.0.0/13\n131.0.72.0/22' $'2400:cb00::/32\n2606:4700::/32'
+"$CLOUDFLARE_COMMAND" >> "$CLOUDFLARE_LOG" 2>&1
 
 # nginx rejects the new settings: the previous file comes back and the run fails.
 conf=$(< "$REAL_IP_CONF")
