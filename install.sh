@@ -43,6 +43,12 @@ BACKUP_LOG=/var/log/plusemu-backup.log
 SSL_DIR=/etc/ssl/plusemu
 LOCK_FILE=/run/plusemu-update.lock
 SSHD_DROPIN=/etc/ssh/sshd_config.d/10-plusemu.conf
+REAL_IP_CONF=/etc/nginx/conf.d/cloudflare-real-ip.conf
+CLOUDFLARE_COMMAND=/usr/local/sbin/plusemu-cloudflare-ips
+CLOUDFLARE_CRON=/etc/cron.d/plusemu-cloudflare-ips
+CLOUDFLARE_LOG=/var/log/plusemu-cloudflare-ips.log
+CLOUDFLARE_TAG=plusemu-cloudflare
+UFW_DEFAULTS=/etc/default/ufw
 LOGROTATE_CONF=/etc/logrotate.d/plusemu
 JOURNALD_DROPIN=/etc/systemd/journald.conf.d/90-plusemu.conf
 MODE=install
@@ -685,20 +691,125 @@ EOF
     ok "Website installed (admin: $ADMIN_USER)"
 }
 
+cloudflare_ranges() { # Cloudflare's published address ranges, one per line; fails unless both lists download and parse
+    local list
+    for list in ips-v4 ips-v6; do
+        curl -fsS --max-time 20 "https://www.cloudflare.com/$list" | python3 -I -c '
+import ipaddress, sys
+version = int(sys.argv[1])
+try:
+    ranges = [ipaddress.ip_network(line.strip()) for line in sys.stdin if line.strip()]
+except ValueError as error:
+    sys.exit(error)
+if not ranges or any(r.version != version for r in ranges):
+    sys.exit("not a list of IPv%d ranges" % version)
+# The same form ufw writes, so the old rules can be told apart from the new ones.
+for r in ranges:
+    print(r.network_address if r.prefixlen == r.max_prefixlen else r)
+' "${list#ips-v}" || return 1
+    done
+}
+
+real_ip_conf() { # real_ip_conf <ranges> [unchecked]: nginx settings for visitors that come through Cloudflare
+    local range others=0 note="The hotel answers only Cloudflare and this server, so nobody can go around Cloudflare."
+    # A list that was not downloaded and checked may be out of date, so it blocks nobody.
+    if [ "${2:-}" = unchecked ]; then
+        others=1
+        note="This list was not checked, so the hotel answers every address until plusemu-cloudflare-ips runs."
+    fi
+    echo "# Cloudflare edge ranges: log and rate-limit the visitor's address, not Cloudflare's."
+    for range in $1; do echo "set_real_ip_from $range;"; done
+    echo "real_ip_header CF-Connecting-IP;"
+    echo ""
+    echo "# $note"
+    echo "geo \$realip_remote_addr \$plusemu_from_cloudflare {"
+    echo "    default $others;"
+    echo "    127.0.0.0/8 1;"
+    echo "    ::1 1;"
+    for range in $1; do echo "    $range 1;"; done
+    echo "}"
+}
+
+allow_https_from() { # allow_https_from <ranges>: HTTPS only from these ranges, replacing the previous ones
+    local ipv6=no range rule added open pattern="^ufw allow from ([^ ]+) to any port 443 proto tcp comment '$CLOUDFLARE_TAG'\$"
+    local -A wanted=()
+    # With IPv6 off, ufw neither lists nor accepts IPv6 rules.
+    if grep -qsx 'IPV6=yes' "$UFW_DEFAULTS"; then ipv6=yes; fi
+    for range in $1; do
+        if [[ $range == *:* && $ipv6 != yes ]]; then continue; fi
+        wanted[$range]=1
+        ufw allow proto tcp from "$range" to any port 443 comment "$CLOUDFLARE_TAG" > /dev/null
+    done
+    # The new rules are in before the old ones go, so HTTPS never closes. Other rules, such as fail2ban's bans, stay.
+    added=$(ufw show added)
+    while read -r rule; do
+        if [[ $rule =~ $pattern ]]; then
+            range=${BASH_REMATCH[1]}
+            if [[ -z ${wanted[$range]:-} && ($range != *:* || $ipv6 == yes) ]]; then
+                ufw delete allow proto tcp from "$range" to any port 443 comment "$CLOUDFLARE_TAG" > /dev/null
+            fi
+        elif [ "$rule" = 'ufw allow 443/tcp' ]; then
+            ufw delete allow 443/tcp > /dev/null
+        fi
+    done <<< "$added"
+    open=$(ufw show added | grep -E "^ufw allow (443|https|'Nginx (Full|HTTPS)')(/tcp)?( comment .*)?\$" || true)
+    while read -r rule; do
+        if [ -n "$rule" ]; then
+            cloudflare_warn "Another firewall rule still lets every address reach HTTPS. Remove it with: sudo ${rule/ufw /ufw delete }"
+        fi
+    done <<< "$open"
+}
+
+cloudflare_warn() { if [ -t 1 ]; then printf '\e[33m%s\e[0m\n' "$*"; else printf '%s\n' "$*"; fi; }
+
+# The plusemu-cloudflare-ips command. Without fresh, valid lists it changes nothing, so the hotel stays reachable.
+refresh_cloudflare() {
+    local ranges conf previous
+    if ! ranges=$(cloudflare_ranges); then
+        cloudflare_warn "$(date) Could not download Cloudflare's address ranges. The firewall and nginx were left as they are."
+        return 1
+    fi
+    allow_https_from "$ranges"
+    conf=$(real_ip_conf "$ranges")
+    previous=$(cat "$REAL_IP_CONF" 2> /dev/null || true)
+    if [ "$previous" != "$conf" ]; then
+        printf '%s\n' "$conf" > "$REAL_IP_CONF"
+        if ! nginx -t; then
+            if [ -n "$previous" ]; then printf '%s\n' "$previous" > "$REAL_IP_CONF"; else rm -f "$REAL_IP_CONF"; fi
+            cloudflare_warn "$(date) nginx did not accept the new Cloudflare ranges, so nginx keeps the previous ones."
+            return 1
+        fi
+        systemctl try-reload-or-restart nginx
+    fi
+    echo "$(date) HTTPS is accepted only from Cloudflare's $(wc -l <<< "$ranges") address ranges."
+}
+
+install_cloudflare_command() {
+    mkdir -p "$(dirname "$CLOUDFLARE_COMMAND")" "$(dirname "$CLOUDFLARE_CRON")"
+    {
+        echo '#!/usr/bin/env bash'
+        echo '# Installed by the PlusEMU installer. Cron runs it every Sunday at 03:00; run it by hand with: sudo plusemu-cloudflare-ips'
+        echo 'set -Eeuo pipefail'
+        echo 'PATH=$PATH:/usr/local/sbin:/usr/sbin:/sbin'
+        declare -p REAL_IP_CONF CLOUDFLARE_TAG UFW_DEFAULTS
+        declare -f cloudflare_ranges real_ip_conf allow_https_from cloudflare_warn refresh_cloudflare
+        echo 'refresh_cloudflare'
+    } > "$CLOUDFLARE_COMMAND"
+    chmod 700 "$CLOUDFLARE_COMMAND"
+    echo "0 3 * * 0 root $CLOUDFLARE_COMMAND >> $CLOUDFLARE_LOG 2>&1" > "$CLOUDFLARE_CRON"
+}
+
 cloudflare_real_ip() {
     local ranges
-    ranges=$(curl -fsS --max-time 10 https://www.cloudflare.com/ips-v4; echo; curl -fsS --max-time 10 https://www.cloudflare.com/ips-v6) || true
-    if ! printf '%s' "$ranges" | grep -q '/'; then
-        ranges="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18
+    if ranges=$(cloudflare_ranges); then
+        real_ip_conf "$ranges" > "$REAL_IP_CONF"
+    elif ! grep -qs plusemu_from_cloudflare "$REAL_IP_CONF"; then
+        # Cloudflare's ranges when this installer was written; plusemu-cloudflare-ips replaces them.
+        real_ip_conf "173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18
 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14
 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32
-2a06:98c0::/29 2c0f:f248::/32"
+2a06:98c0::/29 2c0f:f248::/32" unchecked > "$REAL_IP_CONF"
     fi
-    {
-        echo "# Cloudflare edge ranges: log and rate-limit the visitor's address, not Cloudflare's."
-        for range in $ranges; do echo "set_real_ip_from $range;"; done
-        echo "real_ip_header CF-Connecting-IP;"
-    } > /etc/nginx/conf.d/cloudflare-real-ip.conf
 }
 
 request_limits() {
@@ -762,6 +873,8 @@ configure_web() {
     local timeouts="client_header_timeout 10s;
     client_body_timeout 10s;
     keepalive_timeout 20s;"
+    # The hotel's own names answer only Cloudflare and this server (see cloudflare-real-ip.conf).
+    local cloudflare_only='if ($plusemu_from_cloudflare = 0) { return 444; }'
 
     local ws_main="" ws_server=""
     if [ "$WS_HOST" = "$DOMAIN" ]; then
@@ -777,6 +890,7 @@ server {
     ssl_certificate $ssl/cert.pem;
     ssl_certificate_key $ssl/key.pem;
     $timeouts
+    $cloudflare_only
 $(ws_location)
     location / { return 404; }
 }
@@ -815,6 +929,7 @@ server {
     ssl_certificate $ssl/cert.pem;
     ssl_certificate_key $ssl/key.pem;
     $timeouts
+    $cloudflare_only
     return 301 https://$DOMAIN\$request_uri;
 }
 
@@ -832,6 +947,7 @@ server {
     client_max_body_size 20m;
     server_tokens off;
     $timeouts
+    $cloudflare_only
 
     add_header X-Content-Type-Options nosniff always;
     add_header Referrer-Policy strict-origin-when-cross-origin always;
@@ -900,14 +1016,28 @@ EOF
     systemctl enable --now "php$PHP-fpm" nginx
     systemctl reload nginx
     ok "nginx serves https://$DOMAIN"
+    configure_firewall
+}
 
+# HTTP stays open to everyone for the setup guide and the redirects. HTTPS only takes Cloudflare's addresses,
+# so nobody can go around Cloudflare to reach the hotel.
+configure_firewall() {
     local port ports
     ports=$( (sshd -T 2>/dev/null || true) | awk '/^port / {print $2}')
     for port in 22 $ports; do ufw allow "$port/tcp"; done
     ufw allow 80/tcp
-    ufw allow 443/tcp
+    # HTTPS is open to everyone until plusemu-cloudflare-ips has limited it to Cloudflare.
+    if ! ufw show added | grep -qF "comment '$CLOUDFLARE_TAG'"; then ufw allow 443/tcp; fi
     ufw --force enable
     ok "Firewall on: only SSH, HTTP and HTTPS are open (the database and emulator stay private)"
+    install_cloudflare_command
+    if "$CLOUDFLARE_COMMAND"; then
+        ok "HTTPS is accepted only from Cloudflare's addresses, refreshed every Sunday at 03:00"
+    elif ufw show added | grep -qF "comment '$CLOUDFLARE_TAG'"; then
+        say "      ${yellow}Could not refresh Cloudflare's addresses; HTTPS keeps the previous ones. Try again later: sudo plusemu-cloudflare-ips${reset}"
+    else
+        say "      ${yellow}Could not download Cloudflare's addresses, so HTTPS stays open to every address. Try again later: sudo plusemu-cloudflare-ips${reset}"
+    fi
 }
 
 # ---------------------------------------------------------------- server hardening

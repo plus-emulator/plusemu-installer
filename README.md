@@ -113,11 +113,12 @@ Every step is logged. If a step fails, the installer shows the last lines of the
    - It limits each visitor: 5 login, registration or password reset attempts per minute (plus a burst of 5), 30 housekeeping pages per minute (plus a burst of 20), 50 open requests and 20 game connections (many players can share one address, for example at a school). Over the limit, nginx answers 429. The game client and the hotel files have no limits.
    - It drops slow connections after 10 seconds and sends the `Strict-Transport-Security` and `Permissions-Policy` headers. `Strict-Transport-Security` covers the hotel domain only, not its subdomains.
    - The `ufw` firewall allows only SSH, HTTP and HTTPS. The database and the emulator stay private.
+   - HTTPS is accepted only from Cloudflare's addresses, so nobody can go around Cloudflare to reach the hotel. HTTP stays open for the setup guide and the redirects, but nginx answers the hotel's own names only for Cloudflare and this server. `plusemu-cloudflare-ips` downloads Cloudflare's address lists every Sunday at 03:00 and updates the firewall and nginx. When a download fails, it changes nothing. If the download fails during a new install, HTTPS stays open to every address until the next successful run, and the installer says so.
 9. Secures the server:
    - `fail2ban` bans an address for 1 hour after 5 failed SSH logins in 10 minutes.
    - Security updates from Debian or Ubuntu install every day at 05:00 server time with `unattended-upgrades`. The server restarts right after, but only when an update needs it. Unused packages are removed. The emulator, the client, the website and PHP are not touched: update them with `plusemu-update` and the PHP script below.
    - Network settings in `/etc/sysctl.d/90-plusemu.conf` turn on SYN cookies and raise the queues for new connections, so a flood of connections does not stop the server.
-   - Installer, update and backup logs and the website log rotate daily and are kept for 14 days. The emulator logs to the system journal, which keeps 14 days and at most 1 GB.
+   - Installer, update, backup and Cloudflare address logs and the website log rotate daily and are kept for 14 days. The emulator logs to the system journal, which keeps 14 days and at most 1 GB.
    - A nightly backup runs at 04:00 (see [Nightly backups](#nightly-backups)).
    - SSH lets root log in with a key only. SSH password login goes off only when your login uses an SSH key (this session, or the account that ran `sudo` has a key in `~/.ssh/authorized_keys`). Otherwise password login stays on, and the installer says so. The settings are in `/etc/ssh/sshd_config.d/10-plusemu.conf`.
 10. Writes your setup guide.
@@ -127,7 +128,7 @@ Every step is logged. If a step fails, the installer shows the last lines of the
 - IIS with URL Rewrite, the reverse proxy and WebSockets
 - MariaDB 11.4
 - The emulator as the `PlusEMU` Windows service
-- Windows Firewall rules for the website
+- Windows Firewall rules for the website: HTTP and HTTPS are accepted only from Cloudflare's addresses, so nobody can go around Cloudflare to reach the hotel. Windows needs no open HTTP port, because the setup guide is a file on the desktop. The *PlusEMU Cloudflare addresses* task updates the addresses every Sunday at 03:00. When a download fails, it changes nothing. If the download fails during a new install, the website stays open to every address until the next successful run, and the installer says so. The installer turns off the *World Wide Web Services* rules that IIS adds, because they let every address in. A rule that you add yourself for ports 80 or 443 also lets every address in.
 - An account lockout policy: an account locks for 10 minutes after 10 wrong passwords in 10 minutes, the default of new Windows versions. A lower limit would let an attacker keep the built-in Administrator locked out. RDP and SSH are not opened or changed.
 - The *PlusEMU log cleanup* task removes emulator, website and IIS logs older than 14 days, every day at 03:30. Windows has SYN flood protection built in and has no settings for it, so the installer changes nothing there.
 - The *PlusEMU nightly backup* task makes the nightly backup at 04:00 (see [Nightly backups](#nightly-backups)).
@@ -150,6 +151,8 @@ The pages the installer generates, such as the setup guide and the client config
 | Nightly backups | `/var/backups/plusemu/nightly` | `C:\ProgramData\PlusEMU\backups\nightly` |
 | Backup log | `/var/log/plusemu-backup.log` | `C:\ProgramData\PlusEMU\backup.log` |
 | Make a backup now | `sudo plusemu-backup` | `Start-ScheduledTask 'PlusEMU nightly backup'` |
+| Cloudflare address log | `/var/log/plusemu-cloudflare-ips.log` | `C:\ProgramData\PlusEMU\cloudflare-ips.log` |
+| Refresh Cloudflare's addresses now | `sudo plusemu-cloudflare-ips` | `Start-ScheduledTask 'PlusEMU Cloudflare addresses'` |
 | Restart the emulator | `sudo systemctl restart plusemu` | `Restart-Service PlusEMU` |
 | Watch the emulator log | `sudo journalctl -u plusemu -f` | `Get-Content C:\Hotel\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 50 -Wait` |
 
