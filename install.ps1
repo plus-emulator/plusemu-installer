@@ -3,6 +3,9 @@
 #   Open PowerShell as Administrator and run:
 #   irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.ps1 | iex
 #
+# To try the hotel on your own Windows 10/11 PC only, at http://localhost: .\install.ps1 -Local
+# (or $env:PLUSEMU_LOCAL = '1'). A local install asks no domain and leaves the PC's own settings alone.
+#
 # Installs and wires together: PlusEMU (emulator, as a Windows service) and Volt
 # (client) from their latest GitHub releases, Atom CMS (website), MariaDB, PHP,
 # IIS and the hotel files. Everything is self-hosted on this server; Cloudflare
@@ -20,7 +23,7 @@
 #   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.ps1))) -Update
 # -WithAssets is accepted for older instructions and ignored: the hotel files are always part of an update.
 
-param([string]$GuideMode, [switch]$Update, [switch]$Check, [switch]$Yes, [switch]$Rollback, [switch]$Assets, [switch]$WithAssets)
+param([string]$GuideMode, [switch]$Local, [switch]$Update, [switch]$Check, [switch]$Yes, [switch]$Rollback, [switch]$Assets, [switch]$WithAssets)
 
 function Get-Setting($Name, $Default) {
     $value = [Environment]::GetEnvironmentVariable($Name)
@@ -156,6 +159,7 @@ function Install-Msi($File, [string[]]$Properties = @()) {
 
 function Update-Path {
     $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+    if ($script:LocalNode) { $env:Path = "$script:LocalNode;$env:Path" }
 }
 
 function Add-MachinePath($Dir) {
@@ -373,7 +377,7 @@ function Assert-Administrator {
 function Test-Prerequisites {
     Assert-Administrator
     if (-not [Environment]::Is64BitOperatingSystem) { throw 'A 64-bit Windows is required.' }
-    if ([Environment]::OSVersion.Version.Build -lt 17763) { throw 'Windows Server 2019 or newer is required.' }
+    if ([Environment]::OSVersion.Version.Build -lt 17763) { throw 'Windows Server 2019 or newer is required (Windows 10 version 1809 or newer, or Windows 11, for a local install).' }
     $free = (Get-PSDrive C).Free / 1GB
     if ($free -lt 15) { throw "Not enough disk space on C: ($([int]$free) GB free, at least 15 GB needed)." }
     New-Item -ItemType Directory -Force -Path $StateDir, $HotelRoot, $Downloads | Out-Null
@@ -425,32 +429,23 @@ function Write-CrowdSecNote($Mode) {
     }
 }
 
-function Read-Answers {
-    $selectedMode = Resolve-GuideMode
-    Write-Host ''
-    Write-Host 'Welcome to the PlusEMU hotel installer!' -ForegroundColor White
-    Write-Host 'This sets up your emulator, client and website on this server in about 10 minutes.'
-    Write-Host ''
-
-    if (Test-Path $StateFile) {
-        $script:state = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        $selectedMode = Resolve-GuideMode $state.GuideMode
-        Say "Found the settings of an earlier run for $($state.Domain); continuing that installation."
-        Say "  Setup guide: $selectedMode. Selecting this guide does not change SSH, RDP, firewall, updates or backups."
-        Write-CrowdSecNote $selectedMode
-        $previous = "$($state.DiscordWebhook)"
-        # An older state file has no answer for this, so the question is asked once.
-        $webhook = Select-DiscordWebhook $state.DiscordWebhook ($null -ne $state.PSObject.Properties['DiscordWebhook'])
-        $script:DiscordWebhookNew = [bool]($webhook -and $webhook -ne $previous)
-        $state | Add-Member -MemberType NoteProperty -Name GuideMode -Value $selectedMode -Force
-        $state | Add-Member -MemberType NoteProperty -Name DiscordWebhook -Value $webhook -Force
-        $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
-        if ($webhook) {
-            Say '  Health alerts are on: they go to your Discord webhook. To change it, run the installer again with $env:PLUSEMU_DISCORD_WEBHOOK set to the new URL, or to off to turn alerts off.'
-        }
-        return
+# A saved hotel keeps its choice. Switching it would leave half a server on a PC, or a server without its protection.
+function Resolve-Local($Saved = $null) {
+    $requested = if ($Local) { '1' } else { Get-Setting 'PLUSEMU_LOCAL' '' }
+    $choice = switch ($requested) {
+        '1' { $true }
+        '0' { $false }
+        '' { [bool]$Saved }
+        default { throw 'PLUSEMU_LOCAL must be 1 (install on this PC only) or 0 (install a server).' }
     }
+    if ($null -ne $Saved -and $choice -ne [bool]$Saved) {
+        if ($Saved) { throw 'This PC has a local hotel at http://localhost, and the installer cannot turn it into a server install. Nothing was changed. For a public hotel, run the installer without -Local on your server.' }
+        throw "This server has a hotel for $($state.Domain), and the installer cannot turn it into a local install. Nothing was changed. Run the installer with -Local on another PC."
+    }
+    return $choice
+}
 
+function Read-ServerAddresses {
     $domain = Get-Setting 'PLUSEMU_DOMAIN' ''
     while ($true) {
         if (-not $domain) { $domain = Ask "Your hotel's domain name (for example myhotel.com)" '' }
@@ -472,8 +467,47 @@ function Read-Answers {
         Write-Host "  Type it like wss://$domain/ws or ws.$domain (no port)." -ForegroundColor Yellow
         $ws = ''
     }
+    return $domain, $ws
+}
 
-    $suggested = (Get-Culture).TextInfo.ToTitleCase($domain.Split('.')[0])
+function Read-Answers {
+    $selectedMode = Resolve-GuideMode
+    Write-Host ''
+    Write-Host 'Welcome to the PlusEMU hotel installer!' -ForegroundColor White
+    Write-Host 'This sets up your emulator, client and website on this server in about 10 minutes.'
+    Write-Host ''
+
+    if (Test-Path $StateFile) {
+        $script:state = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $isLocal = Resolve-Local ([bool]$state.Local)
+        $selectedMode = Resolve-GuideMode $state.GuideMode
+        if ($isLocal) {
+            Say 'Found the settings of an earlier run on this PC (http://localhost); continuing that installation.'
+            $script:DiscordWebhookNew = $false
+            return
+        }
+        Say "Found the settings of an earlier run for $($state.Domain); continuing that installation."
+        Say "  Setup guide: $selectedMode. Selecting this guide does not change SSH, RDP, firewall, updates or backups."
+        Write-CrowdSecNote $selectedMode
+        $previous = "$($state.DiscordWebhook)"
+        # An older state file has no answer for this, so the question is asked once.
+        $webhook = Select-DiscordWebhook $state.DiscordWebhook ($null -ne $state.PSObject.Properties['DiscordWebhook'])
+        $script:DiscordWebhookNew = [bool]($webhook -and $webhook -ne $previous)
+        $state | Add-Member -MemberType NoteProperty -Name GuideMode -Value $selectedMode -Force
+        $state | Add-Member -MemberType NoteProperty -Name DiscordWebhook -Value $webhook -Force
+        $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
+        if ($webhook) {
+            Say '  Health alerts are on: they go to your Discord webhook. To change it, run the installer again with $env:PLUSEMU_DISCORD_WEBHOOK set to the new URL, or to off to turn alerts off.'
+        }
+        return
+    }
+
+    $isLocal = Resolve-Local
+    # The game connects through the same IIS site as the website, so the browser sees one origin.
+    if ($isLocal) { $domain = 'localhost'; $ws = 'ws://localhost/ws' } else { $domain, $ws = Read-ServerAddresses }
+
+    $suggested = if ($isLocal) { 'PlusEMU' } else { (Get-Culture).TextInfo.ToTitleCase($domain.Split('.')[0]) }
+    $mailDomain = if ($isLocal) { 'localhost.test' } else { $domain }
     $name = Get-Setting 'PLUSEMU_HOTEL_NAME' ''
     if (-not $name) { $name = Ask 'Hotel name' $suggested }
     $name = $name -replace '[<>"`$\\'']', ''
@@ -487,22 +521,27 @@ function Read-Answers {
     }
     $mail = Get-Setting 'PLUSEMU_ADMIN_EMAIL' ''
     while ($true) {
-        if (-not $mail) { $mail = Ask 'Email for your admin account' "admin@$domain" }
+        if (-not $mail) { $mail = Ask 'Email for your admin account' "admin@$mailDomain" }
         if ($mail -match '^[^@\s'']+@[^@\s'']+\.[^@\s'']+$') { break }
         Write-Host "  That doesn't look like an email address." -ForegroundColor Yellow
         $mail = ''
     }
-    $webhook = Select-DiscordWebhook '' $false
+    $webhook = if ($isLocal) { '' } else { Select-DiscordWebhook '' $false }
     $script:DiscordWebhookNew = [bool]$webhook
 
     Write-Host ''
-    Write-Host "  Website:    https://$domain"
+    Write-Host "  Website:    $(if ($isLocal) { 'http://localhost' } else { "https://$domain" })"
     Write-Host "  WebSocket:  $ws"
     Write-Host "  Hotel name: $name"
     Write-Host "  Admin:      $user ($mail)"
-    Write-Host "  Setup guide: $selectedMode. Selecting this guide does not change SSH, RDP, firewall, updates or backups."
-    Write-Host "  Health alerts: $(if ($webhook) { 'Discord' } else { 'log only (no Discord webhook)' })"
-    Write-CrowdSecNote $selectedMode
+    if ($isLocal) {
+        Write-Host '  Local install: only this PC can open the hotel. There is no HTTPS and no Cloudflare.'
+        Write-Host '  The firewall, Windows Update and the account settings of this PC stay as they are.'
+    } else {
+        Write-Host "  Setup guide: $selectedMode. Selecting this guide does not change SSH, RDP, firewall, updates or backups."
+        Write-Host "  Health alerts: $(if ($webhook) { 'Discord' } else { 'log only (no Discord webhook)' })"
+        Write-CrowdSecNote $selectedMode
+    }
     if ((Get-Setting 'PLUSEMU_YES' '0') -ne '1') {
         $go = Ask 'Start the installation? (y/n)' 'y'
         if ($go -notmatch '^[Yy]') { throw 'Installation cancelled. Nothing was changed.' }
@@ -510,26 +549,62 @@ function Read-Answers {
 
     $script:state = [pscustomobject]@{
         Domain = $domain; WsUrl = $ws; HotelName = $name; AdminUser = $user; AdminEmail = $mail
-        GuideMode = $selectedMode; DiscordWebhook = $webhook
+        GuideMode = $selectedMode; DiscordWebhook = $webhook; Local = $isLocal
         AdminPassword = New-AdminPassword; DbPassword = New-Secret 32; DbRootPassword = New-Secret 32
     }
     $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
 }
 
+# The program that listens on a port is the one the installer puts there. IIS listens through Windows itself (process 4).
+function Test-HotelListener($Port, $Process) {
+    if (-not $Process) { return $false }
+    $path = "$($Process.Path)"
+    switch ($Port) {
+        80 { return $Process.Id -eq 4 }
+        3306 { $mariadb = Find-MariaDb; return [bool]($mariadb -and $path -and $path.StartsWith($mariadb.Substring(0, $mariadb.Length - 'mariadb.exe'.Length), [StringComparison]::OrdinalIgnoreCase)) }
+        default { return [bool]($path -and $path.StartsWith((Join-Path $HotelRoot 'emulator'), [StringComparison]::OrdinalIgnoreCase)) }
+    }
+}
+
+# A PC often runs other web servers or databases. The hotel needs their ports, so the install stops before it changes anything.
+function Assert-FreePorts {
+    $busy = @()
+    foreach ($port in 80, 3306, 2096, 8080, 30001) {
+        $listener = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $listener) { continue }
+        $process = Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue
+        if (Test-HotelListener $port $process) { continue }
+        $busy += "port $port is used by $(if ($process) { $process.ProcessName } else { 'another program' }) (process $($listener.OwningProcess))"
+    }
+    if ($busy) { throw "The hotel needs ports that another program uses: $($busy -join '; '). Stop that program (for example in Services or Task Manager), then run the installer again. Nothing was changed." }
+}
+
 function Get-Derived {
-    $rest = $state.WsUrl.Substring(6)
+    $rest = $state.WsUrl.Substring($state.WsUrl.IndexOf('://') + 3)
     $script:WsHost = $rest.Split('/')[0]
     $script:WsPath = if ($rest.Contains('/')) { $rest.Substring($rest.IndexOf('/') + 1) } else { '' }
+    if ($state.Local) { $script:ServerIp = '127.0.0.1'; return }
     try { $script:ServerIp = (Invoke-RestMethod -Uri 'https://api.ipify.org' -TimeoutSec 10).Trim() }
     catch { $script:ServerIp = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notmatch '^(127|169\.254)\.' } | Select-Object -First 1).IPAddress }
 }
 
 function Install-WebServer {
     Step 'Installing IIS with URL Rewrite, reverse proxy and WebSockets'
-    $features = 'Web-Server', 'Web-Static-Content', 'Web-Default-Doc', 'Web-Http-Errors', 'Web-Http-Logging',
-                'Web-Stat-Compression', 'Web-Dyn-Compression', 'Web-Filtering', 'Web-IP-Security', 'Web-CGI', 'Web-WebSockets', 'Web-Mgmt-Console'
-    $result = Install-WindowsFeature -Name $features
-    if (-not $result.Success) { throw 'Installing IIS failed.' }
+    # Windows 10 and 11 (product type 1) have no server roles; they offer IIS as optional features.
+    if ((Get-CimInstance Win32_OperatingSystem).ProductType -eq 1) {
+        $features = 'IIS-WebServerRole', 'IIS-WebServer', 'IIS-StaticContent', 'IIS-DefaultDocument', 'IIS-HttpErrors', 'IIS-HttpLogging',
+                    'IIS-HttpCompressionStatic', 'IIS-HttpCompressionDynamic', 'IIS-RequestFiltering', 'IIS-CGI', 'IIS-WebSockets',
+                    'IIS-ManagementConsole', 'IIS-ManagementScriptingTools'
+        # The per-visitor limits need IP Security; a local install has no limits.
+        if (-not $state.Local) { $features += 'IIS-IPSecurity' }
+        $result = Enable-WindowsOptionalFeature -Online -FeatureName $features -All -NoRestart
+        if ($result.RestartNeeded) { Say '      Windows wants a restart to finish IIS. If a later step fails, restart the PC and run the installer again.' 'Yellow' }
+    } else {
+        $features = 'Web-Server', 'Web-Static-Content', 'Web-Default-Doc', 'Web-Http-Errors', 'Web-Http-Logging',
+                    'Web-Stat-Compression', 'Web-Dyn-Compression', 'Web-Filtering', 'Web-IP-Security', 'Web-CGI', 'Web-WebSockets', 'Web-Mgmt-Console'
+        $result = Install-WindowsFeature -Name $features
+        if (-not $result.Success) { throw 'Installing IIS failed.' }
+    }
     Import-Module WebAdministration
     if (-not (Test-Path "$env:windir\System32\inetsrv\rewrite.dll")) {
         Download 'https://download.microsoft.com/download/1/2/8/128E2E22-C1B9-44A4-BE2A-5859ED1D4592/rewrite_amd64_en-US.msi' "$Downloads\rewrite.msi"
@@ -540,7 +615,10 @@ function Install-WebServer {
         Install-Msi "$Downloads\arr.msi"
     }
     # The game's WebSocket is handed to the emulator through IIS's reverse proxy.
-    Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter 'system.webServer/proxy' -Name 'enabled' -Value 'True'
+    # The emulator reads the last X-Forwarded-For entry as an address, so it carries no port.
+    foreach ($setting in @(@('enabled', 'True'), @('xForwardedForHeaderName', 'X-Forwarded-For'), @('includePortInXForwardedFor', 'False'))) {
+        Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter 'system.webServer/proxy' -Name $setting[0] -Value $setting[1]
+    }
     Ok 'IIS, URL Rewrite, Application Request Routing and WebSockets'
 }
 
@@ -558,18 +636,7 @@ function Install-Toolchains {
     }
     Ok "$(& git --version)"
 
-    $node = Get-Command node -ErrorAction SilentlyContinue
-    if (-not $node -or -not ((& node --version) -like "v$NodeMajor.*")) {
-        $base = "https://nodejs.org/dist/latest-v$NodeMajor.x"
-        $sums = (Invoke-WebRequest "$base/SHASUMS256.txt" -UseBasicParsing).Content -split "`n"
-        $line = $sums | Where-Object { $_ -match 'node-v[\d.]+-x64\.msi$' } | Select-Object -First 1
-        $hash, $file = $line -split '\s+'
-        Download "$base/$file" "$Downloads\$file"
-        if ((Get-FileHash "$Downloads\$file" -Algorithm SHA256).Hash -ne $hash.ToUpper()) { throw 'The Node.js download is damaged. Run the installer again.' }
-        Install-Msi "$Downloads\$file"
-        Update-Path
-    }
-    Ok "Node.js $(& node --version)"
+    Install-NodeJs
 
     if (-not (Test-Path "$PhpDir\php-cgi.exe")) {
         # PHP needs the Visual C++ runtime.
@@ -599,9 +666,42 @@ function Install-Toolchains {
         Download 'https://getcomposer.org/download/latest-stable/composer.phar' "$PhpDir\composer.phar"
         $expected = ((Invoke-WebRequest 'https://getcomposer.org/download/latest-stable/composer.phar.sha256' -UseBasicParsing).Content -split '\s')[0]
         if ((Get-FileHash "$PhpDir\composer.phar" -Algorithm SHA256).Hash -ne $expected.ToUpper()) { Remove-Item "$PhpDir\composer.phar"; throw 'The Composer download is damaged. Run the installer again.' }
-        Set-Content "$PhpDir\composer.bat" "@php `"%~dp0composer.phar`" %*" -Encoding ASCII
     }
+    # Another PHP earlier on the PATH, as on many PCs, would run Composer without the hotel's extensions.
+    Set-Content "$PhpDir\composer.bat" "@`"%~dp0php.exe`" `"%~dp0composer.phar`" %*" -Encoding ASCII
     Ok 'Composer'
+}
+
+function Install-NodeJs {
+    if ($state.Local) {
+        # The PC's own node and npm stay as they are: this copy is only on the installer's PATH.
+        $script:LocalNode = Join-Path $StateDir 'node'
+        Update-Path
+    }
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $node -or -not ((& node --version) -like "v$NodeMajor.*")) {
+        $base = "https://nodejs.org/dist/latest-v$NodeMajor.x"
+        $sums = (Invoke-WebRequest "$base/SHASUMS256.txt" -UseBasicParsing).Content -split "`n"
+        $package = if ($state.Local) { 'node-v[\d.]+-win-x64\.zip$' } else { 'node-v[\d.]+-x64\.msi$' }
+        $line = $sums | Where-Object { $_ -match $package } | Select-Object -First 1
+        $hash, $file = $line -split '\s+'
+        Download "$base/$file" "$Downloads\$file"
+        if ((Get-FileHash "$Downloads\$file" -Algorithm SHA256).Hash -ne $hash.ToUpper()) { throw 'The Node.js download is damaged. Run the installer again.' }
+        if ($state.Local) {
+            # Unpacked next to its final folder, because Windows moves a folder only within one drive.
+            $unpacked = Join-Path $StateDir 'node-download'
+            if (Test-Path $unpacked) { Remove-Item $unpacked -Recurse -Force }
+            Expand-Archive "$Downloads\$file" $unpacked
+            if (Test-Path $script:LocalNode) { Remove-Item $script:LocalNode -Recurse -Force }
+            # The archive holds one folder, node-v<version>-win-x64.
+            Move-Item ([IO.Directory]::GetDirectories($unpacked)[0]) $script:LocalNode
+            Remove-Item $unpacked -Recurse -Force
+        } else {
+            Install-Msi "$Downloads\$file"
+        }
+        Update-Path
+    }
+    Ok "Node.js $(& node --version)"
 }
 
 function Install-Database {
@@ -671,14 +771,17 @@ function Get-Releases {
     Ok "Atom CMS ($($atom.Substring(0, [Math]::Min(12, $atom.Length))))"
 }
 
+# The address of the website, which the client, the game connection and the website itself are built from.
+function Get-SiteUrl { if ($state.Local) { return 'http://localhost' } return "https://$($state.Domain)" }
+
 function Write-ClientConfig($Dir = (Join-Path (Join-Path $HotelRoot 'client') 'configuration')) {
     # Newer emulators build FurnitureData.json from the furniture table; older ones need the static file.
     $furnidata = '${gamedata.url}/FurnitureData.json?t=%timestamp%'
     try {
         Invoke-WebRequest 'http://127.0.0.1:8080/api/gamedata/furnidata' -UseBasicParsing -TimeoutSec 30 | Out-Null
-        $furnidata = "https://$($state.Domain)/api/gamedata/furnidata"
+        $furnidata = "$(Get-SiteUrl)/api/gamedata/furnidata"
     } catch { }
-    $values = @{ DOMAIN = $state.Domain; SOCKET_URL = $state.WsUrl; FURNIDATA_URL = $furnidata }
+    $values = @{ DOMAIN = $state.Domain; SITE_URL = Get-SiteUrl; SOCKET_URL = $state.WsUrl; FURNIDATA_URL = $furnidata }
     New-Item -ItemType Directory -Force -Path $Dir | Out-Null
     foreach ($file in 'renderer-config.json', 'ui-config.json', 'client-mode.json') {
         Render (Join-Path $Templates $file) (Join-Path $Dir $file) $values
@@ -722,6 +825,13 @@ function Get-HotelFiles {
     Ok 'Hotel files ready'
 }
 
+# A local hotel has one visitor address, so the per-IP limits would block the owner's own test clients.
+function Disable-EmulatorLimits($Json) {
+    if (-not $Json.PSObject.Properties['LoginThrottle']) { $Json | Add-Member -MemberType NoteProperty -Name LoginThrottle -Value ([pscustomobject]@{}) }
+    $Json.Nitro | Add-Member -MemberType NoteProperty -Name MaxConnectionsPerIp -Value 0 -Force
+    $Json.LoginThrottle | Add-Member -MemberType NoteProperty -Name MaxFailuresPerIp -Value 0 -Force
+}
+
 function Start-Emulator {
     Step 'Starting the emulator'
     $out = "$HotelRoot\emulator"
@@ -732,6 +842,7 @@ function Start-Emulator {
     $json.Flash.Hostname = '127.0.0.1'
     $json.Nitro.Hostname = '127.0.0.1'; $json.Nitro.Port = 2096; $json.Nitro.Name = 'Volt'
     $json.Rcon.Hostname = '127.0.0.1'; $json.Rcon.Port = 30001; $json.Rcon.AllowedAddresses = @('127.0.0.1', 'localhost')
+    if ($state.Local) { Disable-EmulatorLimits $json }
     Write-Utf8 $config ($json | ConvertTo-Json -Depth 20)
     # Every packet is logged at Trace level by default, which floods the log.
     $nlog = "$out\Config\nlog.config"
@@ -804,24 +915,28 @@ function Start-EmulatorService { Start-Service PlusEMU }
 
 function Install-Cms {
     Step 'Installing the Atom CMS website'
-    $cms = "$HotelRoot\cms"
-    $envFile = "$cms\.env"
-    $domain = $state.Domain
+    $cms = Join-Path $HotelRoot 'cms'
+    $envFile = Join-Path $cms '.env'
+    $site = Get-SiteUrl
     Push-Location $cms
     if (-not (Test-Path $envFile)) { Copy-Item .env.example $envFile }
     # Laravel trusts the visitor address Cloudflare forwards, but only from Cloudflare itself.
-    $cloudflare = try { Get-CloudflareRanges }
-    catch {
-        @('173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20',
-          '188.114.96.0/20', '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13', '104.24.0.0/14', '172.64.0.0/13',
-          '131.0.72.0/22', '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32', '2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32')
+    $proxies = if ($state.Local) { @('127.0.0.1') } else {
+        try { Get-CloudflareRanges }
+        catch {
+            @('173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20',
+              '188.114.96.0/20', '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13', '104.24.0.0/14', '172.64.0.0/13',
+              '131.0.72.0/22', '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32', '2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32')
+        }
     }
+    # http://localhost has no HTTPS, so Atom must not send visitors there or keep its cookies for HTTPS only.
+    $https = if ($state.Local) { 'false' } else { 'true' }
     $settings = [ordered]@{
-        APP_NAME = $state.HotelName; APP_ENV = 'production'; APP_DEBUG = 'false'; APP_URL = "https://$domain"; LOG_LEVEL = 'warning'
+        APP_NAME = $state.HotelName; APP_ENV = 'production'; APP_DEBUG = 'false'; APP_URL = $site; LOG_LEVEL = 'warning'
         DB_CONNECTION = 'mariadb'; DB_HOST = '127.0.0.1'; DB_PORT = '3306'; DB_DATABASE = 'plus'; DB_USERNAME = 'hotel'; DB_PASSWORD = $state.DbPassword
-        EMULATOR_DRIVER = 'plus'; CLIENT_NITRO_ENABLED = 'true'; NITRO_CLIENT_PATH = "https://$domain/client"
-        RCON_HOST = '127.0.0.1'; RCON_PORT = '30001'; FORCE_HTTPS = 'true'; SESSION_SECURE_COOKIE = 'true'
-        TRUSTED_PROXIES = ($cloudflare -join ',')
+        EMULATOR_DRIVER = 'plus'; CLIENT_NITRO_ENABLED = 'true'; NITRO_CLIENT_PATH = "$site/client"
+        RCON_HOST = '127.0.0.1'; RCON_PORT = '30001'; FORCE_HTTPS = $https; SESSION_SECURE_COOKIE = $https
+        TRUSTED_PROXIES = ($proxies -join ',')
     }
     foreach ($key in $settings.Keys) { Set-EnvValue $envFile $key $settings[$key] }
 
@@ -854,8 +969,8 @@ $user->forceFill(['username' => getenv('ADMIN_USER'), 'mail' => getenv('ADMIN_EM
         Remove-Item $script, Env:\ATOM_ADMIN_PASSWORD, Env:\ADMIN_PASSWORD
     }
     $values = @{
-        nitro_path = "https://$domain/client"; rcon_ip = '127.0.0.1'; rcon_port = '30001'
-        badges_path = "https://$domain/hotel-files/c_images/album1584"; furniture_icons_path = "https://$domain/hotel-files/c_images/hof_furni/icons"
+        nitro_path = "$site/client"; rcon_ip = '127.0.0.1'; rcon_port = '30001'
+        badges_path = "$site/hotel-files/c_images/album1584"; furniture_icons_path = "$site/hotel-files/c_images/hof_furni/icons"
     }
     foreach ($key in $values.Keys) { Sql "UPDATE website_settings SET value = '$($values[$key])' WHERE ``key`` = '$key'" 'plus' | Out-Null }
     Run "$PhpDir\php.exe" artisan optimize:clear
@@ -872,7 +987,8 @@ $user->forceFill(['username' => getenv('ADMIN_USER'), 'mail' => getenv('ADMIN_EM
 }
 
 function Set-IisSite {
-    Step 'Configuring the IIS website, HTTPS and the firewall'
+    $isLocal = [bool]$state.Local
+    if ($isLocal) { Step 'Configuring the IIS website for http://localhost' } else { Step 'Configuring the IIS website, HTTPS and the firewall' }
     Import-Module WebAdministration
     $domain = $state.Domain
     $site = 'Hotel'
@@ -898,27 +1014,39 @@ function Set-IisSite {
     }
 
     # Without a site for bare IP requests, IIS answers them with an error instead of a page.
-    if (Get-Website -Name 'Default Web Site' -ErrorAction SilentlyContinue) { Remove-Website -Name 'Default Web Site' }
+    # On a PC, IIS's own welcome site would answer every address on the network. A site the owner changed stays.
+    $default = Get-Website -Name 'Default Web Site' -ErrorAction SilentlyContinue
+    if ($default -and (-not $isLocal -or (Test-StockIisSite $default))) { Remove-Website -Name 'Default Web Site' }
 
     if (-not (Test-Path "IIS:\AppPools\$pool")) { New-WebAppPool -Name $pool | Out-Null }
     Set-ItemProperty "IIS:\AppPools\$pool" -Name managedRuntimeVersion -Value ''
     if (-not (Get-Website -Name $site -ErrorAction SilentlyContinue)) {
-        New-Website -Name $site -PhysicalPath "$HotelRoot\cms\public" -ApplicationPool $pool -HostHeader $domain -Port 80 | Out-Null
+        if ($isLocal) { New-Website -Name $site -PhysicalPath "$HotelRoot\cms\public" -ApplicationPool $pool -IPAddress '127.0.0.1' -HostHeader $domain -Port 80 | Out-Null }
+        else { New-Website -Name $site -PhysicalPath "$HotelRoot\cms\public" -ApplicationPool $pool -HostHeader $domain -Port 80 | Out-Null }
     }
     if (-not (Get-WebConfiguration -PSPath $apphost -Location $site -Filter "system.webServer/defaultDocument/files/add[@value='index.php']")) {
         Add-WebConfigurationProperty -PSPath $apphost -Location $site -Filter 'system.webServer/defaultDocument/files' -Name '.' -Value @{ value = 'index.php' } -AtIndex 0
     }
-    $hosts = @($domain, "www.$domain")
-    if ($WsHost -ne $domain) { $hosts += $WsHost }
-    $cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -eq "CN=$domain" } | Select-Object -First 1
-    if (-not $cert) {
-        $cert = New-SelfSignedCertificate -DnsName $domain, "*.$domain" -CertStoreLocation Cert:\LocalMachine\My -NotAfter (Get-Date).AddYears(10)
-    }
-    foreach ($name in $hosts) {
-        if (-not (Get-WebBinding -Name $site -Protocol http -HostHeader $name -Port 80)) { New-WebBinding -Name $site -Protocol http -Port 80 -HostHeader $name }
-        if (-not (Get-WebBinding -Name $site -Protocol https -HostHeader $name -Port 443)) {
-            New-WebBinding -Name $site -Protocol https -Port 443 -HostHeader $name -SslFlags 1
-            (Get-WebBinding -Name $site -Protocol https -HostHeader $name -Port 443).AddSslCertificate($cert.Thumbprint, 'My')
+    if ($isLocal) {
+        # Only this PC: browsers try ::1 for localhost before 127.0.0.1.
+        foreach ($binding in '127.0.0.1:80:localhost', '[::1]:80:localhost') {
+            if (-not (Get-WebBinding -Name $site | Where-Object { $_.bindingInformation -eq $binding })) {
+                New-ItemProperty "IIS:\Sites\$site" -Name bindings -Value @{ protocol = 'http'; bindingInformation = $binding } | Out-Null
+            }
+        }
+    } else {
+        $hosts = @($domain, "www.$domain")
+        if ($WsHost -ne $domain) { $hosts += $WsHost }
+        $cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -eq "CN=$domain" } | Select-Object -First 1
+        if (-not $cert) {
+            $cert = New-SelfSignedCertificate -DnsName $domain, "*.$domain" -CertStoreLocation Cert:\LocalMachine\My -NotAfter (Get-Date).AddYears(10)
+        }
+        foreach ($name in $hosts) {
+            if (-not (Get-WebBinding -Name $site -Protocol http -HostHeader $name -Port 80)) { New-WebBinding -Name $site -Protocol http -Port 80 -HostHeader $name }
+            if (-not (Get-WebBinding -Name $site -Protocol https -HostHeader $name -Port 443)) {
+                New-WebBinding -Name $site -Protocol https -Port 443 -HostHeader $name -SslFlags 1
+                (Get-WebBinding -Name $site -Protocol https -HostHeader $name -Port 443).AddSslCertificate($cert.Thumbprint, 'My')
+            }
         }
     }
     foreach ($dir in @(@('client', "$HotelRoot\client"), @('hotel-files', "$HotelRoot\hotel-files"))) {
@@ -951,21 +1079,30 @@ function Set-IisSite {
     foreach ($name in 'PlusEMU www', 'PlusEMU websocket', 'PlusEMU endpoints') {
         if (Get-WebConfiguration -PSPath $apphost -Filter "$rules/rule[@name='$name']") { Clear-WebConfiguration -PSPath $apphost -Filter "$rules/rule[@name='$name']" }
     }
-    Add-WebConfigurationProperty -PSPath $apphost -Filter $rules -Name '.' -Value @{ name = 'PlusEMU www'; stopProcessing = 'True' }
-    Set-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU www']/match" -Name 'url' -Value '(.*)'
-    Add-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU www']/conditions" -Name '.' -Value @{ input = '{HTTP_HOST}'; pattern = "^www\.$([regex]::Escape($domain))$" }
-    $action = "$rules/rule[@name='PlusEMU www']/action"
-    Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'type' -Value 'Redirect'
-    Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'url' -Value "https://$domain/{R:1}"
-    Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'redirectType' -Value 'Permanent'
+    if (-not $isLocal) {
+        Add-WebConfigurationProperty -PSPath $apphost -Filter $rules -Name '.' -Value @{ name = 'PlusEMU www'; stopProcessing = 'True' }
+        Set-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU www']/match" -Name 'url' -Value '(.*)'
+        Add-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU www']/conditions" -Name '.' -Value @{ input = '{HTTP_HOST}'; pattern = "^www\.$([regex]::Escape($domain))$" }
+        $action = "$rules/rule[@name='PlusEMU www']/action"
+        Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'type' -Value 'Redirect'
+        Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'url' -Value "https://$domain/{R:1}"
+        Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'redirectType' -Value 'Permanent'
+    }
 
     Add-WebConfigurationProperty -PSPath $apphost -Filter $rules -Name '.' -Value @{ name = 'PlusEMU websocket'; stopProcessing = 'True' }
     Set-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU websocket']/match" -Name 'url' -Value "^$([regex]::Escape($WsPath))$"
     Add-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU websocket']/conditions" -Name '.' -Value @{ input = '{HTTP_HOST}'; pattern = "^$([regex]::Escape($WsHost))$" }
-    Add-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU websocket']/conditions" -Name '.' -Value @{ input = '{HTTP_ORIGIN}'; pattern = "^https://$([regex]::Escape($domain))$" }
+    Add-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU websocket']/conditions" -Name '.' -Value @{ input = '{HTTP_ORIGIN}'; pattern = "^$([regex]::Escape((Get-SiteUrl)))$" }
     $action = "$rules/rule[@name='PlusEMU websocket']/action"
     Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'type' -Value 'Rewrite'
     Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'url' -Value 'http://127.0.0.1:2096/'
+    # The emulator sees IIS as the peer, so it reads the visitor's address from X-Real-IP. Cloudflare sends it as CF-Connecting-IP.
+    $variables = 'system.webServer/rewrite/allowedServerVariables'
+    if (-not (Get-WebConfiguration -PSPath $apphost -Filter "$variables/add[@name='HTTP_X_REAL_IP']")) {
+        Add-WebConfigurationProperty -PSPath $apphost -Filter $variables -Name '.' -Value @{ name = 'HTTP_X_REAL_IP' }
+    }
+    $visitor = if ($isLocal) { '{REMOTE_ADDR}' } else { '{HTTP_CF_CONNECTING_IP}' }
+    Add-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU websocket']/serverVariables" -Name '.' -Value @{ name = 'HTTP_X_REAL_IP'; value = $visitor }
 
     Add-WebConfigurationProperty -PSPath $apphost -Filter $rules -Name '.' -Value @{ name = 'PlusEMU endpoints'; stopProcessing = 'True' }
     Set-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU endpoints']/match" -Name 'url' -Value '^api/(gamedata/furnidata|badges/leaderboard)$'
@@ -979,10 +1116,12 @@ function Set-IisSite {
     Set-HotelPermissions
     foreach ($dir in "$HotelRoot\cms\storage", "$HotelRoot\cms\bootstrap\cache") { Run icacls.exe $dir /grant "IIS AppPool\$($pool):(OI)(CI)M" /T /Q }
     Run icacls.exe "$HotelRoot\cms\.env" /inheritance:r /grant:r 'Administrators:F' 'SYSTEM:F' "IIS AppPool\$($pool):R"
-    Set-IisLimits $site
+    Set-IisLimits $site $isLocal
     Start-Website -Name $site -ErrorAction SilentlyContinue
     if ((Get-WebAppPoolState -Name $pool).Value -eq 'Started') { Restart-WebAppPool -Name $pool } else { Start-WebAppPool -Name $pool }
-    Ok "IIS serves https://$domain"
+    Ok "IIS serves $(Get-SiteUrl)"
+    # A local install opens no port in the firewall and leaves its rules as they are.
+    if ($isLocal) { return }
 
     # A new rule lets every address in until Update-CloudflareFirewall has limited it to Cloudflare.
     foreach ($port in 80, 443) {
@@ -1051,30 +1190,41 @@ function Write-CloudflareCommand {
     Register-ScheduledTask -TaskName 'PlusEMU Cloudflare addresses' -Action $action -Trigger $trigger -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
 }
 
+function Test-StockIisSite($Site) {
+    $bindings = @($Site.bindings.Collection | ForEach-Object { "$($_.protocol) $($_.bindingInformation)" }) -join ';'
+    return $Site.physicalPath -eq '%SystemDrive%\inetpub\wwwroot' -and $bindings -eq 'http *:80:'
+}
+
 # Per-visitor limits and security headers for the hotel site.
-function Set-IisLimits($Site) {
+function Set-IisLimits($Site, [bool]$IsLocal = $false) {
     $apphost = 'MACHINE/WEBROOT/APPHOST'
-    # Visitors arrive through Cloudflare, so the visitor's address is read from X-Forwarded-For.
-    # The game client loads hundreds of hotel files at once, so the request rate stays high.
-    $dynamic = 'system.webServer/security/dynamicIpSecurity'
-    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $dynamic -Name 'enableProxyMode' -Value 'True'
-    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $dynamic -Name 'denyAction' -Value 'Forbidden'
-    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByConcurrentRequests" -Name 'enabled' -Value 'True'
-    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByConcurrentRequests" -Name 'maxConcurrentRequests' -Value 50
-    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByRequestRate" -Name 'enabled' -Value 'True'
-    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByRequestRate" -Name 'maxRequests' -Value 1500
-    Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByRequestRate" -Name 'requestIntervalInMilliseconds' -Value 10000
     $requestLimits = 'system.webServer/security/requestFiltering/requestLimits'
     Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $requestLimits -Name 'maxAllowedContentLength' -Value 20971520
     Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $requestLimits -Name 'maxUrl' -Value 4096
     Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $requestLimits -Name 'maxQueryString' -Value 2048
-    # Slow clients that never finish sending their request headers are dropped after 10 seconds.
-    & cmd.exe /c 'netsh http delete timeout timeouttype=headerwaittimeout >nul 2>&1'
-    try { Run netsh.exe http add timeout timeouttype=headerwaittimeout value=10 }
-    catch { Say "      Could not set the 10 second header timeout ($_). The website works without it." 'Yellow' }
-
     $headers = 'system.webServer/httpProtocol/customHeaders'
-    foreach ($header in @(@('Strict-Transport-Security', 'max-age=31536000'), @('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), usb=()'))) {
+    $added = @(, @('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), usb=()'))
+    # Every local visitor is 127.0.0.1, so per-visitor limits would only lock out the owner and their test clients.
+    # The header timeout is a setting of the whole PC, and HSTS on localhost would send the browser to https:// for every other project.
+    if (-not $IsLocal) {
+        # Visitors arrive through Cloudflare, so the visitor's address is read from X-Forwarded-For.
+        # The game client loads hundreds of hotel files at once, so the request rate stays high.
+        $dynamic = 'system.webServer/security/dynamicIpSecurity'
+        Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $dynamic -Name 'enableProxyMode' -Value 'True'
+        Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $dynamic -Name 'denyAction' -Value 'Forbidden'
+        Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByConcurrentRequests" -Name 'enabled' -Value 'True'
+        Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByConcurrentRequests" -Name 'maxConcurrentRequests' -Value 50
+        Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByRequestRate" -Name 'enabled' -Value 'True'
+        Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByRequestRate" -Name 'maxRequests' -Value 1500
+        Set-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter "$dynamic/denyByRequestRate" -Name 'requestIntervalInMilliseconds' -Value 10000
+        # Slow clients that never finish sending their request headers are dropped after 10 seconds.
+        & cmd.exe /c 'netsh http delete timeout timeouttype=headerwaittimeout >nul 2>&1'
+        try { Run netsh.exe http add timeout timeouttype=headerwaittimeout value=10 }
+        catch { Say "      Could not set the 10 second header timeout ($_). The website works without it." 'Yellow' }
+        $added = @(, @('Strict-Transport-Security', 'max-age=31536000')) + $added
+    }
+
+    foreach ($header in $added) {
         if (Get-WebConfiguration -PSPath $apphost -Location $Site -Filter "$headers/add[@name='$($header[0])']") {
             Remove-WebConfigurationProperty -PSPath $apphost -Location $Site -Filter $headers -Name 'collection' -AtElement @{ name = $header[0] }
         }
@@ -1109,10 +1259,12 @@ function Set-WindowsUpdates {
 
 # The emulator's service log, the website log and the IIS logs are removed after 14 days.
 function Set-LogCleanup {
+    # A PC may serve other IIS sites, so a local install cleans up the hotel site's logs only.
+    $iisLogs = if ($state.Local) { "W3SVC$((Get-Website -Name 'Hotel').id)" } else { '*' }
     Write-Utf8 $CleanupScript @"
 # Installed by the PlusEMU installer. The "PlusEMU log cleanup" task runs this every day.
 `$limit = (Get-Date).AddDays(-14)
-foreach (`$pattern in '$HotelRoot\emulator\service\*.log', '$HotelRoot\cms\storage\logs\*.log', "`$env:SystemDrive\inetpub\logs\LogFiles\*\*.log") {
+foreach (`$pattern in '$HotelRoot\emulator\service\*.log', '$HotelRoot\cms\storage\logs\*.log', "`$env:SystemDrive\inetpub\logs\LogFiles\$iisLogs\*.log") {
     Get-ChildItem `$pattern -File -ErrorAction SilentlyContinue | Where-Object LastWriteTime -lt `$limit | Remove-Item -Force -ErrorAction SilentlyContinue
 }
 "@
@@ -1187,6 +1339,14 @@ function Write-BackupCommand {
 }
 
 function Protect-Server {
+    # A local install changes nothing on the PC outside the hotel: no account lockout and no Windows Update policy.
+    if ($state.Local) {
+        Step "Setting up the hotel's log cleanup, backups and health checks"
+        Set-LogCleanup
+        Write-BackupCommand
+        Write-HealthCommand
+        return
+    }
     Step 'Securing the server (failed logins, Windows updates, logs, backups and health checks)'
     # A domain controller would apply this to the whole domain, so its own policy is left alone.
     if ((Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4) {
@@ -1208,7 +1368,8 @@ function Protect-Server {
 
 # ---------------------------------------------------------------- health check
 
-# Each check: its name (the function Test-Health<Name>), what it checks, and the command that shows more.
+# Each check: its name (the function Test-Health<Name>), what it checks, the command that shows more,
+# and Server when only a server install has the thing it checks.
 function Get-HealthChecks {
     return @(
         @{ Name = 'Emulator'; Label = 'The emulator service'; Look = "Get-Content $HotelRoot\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 100" }
@@ -1219,9 +1380,9 @@ function Get-HealthChecks {
         @{ Name = 'Database'; Label = 'The database (MariaDB)'; Look = 'Get-Service MariaDB' }
         @{ Name = 'Disk'; Label = 'Free disk space'; Look = 'Get-PSDrive C' }
         @{ Name = 'Backup'; Label = 'The nightly backup'; Look = "Get-Content $BackupLog -Tail 20" }
-        @{ Name = 'Certificate'; Label = 'The HTTPS certificate'; Look = "Get-ChildItem Cert:\LocalMachine\My | Select-Object Subject, NotAfter" }
-        @{ Name = 'Cloudflare'; Label = 'The Cloudflare address refresh'; Look = "Get-Content $CloudflareLog -Tail 20" }
-    )
+        @{ Name = 'Certificate'; Label = 'The HTTPS certificate'; Look = "Get-ChildItem Cert:\LocalMachine\My | Select-Object Subject, NotAfter"; Server = $true }
+        @{ Name = 'Cloudflare'; Label = 'The Cloudflare address refresh'; Look = "Get-Content $CloudflareLog -Tail 20"; Server = $true }
+    ) | Where-Object { -not ($state.Local -and $_.Server) }
 }
 
 # Runs curl.exe without logging and returns its exit code and output.
@@ -1251,8 +1412,8 @@ function Test-HealthWebsite {
     $domain = $state.Domain
     $code = (Get-ProbeResult @('-s', '-o', 'NUL', '-w', '%{http_code}', '--max-time', '10', '--resolve', "$($domain):80:127.0.0.1", "http://$domain/")).Output
     if ($code -match '^[234]\d\d$') { return }
-    if (-not $code -or $code -eq '000') { return "https://$domain does not answer on this server." }
-    return "https://$domain answers with error $code on this server."
+    if (-not $code -or $code -eq '000') { return "$(Get-SiteUrl) does not answer on this server." }
+    return "$(Get-SiteUrl) answers with error $code on this server."
 }
 
 function Test-HealthDatabase {
@@ -1369,7 +1530,7 @@ function Write-HealthCommand {
     }
     $text += "`$script:Log = '$HealthLog'`r`n"
     $text += "Import-Module WebAdministration -ErrorAction SilentlyContinue`r`n"
-    $functions = @('Write-Log', 'Write-Utf8', 'Find-MariaDb', 'Get-MariaDb', 'Sql', 'Get-HotelCertificate', 'Get-ProbeResult', 'Test-PortAnswers', 'Get-FreeMegabytes',
+    $functions = @('Write-Log', 'Write-Utf8', 'Find-MariaDb', 'Get-MariaDb', 'Sql', 'Get-SiteUrl', 'Get-HotelCertificate', 'Get-ProbeResult', 'Test-PortAnswers', 'Get-FreeMegabytes',
                    'Get-HealthChecks', 'Send-Discord', 'Write-HealthLine', 'Invoke-HealthCheck') + @(Get-HealthChecks | ForEach-Object { "Test-Health$($_.Name)" })
     foreach ($name in $functions) {
         $text += "function $name {$((Get-Item "function:$name").Definition)}`r`n"
@@ -1380,6 +1541,7 @@ function Write-HealthCommand {
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
     Register-ScheduledTask -TaskName 'PlusEMU health check' -Action $action -Trigger $trigger -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
     Ok "Health check every 5 minutes (task: PlusEMU health check, log: $HealthLog)"
+    if ($state.Local) { return }
     if (-not $state.DiscordWebhook) {
         Say '      Discord alerts are off. To turn them on, run the installer again with $env:PLUSEMU_DISCORD_WEBHOOK set to the webhook URL.'
         return
@@ -1752,8 +1914,28 @@ function Write-Guide {
     Ok 'Guide written (also on your desktop)'
 }
 
+# The guide for this PC, in place of the server's Cloudflare guide.
+function Write-LocalGuide($Guide) {
+    Render (Join-Path $Templates 'guide-local.html') $Guide ([ordered]@{
+        HOTEL_NAME = $state.HotelName; SITE_URL = Get-SiteUrl; ADMIN_USER = $state.AdminUser; LOCAL_FLAG = '-Local'
+        CREDENTIALS_FILE = $StateFile; CREDENTIALS_COMMAND = "Get-Content $StateFile"
+        START_COMMAND = 'Start-Service PlusEMU'; STOP_COMMAND = 'Stop-Service PlusEMU'; RESTART_COMMAND = 'Restart-Service PlusEMU'
+        LOG_COMMAND = "Get-Content $HotelRoot\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 50 -Wait"
+        STOP_ALL_COMMAND = 'Stop-Service PlusEMU, W3SVC, MariaDB'; HEALTH_RUN = "& '$HealthScript'"; UPDATE_RUN = 'plusemu-update'
+        BACKUP_RUN = "Start-ScheduledTask 'PlusEMU nightly backup'"; BACKUP_DIR = $NightlyRoot
+        SERVER_INSTALL = "irm https://raw.githubusercontent.com/$InstallerRepo/main/install.ps1 | iex"
+    })
+}
+
 # The guide in its manual form, or in its connected form after the Cloudflare step.
 function Write-GuideFile {
+    $guide = Join-Path (Join-Path $HotelRoot 'setup-guide') 'index.html'
+    New-Item -ItemType Directory -Force -Path (Split-Path $guide) | Out-Null
+    if ($state.Local) {
+        Write-LocalGuide $guide
+        Copy-Item $guide "$([Environment]::GetFolderPath('Desktop'))\Hotel setup guide.html" -Force
+        return
+    }
     $mode = if ($state.GuideMode) { $state.GuideMode } else { 'simple' }
     $status = ''; $manualStart = ''; $manualEnd = ''; $gameAddress = ''
     $intro = 'Now connect <b>{{DOMAIN}}</b> through Cloudflare and install its origin certificate.'
@@ -1770,8 +1952,6 @@ function Write-GuideFile {
         $label = if ($WsHost.EndsWith(".$($state.Domain)")) { $WsHost.Substring(0, $WsHost.Length - $state.Domain.Length - 1) } else { $WsHost }
         $wsRow = "<tr><td>A</td><td><code>$label</code></td><td><code>$ServerIp</code></td><td>Proxied (orange cloud)</td></tr>"
     }
-    $guide = Join-Path (Join-Path $HotelRoot 'setup-guide') 'index.html'
-    New-Item -ItemType Directory -Force -Path (Split-Path $guide) | Out-Null
     # The fragments come first, so the placeholders inside them are filled too.
     Render (Join-Path $Templates 'setup-guide.html') $guide ([ordered]@{
         CLOUDFLARE_STATUS = $status; MANUAL_START = $manualStart; MANUAL_END = $manualEnd; GUIDE_INTRO = $intro; GAME_ADDRESS_ITEM = $gameAddress
@@ -1795,13 +1975,27 @@ function Invoke-InstallHealthCheck {
     foreach ($problem in $script:HealthProblems) { Write-Host "    $problem" }
 }
 
+function Open-LocalGuide {
+    if ((Get-Setting 'PLUSEMU_YES' '0') -ne '1') {
+        try { Start-Process (Join-Path (Join-Path $HotelRoot 'setup-guide') 'index.html') } catch { Write-Log "$_" }
+        Say '  Your guide is open in your browser (also on your desktop: "Hotel setup guide").'
+    } else {
+        Say "  Your guide: $HotelRoot\setup-guide\index.html (also on your desktop: `"Hotel setup guide`")."
+    }
+}
+
 function Complete-Install {
     Write-Host ''
     Write-Host 'Your hotel is installed!' -ForegroundColor Green
     Write-Host ''
     Invoke-InstallHealthCheck
     Write-Host ''
-    if ($state.CloudflareSetup -eq 'done') {
+    $where = 'on this server, or through an SSH tunnel'
+    if ($state.Local) {
+        $where = 'on this PC'
+        Write-Host '  Open your hotel on this PC: http://localhost (housekeeping: http://localhost/housekeeping).'
+        Write-Host '  Your guide explains how to start, stop, update and back up the hotel (also on your desktop: "Hotel setup guide").'
+    } elseif ($state.CloudflareSetup -eq 'done') {
         Write-Host "  Cloudflare is connected. Open https://$($state.Domain), log in and enter the hotel to check it."
         Write-Host '  The setup guide shows what the installer set up and what to check (also on your desktop: "Hotel setup guide").'
     } else {
@@ -1809,11 +2003,11 @@ function Complete-Install {
         Write-Host '  Follow the setup guide (also on your desktop: "Hotel setup guide").'
     }
     Write-Host ''
-    Write-Host "  Your admin login for https://$($state.Domain) (also saved in $StateFile):"
+    Write-Host "  Your admin login for $(Get-SiteUrl) (also saved in $StateFile):"
     Write-Host '      Username: ' -NoNewline; Write-Host $state.AdminUser -ForegroundColor White
     Write-Host '      Password: ' -NoNewline; Write-Host $state.AdminPassword -ForegroundColor White
     Write-Host ''
-    Write-Host '  MariaDB connection (on this server, or through an SSH tunnel):'
+    Write-Host "  MariaDB connection ($($where)):"
     Write-Host '      Host: 127.0.0.1    Port: 3306    Database: plus    Username: hotel'
     Write-Host '      Password: ' -NoNewline; Write-Host $state.DbPassword -ForegroundColor White
     Write-Host '      Connect locally with mariadb.exe from the MariaDB bin folder:'
@@ -1825,6 +2019,7 @@ function Complete-Install {
     Write-Host '  Update the emulator, client and hotel files later (Administrator PowerShell): plusemu-update'
     Write-Host "  Nightly backups of the database and your settings: $NightlyRoot"
     Write-Host "  Check the hotel now (Administrator PowerShell): & '$HealthScript' (it runs every 5 minutes; log: $HealthLog)"
+    if ($state.Local) { Write-Host '  This hotel works on this PC only. For a public hotel, run the installer without -Local on a server.' }
     Write-Host '  Store passwords somewhere safe. Change the initial admin password after logging in;'
     Write-Host '  the saved file retains the initial password. Keep passwords out of shared logs and screenshots.'
     Write-Host ''
@@ -2286,6 +2481,38 @@ function Invoke-Update([switch]$Check, [switch]$Yes, [switch]$Rollback, [switch]
     }
 }
 
+function Install-Hotel {
+    Get-InstallerFiles
+    $first = -not (Test-Path $StateFile)
+    Read-Answers
+    if ($state.Local) {
+        $script:TotalSteps = 11
+        # A first run that stops here keeps no settings, so this PC can still get a server install.
+        try { Assert-FreePorts }
+        catch {
+            if ($first) { Remove-Item $StateFile -ErrorAction SilentlyContinue }
+            throw
+        }
+    }
+    Say "  Admin and database passwords are saved in $StateFile. Retrieve them in Administrator PowerShell: Get-Content $StateFile"
+    Get-Derived
+    Install-WebServer
+    Install-Toolchains
+    Install-Database
+    Get-Releases
+    Initialize-HotelDatabase
+    Get-HotelFiles
+    Start-Emulator
+    Write-ClientConfig
+    Install-Cms
+    Set-IisSite
+    Protect-Server
+    Write-Guide
+    Write-UpdateCommand
+    if ($state.Local) { Open-LocalGuide } else { Connect-Cloudflare }
+    Complete-Install
+}
+
 try {
     if ($Update) {
         Invoke-Update -Check:$Check -Yes:$Yes -Rollback:$Rollback -Assets:$Assets
@@ -2294,25 +2521,7 @@ try {
         # Updates, backups and the health check wait for the installer.
         try { $script:InstallLock = [IO.File]::Open($LockFile, 'OpenOrCreate', 'ReadWrite', 'None') }
         catch { throw 'An update or a backup is running. Try again in a few minutes.' }
-        Get-InstallerFiles
-        Read-Answers
-        Say "  Admin and database passwords are saved in $StateFile. Retrieve them in Administrator PowerShell: Get-Content $StateFile"
-        Get-Derived
-        Install-WebServer
-        Install-Toolchains
-        Install-Database
-        Get-Releases
-        Initialize-HotelDatabase
-        Get-HotelFiles
-        Start-Emulator
-        Write-ClientConfig
-        Install-Cms
-        Set-IisSite
-        Protect-Server
-        Write-Guide
-        Write-UpdateCommand
-        Connect-Cloudflare
-        Complete-Install
+        Install-Hotel
     }
 } catch {
     Write-Log "ERROR: $_`n$($_.ScriptStackTrace)"
@@ -2333,6 +2542,8 @@ try {
     }
 } finally {
     if ($script:InstallLock) { $script:InstallLock.Dispose() }
+    # irm | iex runs in the owner's own window, which keeps the PC's own Node.js afterwards.
+    if ($script:LocalNode) { $env:Path = $env:Path.Replace("$script:LocalNode;", ''); $script:LocalNode = $null }
     foreach ($name in 'MYSQL_PWD', 'ATOM_ADMIN_PASSWORD', 'ADMIN_PASSWORD') { Remove-Item "Env:\$name" -ErrorAction SilentlyContinue }
     $ErrorActionPreference = $SessionPreferences.ErrorAction
     $ProgressPreference = $SessionPreferences.Progress
