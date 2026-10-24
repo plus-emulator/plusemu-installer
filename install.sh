@@ -35,6 +35,12 @@ UPDATE_LOG=/var/log/plusemu-update.log
 UPDATE_COMMAND=/usr/local/sbin/plusemu-update
 BACKUP_ROOT=/var/backups/plusemu
 KEEP_BACKUPS=3
+NIGHTLY_ROOT=$BACKUP_ROOT/nightly
+KEEP_NIGHTLY=7
+BACKUP_COMMAND=/usr/local/sbin/plusemu-backup
+BACKUP_CRON=/etc/cron.d/plusemu-backup
+BACKUP_LOG=/var/log/plusemu-backup.log
+SSL_DIR=/etc/ssl/plusemu
 LOCK_FILE=/run/plusemu-update.lock
 SSHD_DROPIN=/etc/ssh/sshd_config.d/10-plusemu.conf
 LOGROTATE_CONF=/etc/logrotate.d/plusemu
@@ -731,7 +737,7 @@ EOF
 
 configure_web() {
     step "Configuring nginx, HTTPS and the firewall"
-    local ssl=/etc/ssl/plusemu php_sock=/run/php/php$PHP-fpm.sock
+    local ssl=$SSL_DIR php_sock=/run/php/php$PHP-fpm.sock
     mkdir -p "$ssl"
     if [ ! -f "$ssl/cert.pem" ]; then
             openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout "$ssl/key.pem" -out "$ssl/cert.pem" \
@@ -1103,13 +1109,64 @@ EOF
     ok "Logs are kept for 14 days (the system journal uses at most 1 GB)"
 }
 
+# The plusemu-backup command. It saves what a download cannot bring back: the database,
+# the settings, the website's uploads and the hotel's texts.
+nightly_backup() {
+    local target partial free_mb database_mb path saved=() settings=()
+    exec 9> "$LOCK_FILE"
+    if ! flock -w "${BACKUP_LOCK_WAIT:-3600}" 9; then
+        echo "$(date) An update is still running; no backup was made."
+        return 1
+    fi
+    install -d -m 700 "$BACKUP_ROOT" "$NIGHTLY_ROOT"
+    database_mb=$(mariadb --protocol=socket -uroot -N -e "SELECT COALESCE(ROUND(SUM(data_length + index_length) / 1048576), 0) FROM information_schema.tables WHERE table_schema = 'plus'")
+    free_mb=$(df -Pm "$NIGHTLY_ROOT" | awk 'NR == 2 {print $4}')
+    if [ "$free_mb" -lt $((database_mb + 2048)) ]; then
+        echo "$(date) Only $free_mb MB free in $NIGHTLY_ROOT; no backup was made."
+        return 1
+    fi
+    target=$NIGHTLY_ROOT/$(date -u +%Y%m%d-%H%M%S-%N)
+    partial=$target.partial
+    install -d -m 700 "$partial"
+    mariadb-dump --protocol=socket -uroot --single-transaction --routines --triggers --events plus | gzip > "$partial/database.sql.gz"
+    for path in emulator/Config client/configuration cms/.env cms/storage/app hotel-files/gamedata; do
+        if [ -e "$HOTEL_ROOT/$path" ]; then saved+=("$path"); fi
+    done
+    # Exit code 1 only means a file changed while it was read.
+    tar -C "$HOTEL_ROOT" --warning=no-file-changed -czf "$partial/hotel.tar.gz" "${saved[@]}" || [ "$?" = 1 ]
+    for path in "$STATE_FILE" "$VERSIONS_FILE" "$SSL_DIR"; do
+        if [ -e "$path" ]; then settings+=("${path#/}"); fi
+    done
+    tar -C / -czf "$partial/settings.tar.gz" "${settings[@]}"
+    mv "$partial" "$target"
+    find "$NIGHTLY_ROOT" -mindepth 1 -maxdepth 1 -type d -name '*.partial' -exec rm -rf {} +
+    find "$NIGHTLY_ROOT" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' | sort | head -n -"$KEEP_NIGHTLY" | xargs -r -d '\n' rm -rf
+    echo "$(date) Backup saved in $target"
+}
+
+install_backup_command() {
+    mkdir -p "$(dirname "$BACKUP_COMMAND")" "$(dirname "$BACKUP_CRON")"
+    {
+        echo '#!/usr/bin/env bash'
+        echo '# Installed by the PlusEMU installer. Cron runs it every night at 04:00; run it by hand with: sudo plusemu-backup'
+        echo 'set -Eeuo pipefail'
+        declare -p HOTEL_ROOT STATE_FILE VERSIONS_FILE SSL_DIR BACKUP_ROOT NIGHTLY_ROOT KEEP_NIGHTLY LOCK_FILE
+        declare -f nightly_backup
+        echo 'nightly_backup'
+    } > "$BACKUP_COMMAND"
+    chmod 700 "$BACKUP_COMMAND"
+    echo "0 4 * * * root $BACKUP_COMMAND >> $BACKUP_LOG 2>&1" > "$BACKUP_CRON"
+    ok "Nightly backups at 04:00 in $NIGHTLY_ROOT (the newest $KEEP_NIGHTLY are kept)"
+}
+
 secure_server() {
-    step "Securing the server (SSH, failed logins, updates, network and logs)"
+    step "Securing the server (SSH, failed logins, updates, logs and backups)"
     protect_ssh_logins
     harden_ssh
     install_security_updates
     tune_network
     rotate_logs
+    install_backup_command
 }
 
 # shellcheck disable=SC2034 # the {{KEY}} values are read by render() through ${!key}
@@ -1152,6 +1209,7 @@ finish() {
     say ""
     say "  Retrieve saved passwords: sudo cat $STATE_FILE"
     say "  Update the emulator and the client later with: sudo plusemu-update"
+    say "  Nightly backups of the database and your settings: $NIGHTLY_ROOT"
     if [ "${SSH_PASSWORDS:-}" = on ]; then
         say "  ${yellow}SSH password login is still on.${reset} To turn it off, add your SSH key, log in with it and run the installer again."
     fi

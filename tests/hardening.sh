@@ -125,4 +125,96 @@ rotate_logs
 expect_call 'systemctl restart systemd-journald'
 [ "$(grep -c SystemMaxUse "$JOURNALD_DROPIN")" = 1 ]
 
+# ---------------------------------------------------------------- nightly backups
+
+HOTEL_ROOT=$TEST_DIR/hotel
+STATE_FILE=$TEST_DIR/etc/plusemu/hotel.env
+VERSIONS_FILE=$TEST_DIR/etc/plusemu/versions.env
+SSL_DIR=$TEST_DIR/etc/ssl/plusemu
+BACKUP_ROOT=$TEST_DIR/backups
+NIGHTLY_ROOT=$BACKUP_ROOT/nightly
+BACKUP_COMMAND=$TEST_DIR/sbin/plusemu-backup
+BACKUP_CRON=$TEST_DIR/cron.d/plusemu-backup
+BACKUP_LOG=$TEST_DIR/plusemu-backup.log
+LOCK_FILE=$TEST_DIR/update.lock
+KEEP_BACKUPS=3
+mkdir -p "$HOTEL_ROOT"/{emulator/Config,emulator/backups,client/configuration,client/assets,cms/storage/app/public,cms/storage/logs,hotel-files/gamedata,hotel-files/assets} \
+    "$(dirname "$STATE_FILE")" "$SSL_DIR" "$TEST_DIR/fakebin"
+echo '{"Database": {}}' > "$HOTEL_ROOT/emulator/Config/config.json"
+echo 'binary' > "$HOTEL_ROOT/emulator/Plus Emulator"
+echo 'old dump' > "$HOTEL_ROOT/emulator/backups/old.sql"
+echo '{}' > "$HOTEL_ROOT/client/configuration/ui-config.json"
+echo 'bundle' > "$HOTEL_ROOT/client/assets/index.js"
+echo 'APP_KEY=secret' > "$HOTEL_ROOT/cms/.env"
+echo 'avatar' > "$HOTEL_ROOT/cms/storage/app/public/avatar.png"
+echo 'log' > "$HOTEL_ROOT/cms/storage/logs/laravel.log"
+echo 'texts' > "$HOTEL_ROOT/hotel-files/gamedata/ExternalTexts.json"
+echo 'furni' > "$HOTEL_ROOT/hotel-files/assets/chair.hab"
+echo "DB_PASSWORD='x'" > "$STATE_FILE"
+echo "EMULATOR_VERSION='v1'" > "$VERSIONS_FILE"
+echo 'certificate' > "$SSL_DIR/cert.pem"
+# The update's own snapshots and gamedata copies share the backup folder.
+mkdir -p "$BACKUP_ROOT/20260101-000000-000000000" "$BACKUP_ROOT/gamedata-abc"
+cat > "$TEST_DIR/fakebin/mariadb-dump" <<'FAKE'
+#!/usr/bin/env bash
+echo 'CREATE TABLE users (id INT);'
+FAKE
+cat > "$TEST_DIR/fakebin/mariadb" <<'FAKE'
+#!/usr/bin/env bash
+echo 1
+FAKE
+chmod +x "$TEST_DIR/fakebin/"*
+export PATH=$TEST_DIR/fakebin:$PATH
+
+backups() { find "$NIGHTLY_ROOT" -mindepth 1 -maxdepth 1 -type d | sort; }
+
+# The installed command runs on its own, as cron runs it.
+install_backup_command
+[ -x "$BACKUP_COMMAND" ]
+grep -Fq "0 4 * * * root $BACKUP_COMMAND" "$BACKUP_CRON"
+for ((i = 0; i < 9; i++)); do "$BACKUP_COMMAND" >> "$BACKUP_LOG" 2>&1; done
+[ "$(backups | wc -l)" = 7 ]
+latest=$(backups | tail -1)
+[[ ${latest##*/} =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]]
+[ "$(gunzip -c "$latest/database.sql.gz")" = 'CREATE TABLE users (id INT);' ]
+files=$(tar -tzf "$latest/hotel.tar.gz")
+for kept in emulator/Config/config.json client/configuration/ui-config.json cms/.env cms/storage/app/public/avatar.png hotel-files/gamedata/ExternalTexts.json; do
+    grep -qx "$kept" <<< "$files" || { echo "missing from the backup: $kept"; exit 1; }
+done
+# Files that come back with a download or an update are left out.
+for left in 'emulator/Plus Emulator' emulator/backups/old.sql client/assets/index.js hotel-files/assets/chair.hab cms/storage/logs/laravel.log; do
+    if grep -qx "$left" <<< "$files"; then echo "backed up a downloadable file: $left"; exit 1; fi
+done
+settings=$(tar -tzf "$latest/settings.tar.gz")
+for kept in "${STATE_FILE#/}" "${VERSIONS_FILE#/}" "${SSL_DIR#/}/cert.pem"; do
+    grep -qx "$kept" <<< "$settings" || { echo "missing from the settings backup: $kept"; exit 1; }
+done
+[ "$(stat -c %a "$NIGHTLY_ROOT")" = 700 ]
+
+# Pruning keeps the update's snapshots, and the update's pruning keeps the nightly backups.
+[ -d "$BACKUP_ROOT/20260101-000000-000000000" ] && [ -d "$BACKUP_ROOT/gamedata-abc" ]
+prune_snapshots
+[ "$(backups | wc -l)" = 7 ]
+
+# An unfinished backup is removed by the next one.
+mkdir "$NIGHTLY_ROOT/20260102-000000-000000000.partial"
+"$BACKUP_COMMAND" >> "$BACKUP_LOG" 2>&1
+[ ! -e "$NIGHTLY_ROOT/20260102-000000-000000000.partial" ]
+[ "$(backups | wc -l)" = 7 ]
+
+# A failed database dump keeps the previous backups and reports the failure.
+printf '#!/usr/bin/env bash\nexit 2\n' > "$TEST_DIR/fakebin/mariadb-dump"
+before=$(backups)
+if "$BACKUP_COMMAND" >> "$BACKUP_LOG" 2>&1; then echo 'a failed dump was reported as a backup'; exit 1; fi
+[ "$(backups | grep -v '\.partial$')" = "$before" ]
+
+# A running update holds the lock: the backup waits, then gives up without a new backup.
+printf '#!/usr/bin/env bash\necho dump\n' > "$TEST_DIR/fakebin/mariadb-dump"
+flock "$LOCK_FILE" sleep 3 &
+sleep 0.5
+before=$(backups | grep -v '\.partial$')
+if BACKUP_LOCK_WAIT=1 "$BACKUP_COMMAND" >> "$BACKUP_LOG" 2>&1; then echo 'backed up during an update'; exit 1; fi
+[ "$(backups | grep -v '\.partial$')" = "$before" ]
+wait
+
 printf 'Bash hardening checks passed\n' >&4

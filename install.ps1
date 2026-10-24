@@ -55,6 +55,11 @@ $VersionsFile  = Join-Path $StateDir 'versions.json'
 $BackupRoot    = Join-Path $StateDir 'backups'
 $UpdateCommand = Join-Path $StateDir 'plusemu-update.ps1'
 $CleanupScript = Join-Path $StateDir 'plusemu-cleanup.ps1'
+$NightlyRoot   = Join-Path $BackupRoot 'nightly'
+$BackupScript  = Join-Path $StateDir 'plusemu-backup.ps1'
+$BackupLog     = Join-Path $StateDir 'backup.log'
+$KeepNightly   = 7
+$BackupLockWait = 3600
 $UpdateLog     = Join-Path $StateDir 'update.log'
 $LockFile      = Join-Path $StateDir 'update.lock'
 $KeepBackups   = 3
@@ -1009,8 +1014,72 @@ foreach (`$pattern in '$HotelRoot\emulator\service\*.log', '$HotelRoot\cms\stora
     Ok 'Logs older than 14 days are removed every day at 03:30 (task: PlusEMU log cleanup)'
 }
 
+# Saves what a download cannot bring back: the database, the settings, the website's uploads and the hotel's texts.
+function Invoke-NightlyBackup {
+    $nightly = $NightlyRoot
+    New-Item -ItemType Directory -Force -Path $nightly | Out-Null
+    # plusemu-update holds this lock while it changes the hotel.
+    $deadline = (Get-Date).AddSeconds([int]$BackupLockWait)
+    $lock = $null
+    while (-not $lock) {
+        try { $lock = [IO.File]::Open($LockFile, 'OpenOrCreate', 'ReadWrite', 'None') }
+        catch {
+            if ((Get-Date) -ge $deadline) { throw 'An update is still running; no backup was made.' }
+            Start-Sleep 1
+        }
+    }
+    try {
+        $script:state = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $databaseMb = [int]"$(Sql "SELECT COALESCE(ROUND(SUM(data_length + index_length) / 1048576), 0) FROM information_schema.tables WHERE table_schema = 'plus'")".Trim()
+        $freeMb = [int]((New-Object IO.DriveInfo $nightly).AvailableFreeSpace / 1MB)
+        if ($freeMb -lt $databaseMb + 2048) { throw "Only $freeMb MB free for $nightly; no backup was made." }
+        $target = Join-Path $nightly (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss-fff')
+        $partial = "$target.partial"
+        New-Item -ItemType Directory -Force -Path $partial | Out-Null
+        $sql = Join-Path $partial 'database.sql'
+        Invoke-DatabaseDump $sql
+        $in = [IO.File]::OpenRead($sql)
+        $out = [IO.File]::Create("$sql.gz")
+        $zip = New-Object IO.Compression.GZipStream($out, [IO.Compression.CompressionMode]::Compress)
+        try { $in.CopyTo($zip) } finally { $zip.Dispose(); $out.Dispose(); $in.Dispose() }
+        Remove-Item $sql
+        $files = @('emulator/Config', 'client/configuration', 'cms/.env', 'cms/storage/app', 'hotel-files/gamedata') | Where-Object { Test-Path (Join-Path $HotelRoot $_) }
+        # Exit code 1 only means a file changed while it was read.
+        $code = Invoke-Tar (@('-C', $HotelRoot, '-czf', (Join-Path $partial 'hotel.tar.gz')) + $files)
+        if ($code -notin 0, 1) { throw "Backing up the hotel files failed (tar exit code $code)." }
+        $settings = @('hotel.json', 'versions.json') | Where-Object { Test-Path (Join-Path $StateDir $_) }
+        if ((Invoke-Tar (@('-C', $StateDir, '-czf', (Join-Path $partial 'settings.tar.gz')) + $settings)) -ne 0) { throw 'Backing up the settings failed.' }
+        Move-Item $partial $target
+        Get-ChildItem $nightly -Directory -Filter '*.partial' | Remove-Item -Recurse -Force
+        $backups = @(Get-ChildItem $nightly -Directory | Where-Object { $_.Name -match '^\d{8}-\d{6}-\d{3}$' } | Sort-Object Name)
+        if ($backups.Count -gt [int]$KeepNightly) { $backups[0..($backups.Count - [int]$KeepNightly - 1)] | Remove-Item -Recurse -Force }
+        Write-Log "$(Get-Date -Format s) Backup saved in $target"
+    } finally {
+        $lock.Dispose()
+    }
+}
+
+# Writes plusemu-backup.ps1 from the installer's own functions and runs it every night at 04:00.
+function Write-BackupCommand {
+    $text = "# Installed by the PlusEMU installer. The `"PlusEMU nightly backup`" task runs this every night at 04:00.`r`n"
+    $text += "`$ErrorActionPreference = 'Stop'`r`n"
+    foreach ($name in 'HotelRoot', 'StateDir', 'StateFile', 'NightlyRoot', 'LockFile', 'KeepNightly', 'BackupLockWait') {
+        $text += "`$$name = '$((Get-Variable $name).Value)'`r`n"
+    }
+    $text += "`$script:Log = '$BackupLog'`r`n"
+    foreach ($name in 'Write-Log', 'Find-MariaDb', 'Get-MariaDb', 'Sql', 'Invoke-DatabaseDump', 'Invoke-Tar', 'Invoke-NightlyBackup') {
+        $text += "function $name {$((Get-Item "function:$name").Definition)}`r`n"
+    }
+    $text += "try { Invoke-NightlyBackup } catch { Write-Log `"`$(Get-Date -Format s) Backup failed: `$_`"; exit 1 }`r`n"
+    Write-Utf8 $BackupScript $text
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$BackupScript`""
+    $trigger = New-ScheduledTaskTrigger -Daily -At '04:00'
+    Register-ScheduledTask -TaskName 'PlusEMU nightly backup' -Action $action -Trigger $trigger -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+    Ok "Nightly backups at 04:00 in $NightlyRoot (the newest $KeepNightly are kept)"
+}
+
 function Protect-Server {
-    Step 'Securing the server (failed logins, Windows updates and logs)'
+    Step 'Securing the server (failed logins, Windows updates, logs and backups)'
     # A domain controller would apply this to the whole domain, so its own policy is left alone.
     if ((Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4) {
         Say '      This server is a domain controller: the account lockout policy was left as it is.' 'Yellow'
@@ -1025,6 +1094,7 @@ function Protect-Server {
     }
     Set-WindowsUpdates
     Set-LogCleanup
+    Write-BackupCommand
 }
 
 function Write-Guide {
@@ -1068,6 +1138,7 @@ function Complete-Install {
     Write-Host ''
     Write-Host "  Retrieve saved passwords (Administrator PowerShell): Get-Content $StateFile"
     Write-Host '  Update the emulator, client and hotel files later (Administrator PowerShell): plusemu-update'
+    Write-Host "  Nightly backups of the database and your settings: $NightlyRoot"
     Write-Host '  Store passwords somewhere safe. Change the initial admin password after logging in;'
     Write-Host '  the saved file retains the initial password. Keep passwords out of shared logs and screenshots.'
     Write-Host ''
