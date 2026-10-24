@@ -3,6 +3,9 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash
 #
+# To try the hotel on your own PC only, at http://localhost: sudo bash install.sh --local
+# (or PLUSEMU_LOCAL=1). A local install asks no domain and leaves the PC's own settings alone.
+#
 # Installs and wires together: PlusEMU (emulator) and Volt (client) from their
 # latest GitHub releases, Atom CMS (website), MariaDB, PHP, nginx and the hotel
 # files. Everything is self-hosted on this server; Cloudflare sits in front.
@@ -154,7 +157,8 @@ render() { # render <template> <output> [certificate fragment]: replace {{KEY}} 
     content=${content//"{{CERTIFICATE_STEPS}}"/"$certificate_steps"}
     # The fragments come first, so the placeholders inside them are filled too.
     for key in CLOUDFLARE_STATUS MANUAL_START MANUAL_END GUIDE_INTRO GAME_ADDRESS_ITEM DOMAIN SITE_URL SOCKET_URL FURNIDATA_URL SERVER_IP WS_HOST HOTEL_NAME ADMIN_USER ADMIN_EMAIL \
-        CREDENTIALS_FILE RESTART_COMMAND LOG_COMMAND WS_DNS_ROW GUIDE_MODE_TITLE GUIDE_MODE_DETAILS CERTIFICATE_EXPIRES CLOUDFLARE_ERROR_HTML; do
+        CREDENTIALS_FILE RESTART_COMMAND LOG_COMMAND WS_DNS_ROW GUIDE_MODE_TITLE GUIDE_MODE_DETAILS CERTIFICATE_EXPIRES CLOUDFLARE_ERROR_HTML \
+        CREDENTIALS_COMMAND START_COMMAND STOP_COMMAND STOP_ALL_COMMAND HEALTH_RUN UPDATE_RUN BACKUP_RUN BACKUP_DIR SERVER_INSTALL; do
         content=${content//"{{$key}}"/${!key-}}
     done
     printf '%s\n' "$content" > "$2"
@@ -183,6 +187,10 @@ clone() { # clone <repo> <branch or commit> <dir>: shallow checkout of exactly t
 
 sql() { mariadb --protocol=socket -uroot "$@"; }
 
+is_local() { [ "${LOCAL:-no}" = yes ]; }
+
+site_url() { if is_local; then printf 'http://localhost'; else printf 'https://%s' "$DOMAIN"; fi; }
+
 save_state() {
     install -d -m 700 "$(dirname "$STATE_FILE")"
     umask 077
@@ -200,6 +208,7 @@ CLOUDFLARE_SETUP='${CLOUDFLARE_SETUP:-}'
 CLOUDFLARE_CERT_EXPIRES='${CLOUDFLARE_CERT_EXPIRES:-}'
 DISCORD_WEBHOOK='${DISCORD_WEBHOOK:-}'
 CROWDSEC='${CROWDSEC:-}'
+LOCAL='${LOCAL:-no}'
 EOF
     chmod 600 "$STATE_FILE"
     umask 022
@@ -322,7 +331,32 @@ EOF
 
 # ---------------------------------------------------------------- steps
 
-check_local_ports() { die "check_local_ports is not implemented yet."; }
+port_listener() { # port_listener <port>: "<program> <pid>" of what listens on that TCP port, if anything
+    ss -Hltnp "sport = :$1" 2> /dev/null | grep -o 'users:(("[^"]*",pid=[0-9]*' | head -n 1 | sed 's/^users:(("//; s/",pid=/ /' || true
+}
+
+hotel_listener() { # hotel_listener <port> <program> <pid>: the program is the one the installer puts on that port
+    case $1:$2 in
+        80:nginx | 3306:mariadbd) return 0 ;;
+        # Installing MariaDB would remove a MySQL server, so only MariaDB's mysqld counts.
+        3306:mysqld) [[ $(dpkg-query -W -f='${Status}' mariadb-server 2> /dev/null) == *'ok installed'* ]] ;;
+        2096:* | 8080:* | 30001:*) [ "$(readlink "/proc/$3/exe")" = "$HOTEL_ROOT/emulator/Plus Emulator" ] ;;
+        *) return 1 ;;
+    esac
+}
+
+# A PC often runs other web servers or databases. The hotel needs their ports, so the install stops before it changes anything.
+check_local_ports() {
+    local port listener busy=''
+    for port in 80 3306 2096 8080 30001; do
+        listener=$(port_listener "$port")
+        if [ -n "$listener" ] && ! hotel_listener "$port" "${listener% *}" "${listener##* }"; then
+            busy+="${busy:+; }port $port is used by ${listener% *} (process ${listener##* })"
+        fi
+    done
+    [ -n "$busy" ] || return 0
+    die "The hotel needs ports that another program uses: $busy. Stop that program (for example: sudo systemctl stop <name>), then run the installer again. Nothing was changed."
+}
 
 preflight() { # preflight [free GB needed]
     [ "$(id -u)" -eq 0 ] || die "Please run this as root, with sudo."
@@ -363,6 +397,24 @@ select_guide_mode() {
         simple | advanced) ;;
         *) die "Guide mode must be simple or advanced (this selects instructions only)." ;;
     esac
+}
+
+# A saved hotel keeps its choice. Switching it would leave half a server on a PC, or a server without its protection.
+select_local() { # select_local [saved choice]: sets LOCAL to yes or no
+    local requested=${LOCAL_OPTION:-${PLUSEMU_LOCAL:-}} saved=${1:-}
+    case $requested in
+        1) requested=yes ;;
+        0) requested=no ;;
+        '') requested=${saved:-no} ;;
+        *) die "PLUSEMU_LOCAL must be 1 (install on this PC only) or 0 (install a server)." ;;
+    esac
+    if [ -n "$saved" ] && [ "$requested" != "$saved" ]; then
+        if [ "$saved" = yes ]; then
+            die "This PC has a local hotel at http://localhost, and the installer cannot turn it into a server install. Nothing was changed. For a public hotel, run the installer without --local on your server."
+        fi
+        die "This server has a hotel for $DOMAIN, and the installer cannot turn it into a local install. Nothing was changed. Run the installer with --local on another PC."
+    fi
+    LOCAL=$requested
 }
 
 valid_webhook() { [[ $1 =~ ^https://(discord|discordapp)\.com/api/webhooks/[A-Za-z0-9._~/?=\&-]+$ ]]; }
@@ -432,15 +484,21 @@ ask_questions() {
     say ""
 
     if [ -f "$STATE_FILE" ]; then
-        GUIDE_MODE=simple
+        GUIDE_MODE=simple LOCAL=no
         # An older state file has no answer for these, so the questions are asked once.
         local trace=${-//[^x]/}
         { set +x; } 2> /dev/null
         # shellcheck disable=SC1090
         . "$STATE_FILE"
         if [ -n "$trace" ]; then set -x; fi
+        select_local "$LOCAL"
         select_guide_mode "$GUIDE_MODE"
         if [ -z "${GUIDE_TOKEN:-}" ]; then GUIDE_TOKEN=$(random_secret 12); fi
+        if is_local; then
+            say "Found the settings of an earlier run on this PC (http://localhost); continuing that installation."
+            save_state
+            return
+        fi
         say "Found the settings of an earlier run for ${bold}$DOMAIN${reset}; continuing that installation."
         say "  Setup guide: $GUIDE_MODE. Selecting this guide does not change SSH, RDP, firewall, updates or backups."
         choose_options
@@ -451,6 +509,60 @@ ask_questions() {
         return
     fi
 
+    select_local
+    if is_local; then
+        # The game connects through the same nginx as the website, so the browser sees one origin.
+        DOMAIN=localhost WS_URL=ws://localhost/ws
+    else
+        ask_server_addresses
+    fi
+
+    local suggested=${DOMAIN%%.*} mail_domain=$DOMAIN
+    if is_local; then suggested=PlusEMU mail_domain=localhost.test; fi
+    HOTEL_NAME=${PLUSEMU_HOTEL_NAME:-}
+    [ -n "$HOTEL_NAME" ] || ask HOTEL_NAME "Hotel name" "${suggested^}"
+    HOTEL_NAME=$(printf '%s' "$HOTEL_NAME" | tr -d '<>"`$\\'"'")
+    ADMIN_USER=${PLUSEMU_ADMIN_USER:-}
+    while true; do
+        [ -n "$ADMIN_USER" ] || ask ADMIN_USER "Username for your admin account" "admin"
+        if [[ $ADMIN_USER =~ ^[A-Za-z0-9._-]{3,25}$ ]]; then break; fi
+        say "  ${yellow}Use 3-25 letters, numbers, dots, dashes or underscores.${reset}"
+        ADMIN_USER=
+    done
+    ADMIN_EMAIL=${PLUSEMU_ADMIN_EMAIL:-}
+    while true; do
+        [ -n "$ADMIN_EMAIL" ] || ask ADMIN_EMAIL "Email for your admin account" "admin@$mail_domain"
+        if [[ $ADMIN_EMAIL =~ ^[^@[:space:]\']+@[^@[:space:]\']+\.[^@[:space:]\']+$ ]]; then break; fi
+        say "  ${yellow}That doesn't look like an email address.${reset}"
+        ADMIN_EMAIL=
+    done
+    if ! is_local; then choose_options; fi
+    ADMIN_PASSWORD=$(admin_password)
+    DB_PASSWORD=$(random_secret 32)
+    GUIDE_TOKEN=$(random_secret 12)
+
+    say ""
+    say "  Website:    ${bold}$(site_url)${reset}"
+    say "  WebSocket:  ${bold}$WS_URL${reset}"
+    say "  Hotel name: ${bold}$HOTEL_NAME${reset}"
+    say "  Admin:      ${bold}$ADMIN_USER${reset} ($ADMIN_EMAIL)"
+    if is_local; then
+        say "  Local install: only this PC can open the hotel. There is no HTTPS and no Cloudflare."
+        say "  The firewall, SSH, system updates and network settings of this PC stay as they are."
+    else
+        say "  Setup guide: $GUIDE_MODE. Selecting this guide does not change SSH, RDP, firewall, updates or backups."
+        if [ "$HEALTH_ALERTS" = on ]; then say "  Health alerts: Discord"; else say "  Health alerts: log only (no Discord webhook)"; fi
+        if [ "$GUIDE_MODE" = advanced ]; then say "  CrowdSec:    $CROWDSEC"; fi
+    fi
+    if [ "${PLUSEMU_YES:-0}" != 1 ]; then
+        local go
+        ask go "Start the installation? (y/n)" "y"
+        [[ $go =~ ^[Yy] ]] || die "Installation cancelled. Nothing was changed."
+    fi
+    save_state
+}
+
+ask_server_addresses() { # sets DOMAIN and WS_URL
     DOMAIN=${PLUSEMU_DOMAIN:-}
     while true; do
         [ -n "$DOMAIN" ] || ask DOMAIN "Your hotel's domain name (for example myhotel.com)"
@@ -472,44 +584,6 @@ ask_questions() {
         say "  ${yellow}Type it like wss://$DOMAIN/ws or ws.$DOMAIN (no port).${reset}"
         WS_URL=
     done
-
-    local suggested=${DOMAIN%%.*}
-    HOTEL_NAME=${PLUSEMU_HOTEL_NAME:-}
-    [ -n "$HOTEL_NAME" ] || ask HOTEL_NAME "Hotel name" "${suggested^}"
-    HOTEL_NAME=$(printf '%s' "$HOTEL_NAME" | tr -d '<>"`$\\'"'")
-    ADMIN_USER=${PLUSEMU_ADMIN_USER:-}
-    while true; do
-        [ -n "$ADMIN_USER" ] || ask ADMIN_USER "Username for your admin account" "admin"
-        if [[ $ADMIN_USER =~ ^[A-Za-z0-9._-]{3,25}$ ]]; then break; fi
-        say "  ${yellow}Use 3-25 letters, numbers, dots, dashes or underscores.${reset}"
-        ADMIN_USER=
-    done
-    ADMIN_EMAIL=${PLUSEMU_ADMIN_EMAIL:-}
-    while true; do
-        [ -n "$ADMIN_EMAIL" ] || ask ADMIN_EMAIL "Email for your admin account" "admin@$DOMAIN"
-        if [[ $ADMIN_EMAIL =~ ^[^@[:space:]\']+@[^@[:space:]\']+\.[^@[:space:]\']+$ ]]; then break; fi
-        say "  ${yellow}That doesn't look like an email address.${reset}"
-        ADMIN_EMAIL=
-    done
-    choose_options
-    ADMIN_PASSWORD=$(admin_password)
-    DB_PASSWORD=$(random_secret 32)
-    GUIDE_TOKEN=$(random_secret 12)
-
-    say ""
-    say "  Website:    ${bold}https://$DOMAIN${reset}"
-    say "  WebSocket:  ${bold}$WS_URL${reset}"
-    say "  Hotel name: ${bold}$HOTEL_NAME${reset}"
-    say "  Admin:      ${bold}$ADMIN_USER${reset} ($ADMIN_EMAIL)"
-    say "  Setup guide: $GUIDE_MODE. Selecting this guide does not change SSH, RDP, firewall, updates or backups."
-    if [ "$HEALTH_ALERTS" = on ]; then say "  Health alerts: Discord"; else say "  Health alerts: log only (no Discord webhook)"; fi
-    if [ "$GUIDE_MODE" = advanced ]; then say "  CrowdSec:    $CROWDSEC"; fi
-    if [ "${PLUSEMU_YES:-0}" != 1 ]; then
-        local go
-        ask go "Start the installation? (y/n)" "y"
-        [[ $go =~ ^[Yy] ]] || die "Installation cancelled. Nothing was changed."
-    fi
-    save_state
 }
 
 # shellcheck disable=SC2034 # the {{KEY}} values are read by render() through ${!key}
@@ -518,8 +592,12 @@ derive_settings() {
     WS_HOST=${rest%%/*}
     WS_PATH=/${rest#*/}
     [ "$rest" != "$WS_HOST" ] || WS_PATH=/
-    SITE_URL=https://$DOMAIN
+    SITE_URL=$(site_url)
     SOCKET_URL=$WS_URL
+    if is_local; then
+        SERVER_IP=127.0.0.1
+        return
+    fi
     SERVER_IP=$(curl -4 -fsS --max-time 5 https://api.ipify.org || curl -4 -fsS --max-time 5 https://ipv4.icanhazip.com || hostname -I | awk '{print $1}')
     SERVER_IP=$(printf '%s' "$SERVER_IP" | tr -d '[:space:]')
 }
@@ -527,9 +605,12 @@ derive_settings() {
 install_packages() {
     step "Installing system packages (nginx, MariaDB, PHP $PHP)"
     export DEBIAN_FRONTEND=noninteractive
+    # These protect a server. On a PC they would start bans and restarts the owner did not ask for.
+    local server_packages=(ufw fail2ban python3-systemd unattended-upgrades)
+    if is_local; then server_packages=(); fi
     apt-get update
-    apt-get install -y ca-certificates curl git unzip jq gnupg openssl cron ufw nginx mariadb-server mariadb-client libicu-dev xz-utils \
-        fail2ban python3-systemd unattended-upgrades
+    apt-get install -y ca-certificates curl git unzip jq gnupg openssl cron nginx mariadb-server mariadb-client libicu-dev xz-utils \
+        "${server_packages[@]}"
     if ! apt-cache show "php$PHP-fpm" > /dev/null 2>&1; then
         # PHP 8.5 isn't in these releases yet: use the well-known Sury/Ondřej packages.
         if [ "$OS_ID" = ubuntu ]; then
@@ -558,15 +639,21 @@ install_packages() {
 
 install_toolchains() {
     step "Installing Node.js $NODE_MAJOR and Composer (for the website)"
+    local node_dir=/opt/node
+    if is_local; then
+        # The PC's own node and npm stay first for its owner: this one is only on the installer's PATH.
+        node_dir=/opt/plusemu-node
+        export PATH=$node_dir/bin:$PATH
+    fi
     if ! node --version 2>/dev/null | grep -q "^v$NODE_MAJOR\."; then
         local base=https://nodejs.org/dist/latest-v$NODE_MAJOR.x file
         file=$(curl -fsSL "$base/SHASUMS256.txt" | awk "/node-v.*-linux-$ARCH.tar.xz\$/ {print \$2}")
         curl -fsSL "$base/$file" -o "/tmp/$file"
         curl -fsSL "$base/SHASUMS256.txt" | grep " $file\$" | (cd /tmp && sha256sum -c -)
-        rm -rf /opt/node && mkdir -p /opt/node
-        tar xJf "/tmp/$file" -C /opt/node --strip-components 1
+        rm -rf "$node_dir" && mkdir -p "$node_dir"
+        tar xJf "/tmp/$file" -C "$node_dir" --strip-components 1
         rm -f "/tmp/$file"
-        ln -sf /opt/node/bin/node /opt/node/bin/npm /opt/node/bin/npx /opt/node/bin/corepack /usr/local/bin/
+        if ! is_local; then ln -sf /opt/node/bin/node /opt/node/bin/npm /opt/node/bin/npx /opt/node/bin/corepack /usr/local/bin/; fi
     fi
     ok "Node.js $(node --version)"
 
@@ -744,8 +831,11 @@ install_cms() {
     set_env "$env" NITRO_CLIENT_PATH "$SITE_URL/client"
     set_env "$env" RCON_HOST 127.0.0.1
     set_env "$env" RCON_PORT 30001
-    set_env "$env" FORCE_HTTPS true
-    set_env "$env" SESSION_SECURE_COOKIE true
+    # http://localhost has no HTTPS, so Atom must not send visitors there or keep its cookies for HTTPS only.
+    local https=true
+    if is_local; then https=false; fi
+    set_env "$env" FORCE_HTTPS "$https"
+    set_env "$env" SESSION_SECURE_COOKIE "$https"
     set_env "$env" TRUSTED_PROXIES 127.0.0.1
     chmod 640 "$env"
 
@@ -934,10 +1024,12 @@ EOF
 }
 
 ws_location() { # the nginx block that hands the game connection to the emulator
+    local limit='limit_conn plusemu_ws 20;'
+    if is_local; then limit=''; fi
     cat <<EOF
     location = $WS_PATH {
         if (\$http_origin != "$SITE_URL") { return 403; }
-        limit_conn plusemu_ws 20;
+        $limit
         proxy_pass http://127.0.0.1:2096;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
@@ -952,17 +1044,28 @@ ws_location() { # the nginx block that hands the game connection to the emulator
 EOF
 }
 
+# nginx's own welcome page answers on every address. A default site the owner changed is theirs, so it stays.
+remove_nginx_welcome() {
+    local enabled=$NGINX_DIR/sites-enabled/default stock
+    stock=$(dpkg-query -W -f='${Conffiles}\n' nginx-common nginx 2> /dev/null | awk '$1 == "/etc/nginx/sites-available/default" {print $2; exit}' || true)
+    if [ -n "$stock" ] && [ "$(md5sum < "$enabled" 2> /dev/null | cut -d' ' -f1)" = "$stock" ]; then rm -f "$enabled"; fi
+}
+
 configure_web() {
-    step "Configuring nginx, HTTPS and the firewall"
     local ssl=$SSL_DIR php_sock=/run/php/php$PHP-fpm.sock
-    mkdir -p "$ssl"
-    if [ ! -f "$ssl/cert.pem" ]; then
-            openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout "$ssl/key.pem" -out "$ssl/cert.pem" \
-            -subj "/CN=$DOMAIN" -addext "subjectAltName=DNS:$DOMAIN,DNS:*.$DOMAIN" 2> /dev/null
-        chmod 600 "$ssl/key.pem"
+    if is_local; then
+        step "Configuring nginx for http://localhost"
+    else
+        step "Configuring nginx, HTTPS and the firewall"
+        mkdir -p "$ssl"
+        if [ ! -f "$ssl/cert.pem" ]; then
+                openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout "$ssl/key.pem" -out "$ssl/cert.pem" \
+                -subj "/CN=$DOMAIN" -addext "subjectAltName=DNS:$DOMAIN,DNS:*.$DOMAIN" 2> /dev/null
+            chmod 600 "$ssl/key.pem"
+        fi
+        cloudflare_real_ip
+        request_limits
     fi
-    cloudflare_real_ip
-    request_limits
     # Added to nginx's own list; .hab and .nitro already fall back to application/octet-stream.
     echo 'types { application/json jsonc; }' > "$NGINX_DIR/conf.d/hotel-mime.conf"
 
@@ -979,34 +1082,29 @@ configure_web() {
     local timeouts="client_header_timeout 10s;
     client_body_timeout 10s;
     keepalive_timeout 20s;"
+    local listen="listen 80;
+    listen [::]:80;
+    $ssl_listen" certificate="ssl_certificate $ssl/cert.pem;
+    ssl_certificate_key $ssl/key.pem;"
     # The hotel's own names answer only Cloudflare and this server (see cloudflare-real-ip.conf).
     local cloudflare_only='if ($plusemu_from_cloudflare = 0) { return 444; }'
-
-    local ws_main="" ws_server=""
-    if [ "$WS_HOST" = "$DOMAIN" ]; then
-        ws_main=$(ws_location)
+    local hsts='add_header Strict-Transport-Security "max-age=31536000" always;'
+    local login_limits="limit_req zone=plusemu_login burst=5 nodelay;
+        limit_conn plusemu_conn 50;" housekeeping_limits="limit_req zone=plusemu_housekeeping burst=20 nodelay;
+        limit_conn plusemu_conn 50;" conn_limit='limit_conn plusemu_conn 50;'
+    local https=on guide='' public_servers
+    if is_local; then
+        # Only this PC: browsers try ::1 for localhost before 127.0.0.1.
+        listen="listen 127.0.0.1:80 default_server;
+    listen [::1]:80 default_server;"
+        # HSTS on localhost would send the browser to https:// for every other project on this PC.
+        certificate='' cloudflare_only='' hsts='' https=off
+        # Every local visitor is 127.0.0.1, so per-visitor limits would only lock out the owner and their test clients.
+        login_limits='' housekeeping_limits='' conn_limit=''
+        guide="location ^~ /$GUIDE_TOKEN/ { alias $HOTEL_ROOT/setup-guide/; index index.html; }"
+        public_servers=''
     else
-        ws_server=$(cat <<EOF
-
-server {
-    listen 80;
-    listen [::]:80;
-    $ssl_listen
-    server_name $WS_HOST;
-    ssl_certificate $ssl/cert.pem;
-    ssl_certificate_key $ssl/key.pem;
-    $timeouts
-    $cloudflare_only
-$(ws_location)
-    location / { return 404; }
-}
-EOF
-)
-    fi
-
-    cat > "$NGINX_DIR/sites-available/hotel.conf" <<EOF
-# Generated by the PlusEMU installer. Re-running the installer rewrites this file.
-
+        public_servers=$(cat <<EOF
 # Requests by IP address get nothing, except the setup guide at its private address.
 server {
     listen 80 default_server;
@@ -1021,31 +1119,51 @@ server {
     listen 443 ssl default_server;
     listen [::]:443 ssl default_server;
     server_name _;
-    ssl_certificate $ssl/cert.pem;
-    ssl_certificate_key $ssl/key.pem;
+    $certificate
     $timeouts
     return 444;
 }
 
 server {
-    listen 80;
-    listen [::]:80;
-    $ssl_listen
+    $listen
     server_name www.$DOMAIN;
-    ssl_certificate $ssl/cert.pem;
-    ssl_certificate_key $ssl/key.pem;
+    $certificate
     $timeouts
     $cloudflare_only
     return 301 https://$DOMAIN\$request_uri;
 }
+EOF
+)
+    fi
+
+    local ws_main="" ws_server=""
+    if [ "$WS_HOST" = "$DOMAIN" ]; then
+        ws_main=$(ws_location)
+    else
+        ws_server=$(cat <<EOF
 
 server {
-    listen 80;
-    listen [::]:80;
-    $ssl_listen
+    $listen
+    server_name $WS_HOST;
+    $certificate
+    $timeouts
+    $cloudflare_only
+$(ws_location)
+    location / { return 404; }
+}
+EOF
+)
+    fi
+
+    cat > "$NGINX_DIR/sites-available/hotel.conf" <<EOF
+# Generated by the PlusEMU installer. Re-running the installer rewrites this file.
+
+$public_servers
+
+server {
+    $listen
     server_name $DOMAIN;
-    ssl_certificate $ssl/cert.pem;
-    ssl_certificate_key $ssl/key.pem;
+    $certificate
 
     root $HOTEL_ROOT/cms/public;
     index index.php;
@@ -1054,10 +1172,11 @@ server {
     server_tokens off;
     $timeouts
     $cloudflare_only
+    $guide
 
     add_header X-Content-Type-Options nosniff always;
     add_header Referrer-Policy strict-origin-when-cross-origin always;
-    add_header Strict-Transport-Security "max-age=31536000" always;
+    $hsts
     add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), usb=()" always;
 
     gzip on;
@@ -1087,27 +1206,25 @@ $ws_main
 
     # Atom CMS sign-in, registration and password reset forms.
     location ~ ^/(login|register|forgot-password|reset-password/[^/]+|two-factor-challenge)\$ {
-        limit_req zone=plusemu_login burst=5 nodelay;
-        limit_conn plusemu_conn 50;
+        $login_limits
         try_files \$uri /index.php?\$query_string;
     }
 
     location /housekeeping {
-        limit_req zone=plusemu_housekeeping burst=20 nodelay;
-        limit_conn plusemu_conn 50;
+        $housekeeping_limits
         try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
     location / {
-        limit_conn plusemu_conn 50;
+        $conn_limit
         try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
     location ~ \.php\$ {
-        limit_conn plusemu_conn 50;
+        $conn_limit
         fastcgi_pass unix:$php_sock;
         fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
-        fastcgi_param HTTPS on;
+        fastcgi_param HTTPS $https;
         include fastcgi_params;
         fastcgi_hide_header X-Powered-By;
     }
@@ -1116,13 +1233,13 @@ $ws_main
 }
 $ws_server
 EOF
-    rm -f "$NGINX_DIR/sites-enabled/default"
+    if is_local; then remove_nginx_welcome; else rm -f "$NGINX_DIR/sites-enabled/default"; fi
     ln -sf "$NGINX_DIR/sites-available/hotel.conf" "$NGINX_DIR/sites-enabled/hotel.conf"
     nginx -t
     systemctl enable --now "php$PHP-fpm" nginx
     systemctl reload nginx
     ok "nginx serves $SITE_URL"
-    configure_firewall
+    if ! is_local; then configure_firewall; fi
 }
 
 # HTTP stays open to everyone for the setup guide and the redirects. HTTPS only takes Cloudflare's addresses,
@@ -1343,6 +1460,11 @@ $HOTEL_ROOT/cms/storage/logs/laravel.log {
     copytruncate
 }
 EOF
+    # The journal holds the logs of the whole PC, so a local install leaves its limits to the owner.
+    if is_local; then
+        ok "The hotel's logs are kept for 14 days"
+        return
+    fi
     # The emulator logs to the journal. A rerun leaves the journal running when nothing changed.
     local journal=$'[Journal]\nSystemMaxUse=1G\nMaxRetentionSec=14day'
     if [ "$(cat "$JOURNALD_DROPIN" 2> /dev/null)" != "$journal" ]; then
@@ -1405,7 +1527,8 @@ install_backup_command() {
 
 # ---------------------------------------------------------------- health check
 
-# Each check: its name (the function health_<name>), what it checks, and the command that shows more.
+# Each check: its name (the function health_<name>), what it checks, the command that shows more,
+# and "server" when only a server install has the thing it checks.
 HEALTH_CHECKS=(
     "emulator|The emulator service|sudo journalctl -u plusemu -n 100"
     "game_port|The game connection (port 2096)|sudo journalctl -u plusemu -n 100"
@@ -1415,8 +1538,8 @@ HEALTH_CHECKS=(
     "database|The database (MariaDB)|sudo systemctl status mariadb"
     "disk|Free disk space|df -h $HOTEL_ROOT"
     "backup|The nightly backup|sudo tail -n 20 $BACKUP_LOG"
-    "certificate|The HTTPS certificate|sudo openssl x509 -in $SSL_DIR/cert.pem -noout -enddate"
-    "cloudflare|The Cloudflare address refresh|sudo tail -n 20 $CLOUDFLARE_LOG"
+    "certificate|The HTTPS certificate|sudo openssl x509 -in $SSL_DIR/cert.pem -noout -enddate|server"
+    "cloudflare|The Cloudflare address refresh|sudo tail -n 20 $CLOUDFLARE_LOG|server"
 )
 
 port_answers() { # port_answers <port>: a program on this server accepts connections on that port
@@ -1433,8 +1556,8 @@ health_website() {
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H "Host: $DOMAIN" http://127.0.0.1/) || true
     case $code in
         [234]??) return 0 ;;
-        '' | 000) echo "https://$DOMAIN does not answer on this server." ;;
-        *) echo "https://$DOMAIN answers with error $code on this server." ;;
+        '' | 000) echo "$(site_url) does not answer on this server." ;;
+        *) echo "$(site_url) answers with error $code on this server." ;;
     esac
     return 1
 }
@@ -1508,9 +1631,9 @@ discord_send() { # discord_send <webhook> <text>: prints the reason when Discord
 
 # The plusemu-health command. Discord hears about every check that starts or stops failing, once.
 health_check() {
-    local entry name label look reason now changes='' short='' count=0 sent=1 failed=()
+    local entry name label look scope reason now changes='' short='' count=0 sent=1 failed=()
     local -A was=()
-    DOMAIN='' HOTEL_NAME=PlusEMU DISCORD_WEBHOOK=''
+    DOMAIN='' HOTEL_NAME=PlusEMU DISCORD_WEBHOOK='' LOCAL=no
     # shellcheck disable=SC1090
     . "$STATE_FILE"
     now=$(date '+%F %T')
@@ -1523,7 +1646,8 @@ health_check() {
         while read -r name; do if [ -n "$name" ]; then was[$name]=1; fi; done < "$HEALTH_STATE"
     fi
     for entry in "${HEALTH_CHECKS[@]}"; do
-        IFS='|' read -r name label look <<< "$entry"
+        IFS='|' read -r name label look scope <<< "$entry"
+        if [ "$scope" = server ] && is_local; then continue; fi
         count=$((count + 1))
         if reason=$("health_$name" 2>&1); then
             if [ -n "${was[$name]:-}" ]; then changes+="✅ $label works again."$'\n' short+="✅ $label works again."$'\n'; fi
@@ -1560,7 +1684,7 @@ health_check() {
 }
 
 install_health_check() {
-    local entry functions=(port_answers json_string discord_send health_check) reason
+    local entry functions=(is_local site_url port_answers json_string discord_send health_check) reason
     for entry in "${HEALTH_CHECKS[@]}"; do functions+=("health_${entry%%|*}"); done
     mkdir -p "$(dirname "$HEALTH_COMMAND")" "$(dirname "$HEALTH_CRON")"
     {
@@ -1576,6 +1700,7 @@ install_health_check() {
     chmod 700 "$HEALTH_COMMAND"
     echo "*/5 * * * * root $HEALTH_COMMAND > /dev/null 2>&1" > "$HEALTH_CRON"
     ok "Health check every 5 minutes (log: $HEALTH_LOG, run it now: sudo plusemu-health)"
+    if is_local; then return; fi
     if [ "${HEALTH_ALERTS:-off}" = off ]; then
         say "      Discord alerts are off. To turn them on, run the installer again with PLUSEMU_DISCORD_WEBHOOK=<webhook URL>."
         return
@@ -1678,6 +1803,14 @@ setup_crowdsec() {
 }
 
 secure_server() {
+    # A local install changes nothing on the PC outside the hotel: no SSH, fail2ban, updates, restarts or network settings.
+    if is_local; then
+        step "Setting up the hotel's logs, backups and health checks"
+        rotate_logs
+        install_backup_command
+        install_health_check
+        return
+    fi
     step "Securing the server (SSH, failed logins, updates, logs, backups and health checks)"
     setup_crowdsec
     protect_ssh_logins
@@ -1964,6 +2097,18 @@ write_guide() {
 # shellcheck disable=SC2034 # the {{KEY}} values are read by render() through ${!key}
 render_guide() { # the guide in its manual form, or in its connected form after the Cloudflare step
     mkdir -p "$HOTEL_ROOT/setup-guide"
+    CREDENTIALS_FILE=$STATE_FILE
+    RESTART_COMMAND="sudo systemctl restart plusemu"
+    LOG_COMMAND="sudo journalctl -u plusemu -f"
+    if is_local; then
+        CREDENTIALS_COMMAND="sudo cat $STATE_FILE"
+        START_COMMAND="sudo systemctl start plusemu" STOP_COMMAND="sudo systemctl stop plusemu"
+        STOP_ALL_COMMAND="sudo systemctl stop plusemu nginx php$PHP-fpm mariadb"
+        HEALTH_RUN="sudo plusemu-health" UPDATE_RUN="sudo plusemu-update" BACKUP_RUN="sudo plusemu-backup" BACKUP_DIR=$NIGHTLY_ROOT
+        SERVER_INSTALL="curl -fsSL https://raw.githubusercontent.com/$INSTALLER_REPO/main/install.sh | sudo bash"
+        render "$TEMPLATES/guide-local.html" "$HOTEL_ROOT/setup-guide/index.html"
+        return
+    fi
     CLOUDFLARE_STATUS="" MANUAL_START="" MANUAL_END="" CLOUDFLARE_ERROR_HTML="" GAME_ADDRESS_ITEM=""
     GUIDE_INTRO='Now connect <b>{{DOMAIN}}</b> through Cloudflare and install its origin certificate.'
     if [ "${CLOUDFLARE_SETUP:-}" = "done" ]; then
@@ -1977,9 +2122,6 @@ render_guide() { # the guide in its manual form, or in its connected form after 
         CLOUDFLARE_ERROR_HTML=$(html_escape "$CLOUDFLARE_ERROR")
     fi
     CERTIFICATE_EXPIRES=${CLOUDFLARE_CERT_EXPIRES:-}
-    CREDENTIALS_FILE=$STATE_FILE
-    RESTART_COMMAND="sudo systemctl restart plusemu"
-    LOG_COMMAND="sudo journalctl -u plusemu -f"
     GUIDE_MODE_TITLE=${GUIDE_MODE^}
     GUIDE_MODE_DETAILS=$(< "$TEMPLATES/guide-$GUIDE_MODE.html")
     if [ "$WS_HOST" != "$DOMAIN" ] && [ "$WS_HOST" != "www.$DOMAIN" ]; then
@@ -2015,7 +2157,12 @@ finish() {
     say ""
     run_health_check
     say ""
-    if [ "${CLOUDFLARE_SETUP:-}" = "done" ]; then
+    local guide=http://$SERVER_IP/$GUIDE_TOKEN/ where="on this server, or through an SSH tunnel"
+    if is_local; then
+        guide=http://localhost/$GUIDE_TOKEN/ where="on this PC"
+        say "  Open your hotel on this PC: ${bold}http://localhost${reset} (housekeeping: http://localhost/housekeeping)."
+        say "  Your guide explains how to start, stop, update and back up the hotel:"
+    elif [ "${CLOUDFLARE_SETUP:-}" = "done" ]; then
         say "  Cloudflare is connected. Open https://$DOMAIN, log in and enter the hotel to check it."
         say "  The setup guide shows what the installer set up and what to check:"
     else
@@ -2023,14 +2170,14 @@ finish() {
         say "  Open this page in your browser for easy step-by-step instructions:"
     fi
     say ""
-    say "      ${bold}${cyan}http://$SERVER_IP/$GUIDE_TOKEN/${reset}"
+    say "      ${bold}${cyan}$guide${reset}"
     say ""
-    say "  Your admin login for https://$DOMAIN (also saved in $STATE_FILE):"
+    say "  Your admin login for $(site_url) (also saved in $STATE_FILE):"
     say "      Username: ${bold}$ADMIN_USER${reset}"
     # Passwords go to the operator's terminal, not the log they may share for help.
     printf '      Password: %s\n' "$ADMIN_PASSWORD" >&3
     say ""
-    say "  MariaDB connection (on this server, or through an SSH tunnel):"
+    say "  MariaDB connection ($where):"
     say "      Host: 127.0.0.1    Port: 3306    Database: plus    Username: hotel"
     printf '      Password: %s\n' "$DB_PASSWORD" >&3
     say "      Connect locally: mariadb --host=127.0.0.1 --port=3306 --user=hotel --password plus"
@@ -2042,6 +2189,9 @@ finish() {
     say "  Check the hotel now: sudo plusemu-health (it runs every 5 minutes; log: $HEALTH_LOG)"
     if [ "${SSH_PASSWORDS:-}" = on ]; then
         say "  ${yellow}SSH password login is still on.${reset} To turn it off, add your SSH key, log in with it and run the installer again."
+    fi
+    if is_local; then
+        say "  This hotel works on this PC only. For a public hotel, run the installer without --local on a server."
     fi
     say "  Store passwords somewhere safe. Change the initial admin password after logging in;"
     say "  the saved file retains the initial password. Keep passwords out of shared logs and screenshots."
@@ -2458,12 +2608,16 @@ main() {
         case "$1" in
             --guide-mode)
                 if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
-                    die "Usage: install.sh [--guide-mode simple|advanced]"
+                    die "Usage: install.sh [--local] [--guide-mode simple|advanced]"
                 fi
                 GUIDE_MODE_OPTION=$2
                 shift 2
                 ;;
-            *) die "Unknown option: $1. Usage: install.sh [--guide-mode simple|advanced]" ;;
+            --local)
+                LOCAL_OPTION=1
+                shift
+                ;;
+            *) die "Unknown option: $1. Usage: install.sh [--local] [--guide-mode simple|advanced]" ;;
         esac
     done
     select_guide_mode
@@ -2477,6 +2631,10 @@ main() {
     exec >> "$LOG" 2>&1
     load_installer_files
     ask_questions
+    if is_local; then
+        TOTAL_STEPS=10
+        check_local_ports
+    fi
     say "  Admin and database passwords are saved in $STATE_FILE. Retrieve them with: sudo cat $STATE_FILE"
     derive_settings
     install_packages
@@ -2491,7 +2649,7 @@ main() {
     secure_server
     write_guide
     install_update_command
-    connect_cloudflare
+    if ! is_local; then connect_cloudflare; fi
     finish
 }
 
