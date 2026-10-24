@@ -76,7 +76,7 @@ The choice is saved with your existing installation settings and reused on rerun
 
 The installer generates passwords automatically and prints your initial admin login and database connection details, including the database password. On Windows it also prints the MariaDB root password. These passwords are saved before installation starts; the installer tells you where to retrieve them even if a later step fails. The final password summary is shown in the terminal, not written to the installer log or browser setup guide.
 
-It also points you to a **setup guide** with instructions for connecting your domain through Cloudflare and installing an origin certificate. The guide includes commands for your server's operating system and contains no passwords or private keys.
+It also shows you a **setup guide** with instructions for connecting your domain through Cloudflare and installing an origin certificate. The guide includes commands for your server's operating system and contains no passwords or private keys.
 
 - **Linux:** open `http://<your server IP>/<token>/`. The installer prints the exact address. The token is random so that strangers can't find the page.
 - **Windows:** the guide opens in your browser. A copy named *Hotel setup guide* is saved on your desktop.
@@ -85,10 +85,38 @@ The guide walks you through:
 
 1. Adding your domain to Cloudflare
 2. Pointing your domain's nameservers to Cloudflare
-3. Adding the DNS records (proxied, orange cloud)
-4. Generating a private key and certificate-signing request (CSR) on your server, requesting a Cloudflare Origin CA certificate, and importing the signed certificate into nginx or IIS
-5. Setting SSL/TLS to **Full (strict)** after installing the certificate, turning on Always Use HTTPS, and checking that WebSockets are on
-6. Opening your hotel and logging in
+3. Connecting Cloudflare automatically with an API token (see below). This does steps 4 to 6 for you, plus extra protection.
+4. Adding the DNS records (proxied, orange cloud)
+5. Generating a private key and certificate-signing request (CSR) on your server, requesting a Cloudflare Origin CA certificate, and importing the signed certificate into nginx or IIS
+6. Setting SSL/TLS to **Full (strict)** after installing the certificate, turning on Always Use HTTPS, and checking that WebSockets are on
+7. Opening your hotel and logging in
+
+### Connect Cloudflare automatically
+
+The last step of the installer, *Connecting your hotel to Cloudflare*, shows the guide first and points you to its section *Connect Cloudflare automatically*. Then it asks: *Paste your Cloudflare API token, or press Enter to skip and follow the manual steps in the guide.* Your domain must already be in Cloudflare with Cloudflare's nameservers (guide steps 1 and 2).
+
+Create the token in Cloudflare under **My Profile → API Tokens → Create Token → Create Custom Token**. Give it these permissions, for your hotel's zone only (**Zone Resources: Include → Specific zone → your domain**):
+
+| | | |
+|---|---|---|
+| Zone | Zone | Read |
+| Zone | DNS | Edit |
+| Zone | SSL and Certificates | Edit |
+| Zone | Zone Settings | Edit |
+| Zone | Zone WAF | Edit |
+| Zone | Bot Management | Edit |
+
+The installer hides the token while you paste it. It uses the token only while it runs and never writes it to a file, the log or the guide. You can delete the token in Cloudflare afterwards. With the token, the installer:
+
+1. Checks the token and finds your domain in Cloudflare. When the domain is missing, it says so and lets you try again or skip.
+2. Adds or updates proxied **A** records for `@`, `www` and the game address, pointing to this server's IPv4 address. It changes no other records and adds no **AAAA** records.
+3. Creates a private key and a certificate request on the server (`openssl` on Linux, `certreq` on Windows) and gets a Cloudflare **Origin CA** certificate for `myhotel.com` and `*.myhotel.com`, valid for 15 years. The private key never leaves the server. The installer checks the certificate before it replaces the temporary one. Linux installs it in `/etc/ssl/plusemu` and reloads nginx; when `nginx -t` fails, the previous certificate comes back. Windows adds Cloudflare's Origin CA root certificate to the machine's trusted root certificates, because `certreq` accepts a certificate only from a trusted root, and puts the certificate on the hotel's HTTPS bindings in IIS. When a valid origin certificate is already installed, a rerun keeps it.
+4. Turns on **Full (strict)** (only after the certificate is installed), **Always Use HTTPS**, TLS 1.2 or newer, **WebSockets**, **Browser Integrity Check**, security level **medium** and **Bot Fight Mode**. When *I'm Under Attack* mode is on, it stays on.
+5. Adds one rate limiting rule, the one the Free plan allows: 10 requests per 10 seconds per visitor to `/login`, `/register`, `/forgot-password`, `/reset-password/*`, `/two-factor-challenge` and `/housekeeping/login`, then a 10 second block. The Free plan can match only the path, so opening these pages counts too, not only sending the forms.
+6. Adds two custom rules: requests to the game connection whose `Origin` is not `https://myhotel.com` are blocked, and visitors to `/housekeeping` get a managed challenge.
+7. Saves `CLOUDFLARE_SETUP=done` (Linux) or `CloudflareSetup` (Windows) and the certificate's expiry date in the saved settings, and rewrites the guide: a green box at the top lists what was set up and what to check, and the manual steps fold away under *If you need to do this by hand*.
+
+It stops at the first step that fails, names that step, the permission the token lacks and Cloudflare's own error message, and the guide shows the reason at the top. A failed or skipped step never removes a working certificate. The installer finds its own records and rules by name, so running it again updates them instead of adding copies. When the setup is done, a rerun asks only *Press Enter to keep it, or paste a token to run it again*. For an unattended install, set `PLUSEMU_CLOUDFLARE_TOKEN`; without it, `PLUSEMU_YES=1` skips this step. A game address on another domain than the hotel's is left to the manual steps.
 
 The installer starts with a temporary self-signed certificate. Complete the certificate steps before selecting **Full (strict)**. Keep the DNS records proxied with the orange cloud. Cloudflare Origin CA certificates protect the connection from Cloudflare to your server and are not trusted directly by browsers. The private key stays on your server. Paste only the CSR into Cloudflare.
 
@@ -108,7 +136,7 @@ Every step is logged. If a step fails, the installer shows the last lines of the
 6. Starts the emulator as the `plusemu` systemd service.
 7. Installs the Atom CMS website and creates your admin account.
 8. Configures nginx and the firewall:
-   - nginx starts with a temporary self-signed HTTPS certificate. The setup guide replaces it with a Cloudflare Origin CA certificate for **Full (strict)**.
+   - nginx starts with a temporary self-signed HTTPS certificate. The Cloudflare step or the setup guide replaces it with a Cloudflare Origin CA certificate for **Full (strict)**.
    - It restores visitors' real IPs from Cloudflare and passes the game's WebSocket through to the emulator.
    - It limits each visitor: 5 login, registration or password reset attempts per minute (plus a burst of 5), 30 housekeeping pages per minute (plus a burst of 20), 50 open requests and 20 game connections (many players can share one address, for example at a school). Over the limit, nginx answers 429. The game client and the hotel files have no limits.
    - It drops slow connections after 10 seconds and sends the `Strict-Transport-Security` and `Permissions-Policy` headers. `Strict-Transport-Security` covers the hotel domain only, not its subdomains.
@@ -122,6 +150,7 @@ Every step is logged. If a step fails, the installer shows the last lines of the
    - A nightly backup runs at 04:00 (see [Nightly backups](#nightly-backups)).
    - SSH lets root log in with a key only. SSH password login goes off only when your login uses an SSH key (this session, or the account that ran `sudo` has a key in `~/.ssh/authorized_keys`). Otherwise password login stays on, and the installer says so. The settings are in `/etc/ssh/sshd_config.d/10-plusemu.conf`.
 10. Writes your setup guide.
+11. Connects your hotel to Cloudflare when you paste an API token (see [Connect Cloudflare automatically](#connect-cloudflare-automatically)).
 
 **Windows** (`install.ps1`) follows the same steps with Windows equivalents:
 
@@ -135,6 +164,7 @@ Every step is logged. If a step fails, the installer shows the last lines of the
 - Windows Update installs updates every day at 05:00 and restarts the server only when an update needs it. Windows has no security-only updates, so all quality updates install. Driver updates are left out. The installer sets these Windows Update policies under `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU`: `NoAutoUpdate=0`, `AUOptions=4`, `ScheduledInstallDay=0`, `ScheduledInstallTime=5`, `AlwaysAutoRebootAtScheduledTime=1` and `AlwaysAutoRebootAtScheduledTimeMinutes=15`, plus `ExcludeWUDriversInQualityUpdate=1` one level up. A domain Group Policy can replace them.
 - IIS Dynamic IP Restrictions: each visitor gets at most 50 open requests and 1500 requests in 10 seconds, read from the address Cloudflare forwards. Over the limit, IIS answers 403. IIS cannot limit single pages, so the login limits come from Atom CMS itself (5 attempts per minute). Uploads are limited to 20 MB, and request headers must arrive within 10 seconds.
 - The `Strict-Transport-Security` header (for the hotel domain only, not its subdomains) and the `Permissions-Policy` header
+- The setup guide, then the Cloudflare step (see [Connect Cloudflare automatically](#connect-cloudflare-automatically))
 
 The pages the installer generates, such as the setup guide and the client configuration, come from the templates in [`templates/`](templates). When you run the installer through `curl | bash` or `irm | iex`, it downloads these templates from this repository's `main` branch, so a fix merged here reaches every new install.
 
@@ -330,6 +360,7 @@ To install without questions, set the answers in environment variables:
 | `PLUSEMU_ADMIN_USER` | Admin username (default `admin`) |
 | `PLUSEMU_ADMIN_EMAIL` | Admin email (default `admin@<domain>`) |
 | `PLUSEMU_YES=1` | Skip the confirmation question |
+| `PLUSEMU_CLOUDFLARE_TOKEN` | Cloudflare API token for [Connect Cloudflare automatically](#connect-cloudflare-automatically). It is used once and never saved. Without it, `PLUSEMU_YES=1` skips that step. |
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh \
