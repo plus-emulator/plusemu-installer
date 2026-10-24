@@ -540,7 +540,10 @@ function Install-WebServer {
         Install-Msi "$Downloads\arr.msi"
     }
     # The game's WebSocket is handed to the emulator through IIS's reverse proxy.
-    Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter 'system.webServer/proxy' -Name 'enabled' -Value 'True'
+    # The emulator reads the last X-Forwarded-For entry as an address, so it carries no port.
+    foreach ($setting in @(@('enabled', 'True'), @('xForwardedForHeaderName', 'X-Forwarded-For'), @('includePortInXForwardedFor', 'False'))) {
+        Set-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' -Filter 'system.webServer/proxy' -Name $setting[0] -Value $setting[1]
+    }
     Ok 'IIS, URL Rewrite, Application Request Routing and WebSockets'
 }
 
@@ -966,6 +969,12 @@ function Set-IisSite {
     $action = "$rules/rule[@name='PlusEMU websocket']/action"
     Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'type' -Value 'Rewrite'
     Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'url' -Value 'http://127.0.0.1:2096/'
+    # The emulator sees IIS as the peer, so it reads the visitor's address from X-Real-IP. Cloudflare sends it as CF-Connecting-IP.
+    $variables = 'system.webServer/rewrite/allowedServerVariables'
+    if (-not (Get-WebConfiguration -PSPath $apphost -Filter "$variables/add[@name='HTTP_X_REAL_IP']")) {
+        Add-WebConfigurationProperty -PSPath $apphost -Filter $variables -Name '.' -Value @{ name = 'HTTP_X_REAL_IP' }
+    }
+    Add-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU websocket']/serverVariables" -Name '.' -Value @{ name = 'HTTP_X_REAL_IP'; value = '{HTTP_CF_CONNECTING_IP}' }
 
     Add-WebConfigurationProperty -PSPath $apphost -Filter $rules -Name '.' -Value @{ name = 'PlusEMU endpoints'; stopProcessing = 'True' }
     Set-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU endpoints']/match" -Name 'url' -Value '^api/(gamedata/furnidata|badges/leaderboard)$'
