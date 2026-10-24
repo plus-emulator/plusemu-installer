@@ -764,6 +764,20 @@ download_hotel_files() {
     ok "Hotel files $latest ready ($(du -sh "$files" | cut -f1))"
 }
 
+write_emulator_config() { # write_emulator_config <config.json>: the emulator's connection settings
+    local limits='.'
+    # A local hotel has one visitor address, so the per-IP limits would block the owner's own test clients.
+    if is_local; then limits='.Nitro.MaxConnectionsPerIp = 0 | .LoginThrottle.MaxFailuresPerIp = 0'; fi
+    jq --arg pass "$DB_PASSWORD" "
+        .Database.Hostname = \"127.0.0.1\" | .Database.Port = 3306 | .Database.Username = \"hotel\"
+        | .Database.Password = \$pass | .Database.Name = \"plus\"
+        | .Flash.Hostname = \"127.0.0.1\"
+        | .Nitro.Hostname = \"127.0.0.1\" | .Nitro.Port = 2096 | .Nitro.Name = \"Volt\"
+        | .Rcon.Hostname = \"127.0.0.1\" | .Rcon.Port = 30001 | .Rcon.AllowedAddresses = [\"127.0.0.1\", \"localhost\"]
+        | $limits" "$1" > "$1.new"
+    mv "$1.new" "$1"
+}
+
 start_emulator() {
     step "Starting the emulator"
     id plusemu > /dev/null 2>&1 || useradd --system --home-dir "$HOTEL_ROOT/emulator" --shell /usr/sbin/nologin plusemu
@@ -771,13 +785,7 @@ start_emulator() {
     sed -i '1s/^\xEF\xBB\xBF//' "$config"
     # Every packet is logged at Trace level by default, which floods the journal.
     sed -i 's/minlevel="Trace"/minlevel="Info"/' "$out/Config/nlog.config"
-    jq --arg pass "$DB_PASSWORD" '
-        .Database.Hostname = "127.0.0.1" | .Database.Port = 3306 | .Database.Username = "hotel"
-        | .Database.Password = $pass | .Database.Name = "plus"
-        | .Flash.Hostname = "127.0.0.1"
-        | .Nitro.Hostname = "127.0.0.1" | .Nitro.Port = 2096 | .Nitro.Name = "Volt"
-        | .Rcon.Hostname = "127.0.0.1" | .Rcon.Port = 30001 | .Rcon.AllowedAddresses = ["127.0.0.1", "localhost"]' "$config" > "$config.new"
-    mv "$config.new" "$config"
+    write_emulator_config "$config"
     chmod 600 "$config"
     chown -R plusemu:plusemu "$out"
 

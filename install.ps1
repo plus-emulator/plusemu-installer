@@ -825,6 +825,13 @@ function Get-HotelFiles {
     Ok 'Hotel files ready'
 }
 
+# A local hotel has one visitor address, so the per-IP limits would block the owner's own test clients.
+function Disable-EmulatorLimits($Json) {
+    if (-not $Json.PSObject.Properties['LoginThrottle']) { $Json | Add-Member -MemberType NoteProperty -Name LoginThrottle -Value ([pscustomobject]@{}) }
+    $Json.Nitro | Add-Member -MemberType NoteProperty -Name MaxConnectionsPerIp -Value 0 -Force
+    $Json.LoginThrottle | Add-Member -MemberType NoteProperty -Name MaxFailuresPerIp -Value 0 -Force
+}
+
 function Start-Emulator {
     Step 'Starting the emulator'
     $out = "$HotelRoot\emulator"
@@ -835,6 +842,7 @@ function Start-Emulator {
     $json.Flash.Hostname = '127.0.0.1'
     $json.Nitro.Hostname = '127.0.0.1'; $json.Nitro.Port = 2096; $json.Nitro.Name = 'Volt'
     $json.Rcon.Hostname = '127.0.0.1'; $json.Rcon.Port = 30001; $json.Rcon.AllowedAddresses = @('127.0.0.1', 'localhost')
+    if ($state.Local) { Disable-EmulatorLimits $json }
     Write-Utf8 $config ($json | ConvertTo-Json -Depth 20)
     # Every packet is logged at Trace level by default, which floods the log.
     $nlog = "$out\Config\nlog.config"
