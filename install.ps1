@@ -517,7 +517,7 @@ function Read-Answers {
 }
 
 function Get-Derived {
-    $rest = $state.WsUrl.Substring(6)
+    $rest = $state.WsUrl.Substring($state.WsUrl.IndexOf('://') + 3)
     $script:WsHost = $rest.Split('/')[0]
     $script:WsPath = if ($rest.Contains('/')) { $rest.Substring($rest.IndexOf('/') + 1) } else { '' }
     try { $script:ServerIp = (Invoke-RestMethod -Uri 'https://api.ipify.org' -TimeoutSec 10).Trim() }
@@ -674,14 +674,17 @@ function Get-Releases {
     Ok "Atom CMS ($($atom.Substring(0, [Math]::Min(12, $atom.Length))))"
 }
 
+# The address of the website, which the client, the game connection and the website itself are built from.
+function Get-SiteUrl { return "https://$($state.Domain)" }
+
 function Write-ClientConfig($Dir = (Join-Path (Join-Path $HotelRoot 'client') 'configuration')) {
     # Newer emulators build FurnitureData.json from the furniture table; older ones need the static file.
     $furnidata = '${gamedata.url}/FurnitureData.json?t=%timestamp%'
     try {
         Invoke-WebRequest 'http://127.0.0.1:8080/api/gamedata/furnidata' -UseBasicParsing -TimeoutSec 30 | Out-Null
-        $furnidata = "https://$($state.Domain)/api/gamedata/furnidata"
+        $furnidata = "$(Get-SiteUrl)/api/gamedata/furnidata"
     } catch { }
-    $values = @{ DOMAIN = $state.Domain; SOCKET_URL = $state.WsUrl; FURNIDATA_URL = $furnidata }
+    $values = @{ DOMAIN = $state.Domain; SITE_URL = Get-SiteUrl; SOCKET_URL = $state.WsUrl; FURNIDATA_URL = $furnidata }
     New-Item -ItemType Directory -Force -Path $Dir | Out-Null
     foreach ($file in 'renderer-config.json', 'ui-config.json', 'client-mode.json') {
         Render (Join-Path $Templates $file) (Join-Path $Dir $file) $values
@@ -809,7 +812,7 @@ function Install-Cms {
     Step 'Installing the Atom CMS website'
     $cms = "$HotelRoot\cms"
     $envFile = "$cms\.env"
-    $domain = $state.Domain
+    $site = Get-SiteUrl
     Push-Location $cms
     if (-not (Test-Path $envFile)) { Copy-Item .env.example $envFile }
     # Laravel trusts the visitor address Cloudflare forwards, but only from Cloudflare itself.
@@ -820,9 +823,9 @@ function Install-Cms {
           '131.0.72.0/22', '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32', '2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32')
     }
     $settings = [ordered]@{
-        APP_NAME = $state.HotelName; APP_ENV = 'production'; APP_DEBUG = 'false'; APP_URL = "https://$domain"; LOG_LEVEL = 'warning'
+        APP_NAME = $state.HotelName; APP_ENV = 'production'; APP_DEBUG = 'false'; APP_URL = $site; LOG_LEVEL = 'warning'
         DB_CONNECTION = 'mariadb'; DB_HOST = '127.0.0.1'; DB_PORT = '3306'; DB_DATABASE = 'plus'; DB_USERNAME = 'hotel'; DB_PASSWORD = $state.DbPassword
-        EMULATOR_DRIVER = 'plus'; CLIENT_NITRO_ENABLED = 'true'; NITRO_CLIENT_PATH = "https://$domain/client"
+        EMULATOR_DRIVER = 'plus'; CLIENT_NITRO_ENABLED = 'true'; NITRO_CLIENT_PATH = "$site/client"
         RCON_HOST = '127.0.0.1'; RCON_PORT = '30001'; FORCE_HTTPS = 'true'; SESSION_SECURE_COOKIE = 'true'
         TRUSTED_PROXIES = ($cloudflare -join ',')
     }
@@ -857,8 +860,8 @@ $user->forceFill(['username' => getenv('ADMIN_USER'), 'mail' => getenv('ADMIN_EM
         Remove-Item $script, Env:\ATOM_ADMIN_PASSWORD, Env:\ADMIN_PASSWORD
     }
     $values = @{
-        nitro_path = "https://$domain/client"; rcon_ip = '127.0.0.1'; rcon_port = '30001'
-        badges_path = "https://$domain/hotel-files/c_images/album1584"; furniture_icons_path = "https://$domain/hotel-files/c_images/hof_furni/icons"
+        nitro_path = "$site/client"; rcon_ip = '127.0.0.1'; rcon_port = '30001'
+        badges_path = "$site/hotel-files/c_images/album1584"; furniture_icons_path = "$site/hotel-files/c_images/hof_furni/icons"
     }
     foreach ($key in $values.Keys) { Sql "UPDATE website_settings SET value = '$($values[$key])' WHERE ``key`` = '$key'" 'plus' | Out-Null }
     Run "$PhpDir\php.exe" artisan optimize:clear
@@ -965,7 +968,7 @@ function Set-IisSite {
     Add-WebConfigurationProperty -PSPath $apphost -Filter $rules -Name '.' -Value @{ name = 'PlusEMU websocket'; stopProcessing = 'True' }
     Set-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU websocket']/match" -Name 'url' -Value "^$([regex]::Escape($WsPath))$"
     Add-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU websocket']/conditions" -Name '.' -Value @{ input = '{HTTP_HOST}'; pattern = "^$([regex]::Escape($WsHost))$" }
-    Add-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU websocket']/conditions" -Name '.' -Value @{ input = '{HTTP_ORIGIN}'; pattern = "^https://$([regex]::Escape($domain))$" }
+    Add-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='PlusEMU websocket']/conditions" -Name '.' -Value @{ input = '{HTTP_ORIGIN}'; pattern = "^$([regex]::Escape((Get-SiteUrl)))$" }
     $action = "$rules/rule[@name='PlusEMU websocket']/action"
     Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'type' -Value 'Rewrite'
     Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'url' -Value 'http://127.0.0.1:2096/'
@@ -991,7 +994,7 @@ function Set-IisSite {
     Set-IisLimits $site
     Start-Website -Name $site -ErrorAction SilentlyContinue
     if ((Get-WebAppPoolState -Name $pool).Value -eq 'Started') { Restart-WebAppPool -Name $pool } else { Start-WebAppPool -Name $pool }
-    Ok "IIS serves https://$domain"
+    Ok "IIS serves $(Get-SiteUrl)"
 
     # A new rule lets every address in until Update-CloudflareFirewall has limited it to Cloudflare.
     foreach ($port in 80, 443) {

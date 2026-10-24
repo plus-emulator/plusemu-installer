@@ -43,6 +43,7 @@ ask_questions
 
 # Use the real CMS orchestration and stop at setup/optimize, before OS changes.
 HOTEL_ROOT=$TEST_DIR/hotel
+SITE_URL=https://$DOMAIN
 mkdir -p "$HOTEL_ROOT/cms"
 touch "$HOTEL_ROOT/cms/.env"
 composer() { :; }
