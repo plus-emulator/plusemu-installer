@@ -688,12 +688,14 @@ function Install-NodeJs {
         Download "$base/$file" "$Downloads\$file"
         if ((Get-FileHash "$Downloads\$file" -Algorithm SHA256).Hash -ne $hash.ToUpper()) { throw 'The Node.js download is damaged. Run the installer again.' }
         if ($state.Local) {
-            $unpacked = Join-Path $Downloads 'node'
+            # Unpacked next to its final folder, because Windows moves a folder only within one drive.
+            $unpacked = Join-Path $StateDir 'node-download'
             if (Test-Path $unpacked) { Remove-Item $unpacked -Recurse -Force }
             Expand-Archive "$Downloads\$file" $unpacked
             if (Test-Path $script:LocalNode) { Remove-Item $script:LocalNode -Recurse -Force }
             # The archive holds one folder, node-v<version>-win-x64.
             Move-Item ([IO.Directory]::GetDirectories($unpacked)[0]) $script:LocalNode
+            Remove-Item $unpacked -Recurse -Force
         } else {
             Install-Msi "$Downloads\$file"
         }
@@ -1004,8 +1006,9 @@ function Set-IisSite {
     }
 
     # Without a site for bare IP requests, IIS answers them with an error instead of a page.
-    # A PC may serve its own sites with IIS, so a local install leaves them alone.
-    if (-not $isLocal -and (Get-Website -Name 'Default Web Site' -ErrorAction SilentlyContinue)) { Remove-Website -Name 'Default Web Site' }
+    # On a PC, IIS's own welcome site would answer every address on the network. A site the owner changed stays.
+    $default = Get-Website -Name 'Default Web Site' -ErrorAction SilentlyContinue
+    if ($default -and (-not $isLocal -or (Test-StockIisSite $default))) { Remove-Website -Name 'Default Web Site' }
 
     if (-not (Test-Path "IIS:\AppPools\$pool")) { New-WebAppPool -Name $pool | Out-Null }
     Set-ItemProperty "IIS:\AppPools\$pool" -Name managedRuntimeVersion -Value ''
@@ -1177,6 +1180,11 @@ function Write-CloudflareCommand {
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$CloudflareScript`""
     $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At '03:00'
     Register-ScheduledTask -TaskName 'PlusEMU Cloudflare addresses' -Action $action -Trigger $trigger -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+}
+
+function Test-StockIisSite($Site) {
+    $bindings = @($Site.bindings.Collection | ForEach-Object { "$($_.protocol) $($_.bindingInformation)" }) -join ';'
+    return $Site.physicalPath -eq '%SystemDrive%\inetpub\wwwroot' -and $bindings -eq 'http *:80:'
 }
 
 # Per-visitor limits and security headers for the hotel site.
@@ -2467,10 +2475,16 @@ function Invoke-Update([switch]$Check, [switch]$Yes, [switch]$Rollback, [switch]
 
 function Install-Hotel {
     Get-InstallerFiles
+    $first = -not (Test-Path $StateFile)
     Read-Answers
     if ($state.Local) {
         $script:TotalSteps = 11
-        Assert-FreePorts
+        # A first run that stops here keeps no settings, so this PC can still get a server install.
+        try { Assert-FreePorts }
+        catch {
+            if ($first) { Remove-Item $StateFile -ErrorAction SilentlyContinue }
+            throw
+        }
     }
     Say "  Admin and database passwords are saved in $StateFile. Retrieve them in Administrator PowerShell: Get-Content $StateFile"
     Get-Derived
@@ -2521,7 +2535,7 @@ try {
 } finally {
     if ($script:InstallLock) { $script:InstallLock.Dispose() }
     # irm | iex runs in the owner's own window, which keeps the PC's own Node.js afterwards.
-    if ($script:LocalNode) { $script:LocalNode = $null; Update-Path }
+    if ($script:LocalNode) { $env:Path = $env:Path.Replace("$script:LocalNode;", ''); $script:LocalNode = $null }
     foreach ($name in 'MYSQL_PWD', 'ATOM_ADMIN_PASSWORD', 'ADMIN_PASSWORD') { Remove-Item "Env:\$name" -ErrorAction SilentlyContinue }
     $ErrorActionPreference = $SessionPreferences.ErrorAction
     $ProgressPreference = $SessionPreferences.Progress

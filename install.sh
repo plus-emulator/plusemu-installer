@@ -1233,7 +1233,16 @@ $ws_main
 }
 $ws_server
 EOF
-    if is_local; then remove_nginx_welcome; else rm -f "$NGINX_DIR/sites-enabled/default"; fi
+    if is_local; then
+        remove_nginx_welcome
+        local others
+        others=$(find "$NGINX_DIR/sites-enabled" -mindepth 1 -maxdepth 1 ! -name hotel.conf -printf '%f ' 2> /dev/null || true)
+        if [ -n "$others" ]; then
+            say "      ${yellow}nginx also serves these sites: ${others% }. Those that listen on port 80 for every address no longer answer on localhost, because the hotel takes 127.0.0.1 and ::1.${reset}"
+        fi
+    else
+        rm -f "$NGINX_DIR/sites-enabled/default"
+    fi
     ln -sf "$NGINX_DIR/sites-available/hotel.conf" "$NGINX_DIR/sites-enabled/hotel.conf"
     nginx -t
     systemctl enable --now "php$PHP-fpm" nginx
@@ -2630,10 +2639,16 @@ main() {
     chmod 600 "$LOG"
     exec >> "$LOG" 2>&1
     load_installer_files
+    local first=0
+    if [ ! -f "$STATE_FILE" ]; then first=1; fi
     ask_questions
     if is_local; then
         TOTAL_STEPS=10
-        check_local_ports
+        # A first run that stops here keeps no settings, so this PC can still get a server install.
+        if ! (check_local_ports); then
+            if [ "$first" = 1 ]; then rm -f "$STATE_FILE"; fi
+            exit 1
+        fi
     fi
     say "  Admin and database passwords are saved in $STATE_FILE. Retrieve them with: sudo cat $STATE_FILE"
     derive_settings
