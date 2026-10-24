@@ -11,6 +11,7 @@
 # Unattended runs can preset the answers: PLUSEMU_DOMAIN, PLUSEMU_WS_URL,
 # PLUSEMU_HOTEL_NAME, PLUSEMU_ADMIN_USER, PLUSEMU_ADMIN_EMAIL, PLUSEMU_YES=1.
 # PLUSEMU_GUIDE_MODE=simple|advanced selects the final instructions only.
+# PLUSEMU_CLOUDFLARE_TOKEN sets up Cloudflare with that API token; it is never saved.
 #
 # Update an installed hotel (PlusEMU, the Volt client and the hotel files) later with:
 #   plusemu-update [-Check] [-Yes] [-Assets] [-Rollback]
@@ -62,6 +63,8 @@ $KeepNightly   = 7
 $BackupLockWait = 3600
 $CloudflareScript = Join-Path $StateDir 'plusemu-cloudflare-ips.ps1'
 $CloudflareLog  = Join-Path $StateDir 'cloudflare-ips.log'
+$CloudflareApi  = 'https://api.cloudflare.com/client/v4'
+$OriginCaRootUrl = 'https://developers.cloudflare.com/ssl/static/origin_ca_rsa_root.pem'
 $UpdateLog     = Join-Path $StateDir 'update.log'
 $LockFile      = Join-Path $StateDir 'update.lock'
 $KeepBackups   = 3
@@ -70,7 +73,7 @@ $script:Log        = "$StateDir\install.log"
 $PhpDir     = 'C:\PHP'
 $NodeMajor  = 22
 $MariaDbSeries = '11.4'
-$script:TotalSteps = 11
+$script:TotalSteps = 12
 $script:Step = 0
 
 # `irm | iex` runs in the user's own session, so these are restored at the end.
@@ -1155,32 +1158,410 @@ function Protect-Server {
     Write-BackupCommand
 }
 
+# ---------------------------------------------------------------- Cloudflare API setup
+
+# Calls the Cloudflare API with the token. On failure it throws Cloudflare's own message and sets CloudflareStatus.
+function Invoke-Cloudflare($Method, $Path, $Body = $null) {
+    $script:CloudflareStatus = 0
+    # The token stays a SecureString until it goes into the request, so a trace never shows it.
+    $request = @{
+        Method = $Method; Uri = "$CloudflareApi$Path"; ContentType = 'application/json'; TimeoutSec = 30
+        Headers = @{ Authorization = 'Bearer ' + ([Net.NetworkCredential]::new('', $script:CloudflareToken).Password).Trim() }
+    }
+    if ($null -ne $Body) { $request.Body = $Body | ConvertTo-Json -Depth 10 -Compress }
+    try {
+        $response = Invoke-RestMethod @request
+    } catch {
+        if ($_.Exception.Response) { $script:CloudflareStatus = [int]$_.Exception.Response.StatusCode }
+        $message = try { (@(($_.ErrorDetails.Message | ConvertFrom-Json).errors) | ForEach-Object { $_.message }) -join ' ' } catch { '' }
+        if (-not $message) { $message = $_.Exception.Message }
+        Write-Log "Cloudflare: $Method $Path -> $script:CloudflareStatus"
+        throw $message
+    }
+    $script:CloudflareStatus = 200
+    Write-Log "Cloudflare: $Method $Path -> 200"
+    if (-not $response.success) { throw ((@($response.errors) | ForEach-Object { $_.message }) -join ' ') }
+    return $response
+}
+
+# A failure on this server, not in Cloudflare.
+function Stop-Cloudflare($Message) { $script:CloudflareStatus = 'local'; throw $Message }
+
+function Set-CloudflareDns {
+    $domain = $state.Domain
+    $names = @($domain, "www.$domain")
+    if ($WsHost -notin $names) { $names += $WsHost }
+    foreach ($name in $names) {
+        $records = @((Invoke-Cloudflare GET "/zones/$CloudflareZone/dns_records?name=$name&per_page=100").result | Where-Object { $_ })
+        if ($records | Where-Object { $_.type -eq 'CNAME' }) { Stop-Cloudflare "$name has a CNAME record. Delete it in Cloudflare (DNS > Records) and run the installer again." }
+        if ($records | Where-Object { $_.type -eq 'AAAA' }) {
+            Say "      $name also has an AAAA (IPv6) record. If it does not point to this server, delete it in Cloudflare (DNS > Records)." 'Yellow'
+        }
+        $a = @($records | Where-Object { $_.type -eq 'A' })
+        if ($a.Count -eq 0) {
+            $null = Invoke-Cloudflare POST "/zones/$CloudflareZone/dns_records" @{ type = 'A'; name = $name; content = $ServerIp; proxied = $true; ttl = 1 }
+        } elseif ($a.Count -gt 1) {
+            Stop-Cloudflare "$name has more than one A record. Keep only one in Cloudflare (DNS > Records) and run the installer again."
+        } elseif ($a[0].content -ne $ServerIp -or -not $a[0].proxied) {
+            $null = Invoke-Cloudflare PATCH "/zones/$CloudflareZone/dns_records/$($a[0].id)" @{ content = $ServerIp; proxied = $true }
+        }
+    }
+    Ok "DNS: $($names -join ' ') point to $ServerIp through Cloudflare (proxied)"
+}
+
+# Cloudflare's Origin CA root, which signs every origin certificate.
+function Get-OriginRoot {
+    $file = Join-Path $Downloads 'origin_ca_rsa_root.pem'
+    try {
+        Invoke-WebRequest $OriginCaRootUrl -OutFile $file -UseBasicParsing -TimeoutSec 20
+        $root = New-Object Security.Cryptography.X509Certificates.X509Certificate2 (, [IO.File]::ReadAllBytes($file))
+    } catch { Stop-Cloudflare "Could not download Cloudflare's Origin CA root certificate. Try again later." }
+    if ($root.Subject -ne $root.Issuer -or $root.Subject -notmatch 'CloudFlare') { Stop-Cloudflare "The download of Cloudflare's Origin CA root certificate is not that certificate." }
+    return $root
+}
+
+# The DNS names in a certificate's subject alternative name extension, read from its DER bytes.
+function Get-CertificateNames($Certificate) {
+    $extension = $Certificate.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.17' } | Select-Object -First 1
+    if (-not $extension) { return @() }
+    $bytes = $extension.RawData
+    $names = @()
+    $at = 0
+    while ($at -lt $bytes.Length) {
+        $tag = $bytes[$at]
+        $length = [int]$bytes[$at + 1]
+        $start = $at + 2
+        if ($length -ge 0x80) {
+            $start += $length - 0x80
+            $length = 0
+            for ($k = $at + 2; $k -lt $start; $k++) { $length = $length * 256 + $bytes[$k] }
+        }
+        # Step into the outer SEQUENCE; collect each dNSName ([2] IA5String).
+        if ($tag -eq 0x30) { $at = $start; continue }
+        if ($tag -eq 0x82) { $names += [Text.Encoding]::ASCII.GetString($bytes, $start, $length).ToLowerInvariant() }
+        $at = $start + $length
+    }
+    return $names
+}
+
+# Signed by the Origin CA root, for every hotel name, with its private key and valid 30 more days.
+function Test-OriginCertificate($Certificate, $Root) {
+    if (-not $Certificate -or -not $Certificate.HasPrivateKey -or $Certificate.NotAfter -lt (Get-Date).AddDays(30)) { return $false }
+    $chain = New-Object Security.Cryptography.X509Certificates.X509Chain
+    $chain.ChainPolicy.RevocationMode = 'NoCheck'
+    $chain.ChainPolicy.VerificationFlags = 'AllowUnknownCertificateAuthority'
+    [void]$chain.ChainPolicy.ExtraStore.Add($Root)
+    if (-not $chain.Build($Certificate) -or $chain.ChainElements[$chain.ChainElements.Count - 1].Certificate.Thumbprint -ne $Root.Thumbprint) { return $false }
+    $names = @(Get-CertificateNames $Certificate)
+    foreach ($name in @($state.Domain, "www.$($state.Domain)", $WsHost)) {
+        $parent = $name.Substring($name.IndexOf('.') + 1)
+        if ($name -notin $names -and "*.$parent" -notin $names) { return $false }
+    }
+    return $true
+}
+
+# The certificate on the hotel's HTTPS binding.
+function Get-HotelCertificate {
+    $binding = Get-WebBinding -Name 'Hotel' -Protocol https -HostHeader $state.Domain -Port 443
+    if (-not $binding -or -not $binding.certificateHash) { return $null }
+    return Get-Item "Cert:\LocalMachine\My\$($binding.certificateHash)" -ErrorAction SilentlyContinue
+}
+
+# certreq makes the private key in the machine's key store, where it stays; Cloudflare only signs the request.
+function New-OriginRequest {
+    $dir = Join-Path $StateDir 'origin'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $inf = Join-Path $dir 'request.inf'
+    $csr = Join-Path $dir 'request.csr'
+    Remove-Item $csr -ErrorAction SilentlyContinue
+    Write-Utf8 $inf @"
+[Version]
+Signature = "`$Windows NT`$"
+
+[NewRequest]
+Subject = "CN=$($state.Domain)"
+KeyAlgorithm = RSA
+KeyLength = 2048
+HashAlgorithm = sha256
+MachineKeySet = TRUE
+Exportable = TRUE
+KeyUsage = 0xa0
+ProviderName = "Microsoft RSA SChannel Cryptographic Provider"
+RequestType = PKCS10
+
+[EnhancedKeyUsageExtension]
+OID = 1.3.6.1.5.5.7.3.1
+"@
+    try { Run certreq.exe -new -q -machine $inf $csr } catch { Stop-Cloudflare 'certreq could not create the certificate request.' }
+    return [IO.File]::ReadAllText($csr)
+}
+
+# Installs Cloudflare's certificate with the pending key and moves the HTTPS bindings to it.
+# When a binding refuses it, every binding gets its previous certificate back.
+function Install-OriginCertificate($Pem, $Root) {
+    $dir = Join-Path $StateDir 'origin'
+    $file = Join-Path $dir 'certificate.cer'
+    Write-Utf8 $file $Pem
+    $issued = New-Object Security.Cryptography.X509Certificates.X509Certificate2 (, [IO.File]::ReadAllBytes($file))
+    # certreq accepts a certificate only when Windows trusts its root.
+    if (-not (Test-Path "Cert:\LocalMachine\Root\$($Root.Thumbprint)")) {
+        $store = New-Object Security.Cryptography.X509Certificates.X509Store 'Root', 'LocalMachine'
+        $store.Open('ReadWrite')
+        $store.Add($Root)
+        $store.Close()
+    }
+    try { Run certreq.exe -accept -q -machine $file } catch { Stop-Cloudflare 'Windows did not accept the certificate from Cloudflare, so the current certificate stays.' }
+    $certificate = Get-Item "Cert:\LocalMachine\My\$($issued.Thumbprint)" -ErrorAction SilentlyContinue
+    if (-not (Test-OriginCertificate $certificate $Root)) { Stop-Cloudflare 'The certificate from Cloudflare did not pass the checks, so the current certificate stays.' }
+    $certificate.FriendlyName = 'PlusEMU Cloudflare Origin'
+    Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+    $names = @($state.Domain, "www.$($state.Domain)")
+    if ($WsHost -notin $names) { $names += $WsHost }
+    $previous = @{}
+    try {
+        foreach ($name in $names) {
+            $binding = Get-WebBinding -Name 'Hotel' -Protocol https -HostHeader $name -Port 443
+            if (-not $binding) { continue }
+            $previous[$name] = "$($binding.certificateHash)"
+            if ($binding.certificateHash) { $binding.RemoveSslCertificate() }
+            $binding.AddSslCertificate($certificate.Thumbprint, 'My')
+        }
+    } catch {
+        $reason = "$_"
+        foreach ($name in $previous.Keys) {
+            $binding = Get-WebBinding -Name 'Hotel' -Protocol https -HostHeader $name -Port 443
+            try { $binding.RemoveSslCertificate() } catch { }
+            if ($previous[$name]) { $binding.AddSslCertificate($previous[$name], 'My') }
+        }
+        Stop-Cloudflare "IIS did not accept the new certificate ($reason), so the previous one is back."
+    }
+    return $certificate
+}
+
+function Set-CloudflareCertificate {
+    $domain = $state.Domain
+    $hosts = @($domain, "*.$domain")
+    # The wildcard covers one level below the domain only.
+    if ($WsHost.EndsWith(".$domain") -and $WsHost.Substring(0, $WsHost.Length - $domain.Length - 1).Contains('.')) { $hosts += $WsHost }
+    $root = Get-OriginRoot
+    $certificate = Get-HotelCertificate
+    if (Test-OriginCertificate $certificate $root) {
+        $script:CloudflareCertExpires = $certificate.NotAfter.ToUniversalTime().ToString('yyyy-MM-dd')
+        Ok "Origin certificate: already installed, valid until $script:CloudflareCertExpires"
+        return
+    }
+    $csr = New-OriginRequest
+    $response = Invoke-Cloudflare POST '/certificates' @{ hostnames = $hosts; requested_validity = 5475; request_type = 'origin-rsa'; csr = $csr }
+    $certificate = Install-OriginCertificate $response.result.certificate $root
+    $script:CloudflareCertExpires = $certificate.NotAfter.ToUniversalTime().ToString('yyyy-MM-dd')
+    Ok "Origin certificate installed, valid until $script:CloudflareCertExpires"
+}
+
+function Set-CloudflareSettings {
+    # Full (strict) comes after the certificate step, so Cloudflare never meets the self-signed one.
+    foreach ($setting in @(@('ssl', 'strict'), @('always_use_https', 'on'), @('websockets', 'on'), @('min_tls_version', '1.2'), @('browser_check', 'on'))) {
+        $null = Invoke-Cloudflare PATCH "/zones/$CloudflareZone/settings/$($setting[0])" @{ value = $setting[1] }
+    }
+    # The security level also switches Under Attack mode, which the owner may have turned on.
+    if ((Invoke-Cloudflare GET "/zones/$CloudflareZone/settings/security_level").result.value -ne 'under_attack') {
+        $null = Invoke-Cloudflare PATCH "/zones/$CloudflareZone/settings/security_level" @{ value = 'medium' }
+    }
+    Ok 'SSL/TLS: Full (strict), Always Use HTTPS, TLS 1.2 or newer, WebSockets, Browser Integrity Check, security level medium'
+}
+
+function Set-CloudflareBotFightMode {
+    $null = Invoke-Cloudflare PUT "/zones/$CloudflareZone/bot_management" @{ fight_mode = $true }
+    Ok 'Bot Fight Mode on'
+}
+
+# Adds each rule to the phase, or updates the rule with the same description.
+function Set-CloudflareRules($Phase, $Rules) {
+    try {
+        $entry = (Invoke-Cloudflare GET "/zones/$CloudflareZone/rulesets/phases/$Phase/entrypoint").result
+    } catch {
+        if ($script:CloudflareStatus -ne 404) { throw }
+        $null = Invoke-Cloudflare PUT "/zones/$CloudflareZone/rulesets/phases/$Phase/entrypoint" @{ rules = @($Rules) }
+        return
+    }
+    foreach ($rule in $Rules) {
+        $existing = @($entry.rules) | Where-Object { $_ -and $_.description -eq $rule.description } | Select-Object -First 1
+        if ($existing) {
+            $null = Invoke-Cloudflare PATCH "/zones/$CloudflareZone/rulesets/$($entry.id)/rules/$($existing.id)" $rule
+        } else {
+            $null = Invoke-Cloudflare POST "/zones/$CloudflareZone/rulesets/$($entry.id)/rules" $rule
+        }
+    }
+}
+
+function Set-CloudflareRateLimit {
+    # The Free plan counts by path and IP only, over 10 seconds, so opening these pages counts too.
+    Set-CloudflareRules 'http_ratelimit' @(@{
+        description = 'PlusEMU: limit sign-in and registration'; action = 'block'; enabled = $true
+        expression = '(http.request.uri.path in {"/login" "/register" "/forgot-password" "/two-factor-challenge" "/housekeeping/login"} or http.request.uri.path wildcard "/reset-password/*")'
+        ratelimit = @{ characteristics = @('cf.colo.id', 'ip.src'); period = 10; requests_per_period = 10; mitigation_timeout = 10 }
+    })
+    Ok 'Rate limit: 10 sign-in, registration and password reset requests per 10 seconds per visitor'
+}
+
+function Set-CloudflareFirewallRules {
+    $domain = $state.Domain
+    Set-CloudflareRules 'http_request_firewall_custom' @(
+        @{ description = 'PlusEMU: game connection only from the hotel website'; action = 'block'; enabled = $true
+           expression = "(http.host eq `"$WsHost`" and http.request.uri.path eq `"/$WsPath`" and not any(http.request.headers[`"origin`"][*] eq `"https://$domain`"))" },
+        @{ description = 'PlusEMU: check visitors before housekeeping'; action = 'managed_challenge'; enabled = $true
+           expression = "(http.host eq `"$domain`" and (http.request.uri.path eq `"/housekeeping`" or http.request.uri.path wildcard `"/housekeeping/*`"))" }
+    )
+    Ok "Firewall rules: the game connects only from https://$domain, and housekeeping visitors get a Cloudflare check first"
+}
+
+# Runs every step with the token. Returns $false and sets CloudflareError when a step fails.
+function Invoke-CloudflareSetup {
+    $domain = $state.Domain
+    # Each step: the function, the token permission it needs, and its name in messages.
+    $steps = @(
+        @{ Name = 'Set-CloudflareDns'; Permission = 'Zone / DNS / Edit'; Label = 'DNS records' },
+        @{ Name = 'Set-CloudflareCertificate'; Permission = 'Zone / SSL and Certificates / Edit'; Label = 'origin certificate' },
+        @{ Name = 'Set-CloudflareSettings'; Permission = 'Zone / Zone Settings / Edit'; Label = 'SSL/TLS and security settings' },
+        @{ Name = 'Set-CloudflareBotFightMode'; Permission = 'Zone / Bot Management / Edit'; Label = 'Bot Fight Mode' },
+        @{ Name = 'Set-CloudflareRateLimit'; Permission = 'Zone / Zone WAF / Edit'; Label = 'rate limiting rule' },
+        @{ Name = 'Set-CloudflareFirewallRules'; Permission = 'Zone / Zone WAF / Edit'; Label = 'firewall rules' }
+    )
+    if ($WsHost -ne $domain -and -not $WsHost.EndsWith(".$domain")) {
+        $script:CloudflareError = "The game connection uses another domain ($WsHost), so the installer cannot set it up. Follow the manual steps in the guide."
+        return $false
+    }
+    try { $null = Invoke-Cloudflare GET '/user/tokens/verify' }
+    catch { $script:CloudflareError = "Cloudflare did not accept the token. Copy it again from My Profile > API Tokens. Cloudflare said: $_"; return $false }
+    try { $zones = @((Invoke-Cloudflare GET "/zones?name=$domain").result | Where-Object { $_ }) }
+    catch { $script:CloudflareError = "Could not look up $domain. The token needs the permission Zone / Zone / Read. Cloudflare said: $_"; return $false }
+    if (-not $zones) {
+        $script:CloudflareError = "Cloudflare has no site $domain that this token can use. Add the site to Cloudflare and change the nameservers (guide steps 1 and 2). Check that the token's Zone Resources include $domain."
+        return $false
+    }
+    $script:CloudflareZone = $zones[0].id
+    if ($zones[0].status -ne 'active') {
+        Say "      Cloudflare still waits for the nameserver change of $domain. The settings work as soon as Cloudflare shows the site as Active." 'Yellow'
+    }
+    foreach ($step in $steps) {
+        try { & $step.Name }
+        catch {
+            $reason = "$_"
+            $script:CloudflareError = if ("$script:CloudflareStatus" -in '401', '403') {
+                "The $($step.Label) step failed: the token lacks the permission $($step.Permission). Add it in My Profile > API Tokens > Edit, then try again. Cloudflare said: $reason"
+            } elseif ($script:CloudflareStatus -eq 'local') {
+                "The $($step.Label) step failed: $reason"
+            } else {
+                "The $($step.Label) step failed. Cloudflare said: $reason"
+            }
+            return $false
+        }
+    }
+    return $true
+}
+
+# A hidden answer from the console, as a SecureString.
+function Read-Secret($Question) { return Read-Host "  $Question" -AsSecureString }
+
+function Connect-Cloudflare {
+    Step 'Connecting your hotel to Cloudflare'
+    $interactive = (Get-Setting 'PLUSEMU_YES' '0') -ne '1'
+    $token = if ($env:PLUSEMU_CLOUDFLARE_TOKEN) { ConvertTo-SecureString $env:PLUSEMU_CLOUDFLARE_TOKEN -AsPlainText -Force }
+    Remove-Item Env:\PLUSEMU_CLOUDFLARE_TOKEN -ErrorAction SilentlyContinue
+    $script:CloudflareError = ''
+    if ($interactive) {
+        try { Start-Process (Join-Path (Join-Path $HotelRoot 'setup-guide') 'index.html') } catch { Write-Log "$_" }
+        Say '  Your setup guide is open in your browser (also on your desktop: "Hotel setup guide").'
+    } else {
+        Say "  Your setup guide: $HotelRoot\setup-guide\index.html (also on your desktop: `"Hotel setup guide`")."
+    }
+    Say '  To let the installer set up Cloudflare for you, follow the guide''s section "Connect Cloudflare automatically".'
+    $question = 'Paste your Cloudflare API token, or press Enter to skip and follow the manual steps in the guide'
+    if ($state.CloudflareSetup -eq 'done') {
+        Say '  Cloudflare is already connected.'
+        $question = 'Press Enter to keep it, or paste a token to run it again'
+    }
+    while ($true) {
+        if (-not $token -and $interactive) { $token = Read-Secret $question }
+        if (-not $token -or $token.Length -eq 0) { break }
+        $script:CloudflareToken = $token
+        $script:CloudflareError = ''
+        if (Invoke-CloudflareSetup) {
+            $state | Add-Member -MemberType NoteProperty -Name CloudflareSetup -Value 'done' -Force
+            $state | Add-Member -MemberType NoteProperty -Name CloudflareCertExpires -Value $script:CloudflareCertExpires -Force
+            $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
+            Ok 'Cloudflare is connected. Reload the setup guide to see what was set up.'
+            break
+        }
+        Say "      $script:CloudflareError" 'Yellow'
+        if (-not $interactive) { break }
+        $retry = Read-Secret 'Fix it and press Enter to try again, paste a new token, or type skip'
+        if ($retry.Length -eq 0) { continue }
+        if ([Net.NetworkCredential]::new('', $retry).Password.Trim() -eq 'skip') { break }
+        $token = $retry
+    }
+    $script:CloudflareToken = $null
+    $token = $null
+    $retry = $null
+    if ($script:CloudflareError -and $state.CloudflareSetup -eq 'done') {
+        Say '      The earlier Cloudflare setup stays as it was.' 'Yellow'
+    } elseif ($script:CloudflareError) {
+        Say '      The installer did not finish the Cloudflare setup. Follow the manual steps in the guide.' 'Yellow'
+    } elseif ($state.CloudflareSetup -ne 'done') {
+        Say '      Skipped. Follow the manual steps in the guide.'
+    }
+    Write-GuideFile
+}
+
 function Write-Guide {
     Step 'Writing your setup guide'
+    Write-GuideFile
+    Ok 'Guide written (also on your desktop)'
+}
+
+# The guide in its manual form, or in its connected form after the Cloudflare step.
+function Write-GuideFile {
     $mode = if ($state.GuideMode) { $state.GuideMode } else { 'simple' }
+    $status = ''; $manualStart = ''; $manualEnd = ''; $gameAddress = ''
+    $intro = 'Now connect <b>{{DOMAIN}}</b> through Cloudflare and install its origin certificate.'
+    if ($state.CloudflareSetup -eq 'done') {
+        $intro = 'Cloudflare is connected. Check your hotel below.'
+        $status = [IO.File]::ReadAllText((Join-Path $Templates 'cloudflare-connected.html'))
+        $manualStart = '<details class="card manual"><summary>If you need to do this by hand</summary>'
+        $manualEnd = '</details>'
+    }
+    if ($script:CloudflareError) { $status += [IO.File]::ReadAllText((Join-Path $Templates 'cloudflare-failed.html')) }
+    if ($WsHost -notin $state.Domain, "www.$($state.Domain)") { $gameAddress = ", the game address <code>$WsHost</code>" }
     $wsRow = ''
     if ($WsHost -ne $state.Domain) {
         $label = if ($WsHost.EndsWith(".$($state.Domain)")) { $WsHost.Substring(0, $WsHost.Length - $state.Domain.Length - 1) } else { $WsHost }
         $wsRow = "<tr><td>A</td><td><code>$label</code></td><td><code>$ServerIp</code></td><td>Proxied (orange cloud)</td></tr>"
     }
-    New-Item -ItemType Directory -Force -Path "$HotelRoot\setup-guide" | Out-Null
-    Render "$Templates\setup-guide.html" "$HotelRoot\setup-guide\index.html" @{
+    $guide = Join-Path (Join-Path $HotelRoot 'setup-guide') 'index.html'
+    New-Item -ItemType Directory -Force -Path (Split-Path $guide) | Out-Null
+    # The fragments come first, so the placeholders inside them are filled too.
+    Render (Join-Path $Templates 'setup-guide.html') $guide ([ordered]@{
+        CLOUDFLARE_STATUS = $status; MANUAL_START = $manualStart; MANUAL_END = $manualEnd; GUIDE_INTRO = $intro; GAME_ADDRESS_ITEM = $gameAddress
+        CERTIFICATE_EXPIRES = $state.CloudflareCertExpires; CLOUDFLARE_ERROR_HTML = [Net.WebUtility]::HtmlEncode("$script:CloudflareError")
         DOMAIN = $state.Domain; SERVER_IP = $ServerIp; HOTEL_NAME = $state.HotelName; WS_DNS_ROW = $wsRow; WS_HOST = $WsHost
         GUIDE_MODE_TITLE = (Get-Culture).TextInfo.ToTitleCase($mode)
-        GUIDE_MODE_DETAILS = [IO.File]::ReadAllText("$Templates\guide-$mode.html")
+        GUIDE_MODE_DETAILS = [IO.File]::ReadAllText((Join-Path $Templates "guide-$mode.html"))
         CREDENTIALS_FILE = $StateFile; RESTART_COMMAND = 'Restart-Service PlusEMU'
         LOG_COMMAND = "Get-Content $HotelRoot\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 50 -Wait"
-    } "$Templates\certificate-windows.html"
-    Copy-Item "$HotelRoot\setup-guide\index.html" "$([Environment]::GetFolderPath('Desktop'))\Hotel setup guide.html" -Force
-    Ok 'Guide written (also on your desktop)'
+    }) (Join-Path $Templates 'certificate-windows.html')
+    Copy-Item $guide "$([Environment]::GetFolderPath('Desktop'))\Hotel setup guide.html" -Force
 }
 
 function Complete-Install {
     Write-Host ''
     Write-Host 'Your hotel is installed!' -ForegroundColor Green
     Write-Host ''
-    Write-Host '  One last part: connect your domain and install your Cloudflare origin certificate.'
-    Write-Host '  The setup guide is opening in your browser now (also on your desktop: "Hotel setup guide").'
+    if ($state.CloudflareSetup -eq 'done') {
+        Write-Host "  Cloudflare is connected. Open https://$($state.Domain), log in and enter the hotel to check it."
+        Write-Host '  The setup guide shows what the installer set up and what to check (also on your desktop: "Hotel setup guide").'
+    } else {
+        Write-Host '  One last part: connect your domain and install your Cloudflare origin certificate.'
+        Write-Host '  Follow the setup guide (also on your desktop: "Hotel setup guide").'
+    }
     Write-Host ''
     Write-Host "  Your admin login for https://$($state.Domain) (also saved in $StateFile):"
     Write-Host '      Username: ' -NoNewline; Write-Host $state.AdminUser -ForegroundColor White
@@ -1200,7 +1581,6 @@ function Complete-Install {
     Write-Host '  Store passwords somewhere safe. Change the initial admin password after logging in;'
     Write-Host '  the saved file retains the initial password. Keep passwords out of shared logs and screenshots.'
     Write-Host ''
-    if ((Get-Setting 'PLUSEMU_YES' '0') -ne '1') { Start-Process "$HotelRoot\setup-guide\index.html" }
 }
 
 # ---------------------------------------------------------------- update
@@ -1681,6 +2061,7 @@ try {
         Protect-Server
         Write-Guide
         Write-UpdateCommand
+        Connect-Cloudflare
         Complete-Install
     }
 } catch {

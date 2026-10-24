@@ -11,6 +11,7 @@
 # Unattended runs can preset the answers: PLUSEMU_DOMAIN, PLUSEMU_WS_URL,
 # PLUSEMU_HOTEL_NAME, PLUSEMU_ADMIN_USER, PLUSEMU_ADMIN_EMAIL, PLUSEMU_YES=1.
 # PLUSEMU_GUIDE_MODE=simple|advanced selects the final instructions only.
+# PLUSEMU_CLOUDFLARE_TOKEN sets up Cloudflare with that API token; it is never saved.
 set -Eeuo pipefail
 shopt -u patsub_replacement 2> /dev/null || true # bash 5.2 would expand "&" in template values
 
@@ -49,12 +50,15 @@ CLOUDFLARE_CRON=/etc/cron.d/plusemu-cloudflare-ips
 CLOUDFLARE_LOG=/var/log/plusemu-cloudflare-ips.log
 CLOUDFLARE_TAG=plusemu-cloudflare
 UFW_DEFAULTS=/etc/default/ufw
+CF_API=https://api.cloudflare.com/client/v4
+ORIGIN_CA_ROOT_URL=https://developers.cloudflare.com/ssl/static/origin_ca_rsa_root.pem
+TTY=/dev/tty
 LOGROTATE_CONF=/etc/logrotate.d/plusemu
 JOURNALD_DROPIN=/etc/systemd/journald.conf.d/90-plusemu.conf
 MODE=install
 PHP=8.5
 NODE_MAJOR=22
-TOTAL_STEPS=10
+TOTAL_STEPS=11
 STEP=0
 
 # ---------------------------------------------------------------- output
@@ -130,8 +134,9 @@ render() { # render <template> <output> [certificate fragment]: replace {{KEY}} 
     content=$(< "$1")
     if [ -n "${3-}" ]; then certificate_steps=$(< "$3"); fi
     content=${content//"{{CERTIFICATE_STEPS}}"/"$certificate_steps"}
-    for key in DOMAIN SOCKET_URL FURNIDATA_URL SERVER_IP WS_HOST HOTEL_NAME ADMIN_USER ADMIN_EMAIL \
-        CREDENTIALS_FILE RESTART_COMMAND LOG_COMMAND WS_DNS_ROW GUIDE_MODE_TITLE GUIDE_MODE_DETAILS; do
+    # The fragments come first, so the placeholders inside them are filled too.
+    for key in CLOUDFLARE_STATUS MANUAL_START MANUAL_END GUIDE_INTRO GAME_ADDRESS_ITEM DOMAIN SOCKET_URL FURNIDATA_URL SERVER_IP WS_HOST HOTEL_NAME ADMIN_USER ADMIN_EMAIL \
+        CREDENTIALS_FILE RESTART_COMMAND LOG_COMMAND WS_DNS_ROW GUIDE_MODE_TITLE GUIDE_MODE_DETAILS CERTIFICATE_EXPIRES CLOUDFLARE_ERROR_HTML; do
         content=${content//"{{$key}}"/${!key-}}
     done
     printf '%s\n' "$content" > "$2"
@@ -173,6 +178,8 @@ ADMIN_PASSWORD='$ADMIN_PASSWORD'
 DB_PASSWORD='$DB_PASSWORD'
 GUIDE_TOKEN='$GUIDE_TOKEN'
 GUIDE_MODE='${GUIDE_MODE:-simple}'
+CLOUDFLARE_SETUP='${CLOUDFLARE_SETUP:-}'
+CLOUDFLARE_CERT_EXPIRES='${CLOUDFLARE_CERT_EXPIRES:-}'
 EOF
     chmod 600 "$STATE_FILE"
     umask 022
@@ -1299,21 +1306,307 @@ secure_server() {
     install_backup_command
 }
 
-# shellcheck disable=SC2034 # the {{KEY}} values are read by render() through ${!key}
+# ---------------------------------------------------------------- Cloudflare API setup
+
+# Each step: the function, the token permission it needs, and its name in messages.
+CLOUDFLARE_STEPS=(
+    "cloudflare_dns|Zone / DNS / Edit|DNS records"
+    "cloudflare_certificate|Zone / SSL and Certificates / Edit|origin certificate"
+    "cloudflare_settings|Zone / Zone Settings / Edit|SSL/TLS and security settings"
+    "cloudflare_bot_fight_mode|Zone / Bot Management / Edit|Bot Fight Mode"
+    "cloudflare_rate_limit|Zone / Zone WAF / Edit|rate limiting rule"
+    "cloudflare_firewall_rules|Zone / Zone WAF / Edit|firewall rules"
+)
+
+cf_api() { # cf_api <method> <path> [JSON body]: sets CF_STATUS, CF_BODY and CF_ERROR; fails unless Cloudflare reports success
+    local out errors args=(-sS --fail-with-body --max-time 30 -X "$1" -H 'Content-Type: application/json' -w '\n%{http_code}')
+    if [ -n "${3:-}" ]; then args+=(--data-binary "$3"); fi
+    errors=$(mktemp)
+    # The token reaches curl through a pipe, never on its command line or in a file.
+    out=$(curl "${args[@]}" -H @<(printf 'Authorization: Bearer %s\n' "$CLOUDFLARE_TOKEN") "$CF_API$2" 2> "$errors") || true
+    CF_STATUS=${out##*$'\n'}
+    CF_BODY=${out%"$CF_STATUS"}
+    CF_ERROR=$(jq -r '[.errors[]?.message] | join(" ")' <<< "$CF_BODY" 2> /dev/null || true)
+    if [ -z "$CF_ERROR" ]; then CF_ERROR=$(head -c 300 "$errors"); fi
+    rm -f "$errors"
+    echo "Cloudflare: $1 $2 -> ${CF_STATUS:-no answer}"
+    [[ $CF_STATUS == 2?? ]] && [ "$(jq -r '.success' <<< "$CF_BODY" 2> /dev/null)" = true ]
+}
+
+cloudflare_fail() { CF_STATUS=local CF_ERROR=$1; return 1; }
+
+cloudflare_dns() {
+    local host record names=("$DOMAIN" "www.$DOMAIN")
+    if [ "$WS_HOST" != "$DOMAIN" ] && [ "$WS_HOST" != "www.$DOMAIN" ]; then names+=("$WS_HOST"); fi
+    for host in "${names[@]}"; do
+        cf_api GET "/zones/$CF_ZONE/dns_records?name=$host&per_page=100" || return 1
+        if jq -e '.result | any(.type == "CNAME")' <<< "$CF_BODY" > /dev/null; then
+            cloudflare_fail "$host has a CNAME record. Delete it in Cloudflare (DNS > Records) and run the installer again."
+            return 1
+        fi
+        if jq -e '.result | any(.type == "AAAA")' <<< "$CF_BODY" > /dev/null; then
+            say "      ${yellow}$host also has an AAAA (IPv6) record. If it does not point to this server, delete it in Cloudflare (DNS > Records).${reset}"
+        fi
+        case $(jq '[.result[] | select(.type == "A")] | length' <<< "$CF_BODY") in
+            0) cf_api POST "/zones/$CF_ZONE/dns_records" "$(jq -nc --arg name "$host" --arg ip "$SERVER_IP" '{type: "A", name: $name, content: $ip, proxied: true, ttl: 1}')" || return 1 ;;
+            1)
+                record=$(jq -c '.result[] | select(.type == "A")' <<< "$CF_BODY")
+                if [ "$(jq -r '"\(.content) \(.proxied)"' <<< "$record")" != "$SERVER_IP true" ]; then
+                    cf_api PATCH "/zones/$CF_ZONE/dns_records/$(jq -r .id <<< "$record")" "$(jq -nc --arg ip "$SERVER_IP" '{content: $ip, proxied: true}')" || return 1
+                fi
+                ;;
+            *)
+                cloudflare_fail "$host has more than one A record. Keep only one in Cloudflare (DNS > Records) and run the installer again."
+                return 1
+                ;;
+        esac
+    done
+    ok "DNS: ${names[*]} point to $SERVER_IP through Cloudflare (proxied)"
+}
+
+origin_certificate_valid() { # origin_certificate_valid <cert> <key> <Origin CA root>: signed by Cloudflare, for every hotel name, valid 30 more days
+    local host
+    [ -s "$1" ] && [ -s "$2" ] || return 1
+    openssl x509 -in "$1" -noout -checkend 2592000 > /dev/null || return 1
+    for host in "$DOMAIN" "www.$DOMAIN" "$WS_HOST"; do
+        openssl verify -CAfile "$3" -purpose sslserver -verify_hostname "$host" "$1" > /dev/null 2>&1 || return 1
+    done
+    [ "$(openssl pkey -in "$2" -pubout 2> /dev/null)" = "$(openssl x509 -in "$1" -pubkey -noout)" ]
+}
+
+certificate_expiry() { date -u -d "$(openssl x509 -in "$1" -noout -enddate | cut -d= -f2)" +%Y-%m-%d; }
+
+cloudflare_certificate() {
+    local work backup hosts=("$DOMAIN" "*.$DOMAIN")
+    # The wildcard covers one level below the domain only.
+    if [[ $WS_HOST == *."$DOMAIN" && ${WS_HOST%."$DOMAIN"} == *.* ]]; then hosts+=("$WS_HOST"); fi
+    work=$(mktemp -d)
+    if ! curl -fsS --max-time 20 "$ORIGIN_CA_ROOT_URL" -o "$work/root.pem" || ! openssl x509 -in "$work/root.pem" -noout 2> /dev/null; then
+        rm -rf "$work"
+        cloudflare_fail "Could not download Cloudflare's Origin CA root certificate. Try again later."
+        return 1
+    fi
+    if origin_certificate_valid "$SSL_DIR/cert.pem" "$SSL_DIR/key.pem" "$work/root.pem"; then
+        rm -rf "$work"
+        CLOUDFLARE_CERT_EXPIRES=$(certificate_expiry "$SSL_DIR/cert.pem")
+        ok "Origin certificate: already installed, valid until $CLOUDFLARE_CERT_EXPIRES"
+        return 0
+    fi
+    # The private key is made here and never leaves the server; Cloudflare only signs the request.
+    if ! openssl req -new -newkey rsa:2048 -nodes -keyout "$work/key.pem" -out "$work/request.csr" -subj "/CN=$DOMAIN" 2> /dev/null; then
+        rm -rf "$work"
+        cloudflare_fail "openssl could not create the certificate request."
+        return 1
+    fi
+    if ! cf_api POST /certificates "$(jq -nc --rawfile csr "$work/request.csr" '{hostnames: $ARGS.positional, requested_validity: 5475, request_type: "origin-rsa", csr: $csr}' --args "${hosts[@]}")"; then
+        rm -rf "$work"
+        return 1
+    fi
+    jq -r '.result.certificate' <<< "$CF_BODY" > "$work/cert.pem"
+    if ! origin_certificate_valid "$work/cert.pem" "$work/key.pem" "$work/root.pem"; then
+        rm -rf "$work"
+        cloudflare_fail "The certificate from Cloudflare did not pass the checks, so the current certificate stays."
+        return 1
+    fi
+    backup=$(mktemp -d "$SSL_DIR/backup.XXXXXX")
+    cp -p "$SSL_DIR/cert.pem" "$SSL_DIR/key.pem" "$backup/"
+    if install -m 600 "$work/key.pem" "$SSL_DIR/key.pem" && install -m 644 "$work/cert.pem" "$SSL_DIR/cert.pem" &&
+        nginx -t && systemctl reload nginx; then
+        rm -rf "$work"
+        CLOUDFLARE_CERT_EXPIRES=$(certificate_expiry "$SSL_DIR/cert.pem")
+        ok "Origin certificate installed, valid until $CLOUDFLARE_CERT_EXPIRES (previous one saved in $backup)"
+        return 0
+    fi
+    cp -p "$backup/cert.pem" "$backup/key.pem" "$SSL_DIR/"
+    nginx -t && systemctl reload nginx
+    rm -rf "$work"
+    cloudflare_fail "nginx did not accept the new certificate, so the previous one is back. See $LOG."
+}
+
+cloudflare_settings() {
+    local setting
+    # Full (strict) comes after the certificate step, so Cloudflare never meets the self-signed one.
+    for setting in ssl=strict always_use_https=on websockets=on min_tls_version=1.2 browser_check=on; do
+        cf_api PATCH "/zones/$CF_ZONE/settings/${setting%%=*}" "$(jq -nc --arg value "${setting#*=}" '{value: $value}')" || return 1
+    done
+    # The security level also switches Under Attack mode, which the owner may have turned on.
+    cf_api GET "/zones/$CF_ZONE/settings/security_level" || return 1
+    if [ "$(jq -r .result.value <<< "$CF_BODY")" != under_attack ]; then
+        cf_api PATCH "/zones/$CF_ZONE/settings/security_level" '{"value":"medium"}' || return 1
+    fi
+    ok "SSL/TLS: Full (strict), Always Use HTTPS, TLS 1.2 or newer, WebSockets, Browser Integrity Check, security level medium"
+}
+
+cloudflare_bot_fight_mode() {
+    cf_api PUT "/zones/$CF_ZONE/bot_management" '{"fight_mode":true}' || return 1
+    ok "Bot Fight Mode on"
+}
+
+cloudflare_rules() { # cloudflare_rules <phase> <rule JSON>...: adds each rule, or updates the rule with the same description
+    local phase=$1 ruleset rule id
+    shift
+    if ! cf_api GET "/zones/$CF_ZONE/rulesets/phases/$phase/entrypoint"; then
+        [ "$CF_STATUS" = 404 ] || return 1
+        cf_api PUT "/zones/$CF_ZONE/rulesets/phases/$phase/entrypoint" "$(printf '%s\n' "$@" | jq -s '{rules: .}')"
+        return
+    fi
+    ruleset=$(jq -r .result.id <<< "$CF_BODY")
+    local rules=$CF_BODY
+    for rule in "$@"; do
+        id=$(jq -r --arg description "$(jq -r .description <<< "$rule")" 'first(.result.rules[]? | select(.description == $description) | .id) // empty' <<< "$rules")
+        if [ -n "$id" ]; then
+            cf_api PATCH "/zones/$CF_ZONE/rulesets/$ruleset/rules/$id" "$rule" || return 1
+        else
+            cf_api POST "/zones/$CF_ZONE/rulesets/$ruleset/rules" "$rule" || return 1
+        fi
+    done
+}
+
+cloudflare_rate_limit() {
+    # The Free plan counts by path and IP only, over 10 seconds, so opening these pages counts too.
+    local expression='(http.request.uri.path in {"/login" "/register" "/forgot-password" "/two-factor-challenge" "/housekeeping/login"} or http.request.uri.path wildcard "/reset-password/*")'
+    cloudflare_rules http_ratelimit "$(jq -nc --arg expression "$expression" '{description: "PlusEMU: limit sign-in and registration", expression: $expression, action: "block", enabled: true,
+        ratelimit: {characteristics: ["cf.colo.id", "ip.src"], period: 10, requests_per_period: 10, mitigation_timeout: 10}}')" || return 1
+    ok "Rate limit: 10 sign-in, registration and password reset requests per 10 seconds per visitor"
+}
+
+cloudflare_firewall_rules() {
+    local game housekeeping
+    game="(http.host eq \"$WS_HOST\" and http.request.uri.path eq \"$WS_PATH\" and not any(http.request.headers[\"origin\"][*] eq \"https://$DOMAIN\"))"
+    housekeeping="(http.host eq \"$DOMAIN\" and (http.request.uri.path eq \"/housekeeping\" or http.request.uri.path wildcard \"/housekeeping/*\"))"
+    cloudflare_rules http_request_firewall_custom \
+        "$(jq -nc --arg expression "$game" '{description: "PlusEMU: game connection only from the hotel website", expression: $expression, action: "block", enabled: true}')" \
+        "$(jq -nc --arg expression "$housekeeping" '{description: "PlusEMU: check visitors before housekeeping", expression: $expression, action: "managed_challenge", enabled: true}')" || return 1
+    ok "Firewall rules: the game connects only from https://$DOMAIN, and housekeeping visitors get a Cloudflare check first"
+}
+
+cloudflare_setup() { # runs every step with CLOUDFLARE_TOKEN; on failure CLOUDFLARE_ERROR says what failed
+    local entry name permission label
+    if [ "$WS_HOST" != "$DOMAIN" ] && [[ $WS_HOST != *."$DOMAIN" ]]; then
+        CLOUDFLARE_ERROR="The game connection uses another domain ($WS_HOST), so the installer cannot set it up. Follow the manual steps in the guide."
+        return 1
+    fi
+    if ! cf_api GET /user/tokens/verify; then
+        CLOUDFLARE_ERROR="Cloudflare did not accept the token. Copy it again from My Profile > API Tokens. Cloudflare said: $CF_ERROR"
+        return 1
+    fi
+    if ! cf_api GET "/zones?name=$DOMAIN"; then
+        CLOUDFLARE_ERROR="Could not look up $DOMAIN. The token needs the permission Zone / Zone / Read. Cloudflare said: $CF_ERROR"
+        return 1
+    fi
+    CF_ZONE=$(jq -r '.result[0].id // empty' <<< "$CF_BODY")
+    if [ -z "$CF_ZONE" ]; then
+        CLOUDFLARE_ERROR="Cloudflare has no site $DOMAIN that this token can use. Add the site to Cloudflare and change the nameservers (guide steps 1 and 2). Check that the token's Zone Resources include $DOMAIN."
+        return 1
+    fi
+    if [ "$(jq -r '.result[0].status' <<< "$CF_BODY")" != active ]; then
+        say "      ${yellow}Cloudflare still waits for the nameserver change of $DOMAIN. The settings work as soon as Cloudflare shows the site as Active.${reset}"
+    fi
+    for entry in "${CLOUDFLARE_STEPS[@]}"; do
+        IFS='|' read -r name permission label <<< "$entry"
+        if ! "$name"; then
+            case $CF_STATUS in
+                401 | 403) CLOUDFLARE_ERROR="The $label step failed: the token lacks the permission $permission. Add it in My Profile > API Tokens > Edit, then try again. Cloudflare said: $CF_ERROR" ;;
+                local) CLOUDFLARE_ERROR="The $label step failed: $CF_ERROR" ;;
+                *) CLOUDFLARE_ERROR="The $label step failed. Cloudflare said: ${CF_ERROR:-no answer}" ;;
+            esac
+            return 1
+        fi
+    done
+}
+
+read_secret() { # read_secret <variable> <question>: a hidden answer from the terminal; fails without one
+    local answer
+    [ "${PLUSEMU_YES:-0}" != 1 ] || return 1
+    printf '  %s: ' "$2" >&3
+    IFS= read -rs answer < "$TTY" 2> /dev/null || return 1
+    printf '\n' >&3
+    printf -v "$1" '%s' "${answer//[[:space:]]/}"
+}
+
+connect_cloudflare() {
+    step "Connecting your hotel to Cloudflare"
+    # A trace (bash -x) would print the token, so it stays off until the token is gone.
+    local trace=${-//[^x]/} token=${PLUSEMU_CLOUDFLARE_TOKEN:-} question retry
+    { set +x; } 2> /dev/null
+    unset PLUSEMU_CLOUDFLARE_TOKEN
+    CLOUDFLARE_ERROR=
+    say "  Your setup guide: ${bold}${cyan}http://$SERVER_IP/$GUIDE_TOKEN/${reset}"
+    say "  To let the installer set up Cloudflare for you, follow the guide's section \"Connect Cloudflare automatically\"."
+    question="Paste your Cloudflare API token, or press Enter to skip and follow the manual steps in the guide"
+    if [ "${CLOUDFLARE_SETUP:-}" = "done" ]; then
+        say "  Cloudflare is already connected."
+        question="Press Enter to keep it, or paste a token to run it again"
+    fi
+    while [ -n "$token" ] || read_secret token "$question"; do
+        [ -n "$token" ] || break
+        CLOUDFLARE_TOKEN=$token
+        CLOUDFLARE_ERROR=
+        if cloudflare_setup; then
+            CLOUDFLARE_SETUP="done"
+            save_state
+            ok "Cloudflare is connected. Reload the setup guide to see what was set up."
+            break
+        fi
+        say "      ${yellow}$CLOUDFLARE_ERROR${reset}"
+        token=
+        question="Fix it and press Enter to try again, paste a new token, or type skip"
+        read_secret retry "$question" || break
+        case $retry in
+            skip) break ;;
+            '') token=$CLOUDFLARE_TOKEN ;;
+            *) token=$retry ;;
+        esac
+    done
+    unset CLOUDFLARE_TOKEN token retry
+    if [ -n "$trace" ]; then set -x; fi
+    if [ -n "$CLOUDFLARE_ERROR" ] && [ "${CLOUDFLARE_SETUP:-}" = "done" ]; then
+        say "      ${yellow}The earlier Cloudflare setup stays as it was.${reset}"
+    elif [ -n "$CLOUDFLARE_ERROR" ]; then
+        say "      ${yellow}The installer did not finish the Cloudflare setup. Follow the manual steps in the guide.${reset}"
+    elif [ "${CLOUDFLARE_SETUP:-}" != "done" ]; then
+        say "      Skipped. Follow the manual steps in the guide."
+    fi
+    render_guide
+}
+
+html_escape() { local text=${1//&/&amp;}; text=${text//</&lt;}; text=${text//>/&gt;}; printf '%s' "${text//\"/&quot;}"; }
+
 write_guide() {
     step "Writing your setup guide"
+    render_guide
+    ok "Guide written"
+}
+
+# shellcheck disable=SC2034 # the {{KEY}} values are read by render() through ${!key}
+render_guide() { # the guide in its manual form, or in its connected form after the Cloudflare step
     mkdir -p "$HOTEL_ROOT/setup-guide"
+    CLOUDFLARE_STATUS="" MANUAL_START="" MANUAL_END="" CLOUDFLARE_ERROR_HTML="" GAME_ADDRESS_ITEM=""
+    GUIDE_INTRO='Now connect <b>{{DOMAIN}}</b> through Cloudflare and install its origin certificate.'
+    if [ "${CLOUDFLARE_SETUP:-}" = "done" ]; then
+        GUIDE_INTRO='Cloudflare is connected. Check your hotel below.'
+        CLOUDFLARE_STATUS=$(< "$TEMPLATES/cloudflare-connected.html")
+        MANUAL_START='<details class="card manual"><summary>If you need to do this by hand</summary>'
+        MANUAL_END='</details>'
+    fi
+    if [ -n "${CLOUDFLARE_ERROR:-}" ]; then
+        CLOUDFLARE_STATUS+=$(< "$TEMPLATES/cloudflare-failed.html")
+        CLOUDFLARE_ERROR_HTML=$(html_escape "$CLOUDFLARE_ERROR")
+    fi
+    CERTIFICATE_EXPIRES=${CLOUDFLARE_CERT_EXPIRES:-}
     CREDENTIALS_FILE=$STATE_FILE
     RESTART_COMMAND="sudo systemctl restart plusemu"
     LOG_COMMAND="sudo journalctl -u plusemu -f"
     GUIDE_MODE_TITLE=${GUIDE_MODE^}
     GUIDE_MODE_DETAILS=$(< "$TEMPLATES/guide-$GUIDE_MODE.html")
+    if [ "$WS_HOST" != "$DOMAIN" ] && [ "$WS_HOST" != "www.$DOMAIN" ]; then
+        GAME_ADDRESS_ITEM=", the game address <code>$WS_HOST</code>"
+    fi
     WS_DNS_ROW=""
     if [ "$WS_HOST" != "$DOMAIN" ]; then
         WS_DNS_ROW="<tr><td>A</td><td><code>${WS_HOST%."$DOMAIN"}</code></td><td><code>$SERVER_IP</code></td><td>Proxied (orange cloud)</td></tr>"
     fi
     render "$TEMPLATES/setup-guide.html" "$HOTEL_ROOT/setup-guide/index.html" "$TEMPLATES/certificate-linux.html"
-    ok "Guide written"
 }
 
 finish() {
@@ -1321,8 +1614,13 @@ finish() {
     say ""
     say "${green}${bold}🎉 Your hotel is installed!${reset}"
     say ""
-    say "  One last part: connect your domain and install your Cloudflare origin certificate."
-    say "  Open this page in your browser for easy step-by-step instructions:"
+    if [ "${CLOUDFLARE_SETUP:-}" = "done" ]; then
+        say "  Cloudflare is connected. Open https://$DOMAIN, log in and enter the hotel to check it."
+        say "  The setup guide shows what the installer set up and what to check:"
+    else
+        say "  One last part: connect your domain and install your Cloudflare origin certificate."
+        say "  Open this page in your browser for easy step-by-step instructions:"
+    fi
     say ""
     say "      ${bold}${cyan}http://$SERVER_IP/$GUIDE_TOKEN/${reset}"
     say ""
@@ -1788,6 +2086,7 @@ main() {
     secure_server
     write_guide
     install_update_command
+    connect_cloudflare
     finish
 }
 
