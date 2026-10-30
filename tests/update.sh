@@ -369,4 +369,18 @@ grep -Fqi 'figuredata.xml' "$TEST_DIR/terminal"
 run_update --assets
 grep -qi 'up to date' "$TEST_DIR/terminal"
 
+# A new release with a lower or differently shaped tag still counts as new: any tag other than the installed one is installed.
+make_client_release v1.0.0
+LATEST_CLIENT=v1.0.0
+: > "$TEST_DIR/terminal"
+run_update --check
+grep -Fq 'client-v2.0.0 -> ' "$TEST_DIR/terminal"
+grep -Fq v1.0.0 "$TEST_DIR/terminal"
+run_update --yes
+[[ $(< "$client/index.html") == 'client v1.0.0' && $(< "$emulator/Plus Emulator") == 'emulator v2.2.0' ]]
+grep -qx "CLIENT_VERSION='v1.0.0'" "$VERSIONS_FILE"
+: > "$TEST_DIR/terminal"
+run_update --yes
+grep -qi 'everything is up to date' "$TEST_DIR/terminal"
+
 printf 'Bash update checks passed\n' >&4

@@ -403,6 +403,17 @@ try {
     Assert (Test-Path (Join-Path $furni 'stock_3.nitro')) 'An older pack was not refreshed'
     Assert (Test-Path (Join-Path (Join-Path (Join-Path $hotelFiles 'assets') 'custom') 'my_furni.nitro')) 'The refresh removed an owner-added file'
     Assert ((Get-Versions).AssetsVersion -eq $pack3) 'The refreshed pack version was not recorded'
+    # A new release with a lower or differently shaped tag still counts as new: any tag other than the installed one is installed.
+    New-ClientRelease 'v1.0.0'
+    $script:LatestClient = 'v1.0.0'
+    Invoke-TestUpdate -Check
+    Assert ($Terminal.Contains('client-v2.0.0 -> v1.0.0')) "A lower client tag was not reported: $Terminal"
+    Invoke-TestUpdate -Yes
+    Assert ((Get-Text (Join-Path $client 'index.html')) -eq 'client v1.0.0') 'A lower client tag was not installed'
+    Assert ((Get-Text (Join-Path $emulator 'Plus Emulator.exe')) -eq 'emulator v2.2.0') 'The emulator changed without a new release'
+    Assert ((Get-Versions).ClientVersion -eq 'v1.0.0') 'The lower client tag was not recorded'
+    Invoke-TestUpdate -Yes
+    Assert ($Terminal -match 'Everything is up to date') "The lower client tag was installed again: $Terminal"
     Write-Host 'PowerShell update checks passed'
 } catch {
     Write-Host "Failed: $_" -ForegroundColor Red
