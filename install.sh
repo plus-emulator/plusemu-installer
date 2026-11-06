@@ -17,6 +17,8 @@
 # PLUSEMU_CLOUDFLARE_TOKEN sets up Cloudflare with that API token; it is never saved.
 # PLUSEMU_DISCORD_WEBHOOK sends health alerts to that Discord webhook ("off" turns them off).
 # PLUSEMU_CROWDSEC=1 installs CrowdSec with the advanced guide (0 keeps it off).
+# --remote-database <addresses> (or PLUSEMU_REMOTE_DATABASE) lets these IPv4 addresses or networks,
+# separated by commas, reach the database on port 3306, for example from HeidiSQL. "off" closes it again.
 set -Eeuo pipefail
 shopt -u patsub_replacement 2> /dev/null || true # bash 5.2 would expand "&" in template values
 
@@ -57,6 +59,8 @@ CLOUDFLARE_CRON=/etc/cron.d/plusemu-cloudflare-ips
 CLOUDFLARE_LOG=/var/log/plusemu-cloudflare-ips.log
 CLOUDFLARE_TAG=plusemu-cloudflare
 UFW_DEFAULTS=/etc/default/ufw
+DATABASE_TAG=plusemu-database
+MARIADB_REMOTE_CONF=/etc/mysql/mariadb.conf.d/60-plusemu-remote.cnf
 CF_API=https://api.cloudflare.com/client/v4
 ORIGIN_CA_ROOT_URL=https://developers.cloudflare.com/ssl/static/origin_ca_rsa_root.pem
 TTY=/dev/tty
@@ -209,6 +213,7 @@ CLOUDFLARE_CERT_EXPIRES='${CLOUDFLARE_CERT_EXPIRES:-}'
 DISCORD_WEBHOOK='${DISCORD_WEBHOOK:-}'
 CROWDSEC='${CROWDSEC:-}'
 LOCAL='${LOCAL:-no}'
+REMOTE_DATABASE='${REMOTE_DATABASE:-}'
 EOF
     chmod 600 "$STATE_FILE"
     umask 022
@@ -417,6 +422,52 @@ select_local() { # select_local [saved choice]: sets LOCAL to yes or no
     LOCAL=$requested
 }
 
+remote_database_list() { # remote_database_list <addresses>: each IPv4 address or network on a line, as ufw shows it; fails on anything else
+    local entry ip bits part value=0 mask
+    for entry in ${1//,/ }; do
+        ip=${entry%/*} bits=32
+        if [[ $entry == */* ]]; then bits=${entry#*/}; fi
+        [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ && $bits =~ ^[0-9]{1,2}$ ]] || return 1
+        bits=$((10#$bits))
+        # Wider networks than a /8 would open the database to a large part of the internet.
+        ((bits >= 8 && bits <= 32)) || return 1
+        value=0
+        for part in ${ip//./ }; do
+            part=$((10#$part))
+            ((part <= 255)) || return 1
+            value=$((value * 256 + part))
+        done
+        mask=$(((0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF))
+        value=$((value & mask))
+        ip=$((value >> 24)).$((value >> 16 & 255)).$((value >> 8 & 255)).$((value & 255))
+        if ((bits == 32)); then echo "$ip"; else echo "$ip/$bits"; fi
+    done
+}
+
+mariadb_host() { # mariadb_host <address or network>: the host part of its MariaDB account
+    local bits mask
+    if [[ $1 != */* ]]; then printf '%s' "$1"; return; fi
+    bits=${1#*/}
+    mask=$(((0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF))
+    printf '%s/%s' "${1%/*}" "$((mask >> 24)).$((mask >> 16 & 255)).$((mask >> 8 & 255)).$((mask & 255))"
+}
+
+select_remote_database() { # select_remote_database [saved addresses]: sets REMOTE_DATABASE; a rerun keeps the saved ones
+    local requested=${REMOTE_DATABASE_OPTION:-${PLUSEMU_REMOTE_DATABASE:-}} list
+    REMOTE_DATABASE=${1:-}
+    if [ -z "$requested" ]; then return; fi
+    REMOTE_DATABASE=
+    if [ "$requested" = off ]; then return; fi
+    if is_local; then
+        die "A local hotel has its database on this PC already: connect HeidiSQL to 127.0.0.1, port 3306. Nothing was changed."
+    fi
+    list=$(remote_database_list "$requested") || list=
+    if [ -z "$list" ]; then
+        die "--remote-database needs the IPv4 addresses of your PC, separated by commas, for example 203.0.113.7 or 203.0.113.0/24. Nothing was changed."
+    fi
+    REMOTE_DATABASE=$(paste -sd, <<< "$list")
+}
+
 valid_webhook() { [[ $1 =~ ^https://(discord|discordapp)\.com/api/webhooks/[A-Za-z0-9._~/?=\&-]+$ ]]; }
 
 choose_discord_webhook() { # sets DISCORD_WEBHOOK; reruns keep the saved one unless PLUSEMU_DISCORD_WEBHOOK changes it
@@ -478,13 +529,14 @@ choose_options() { # the optional answers; DISCORD_WEBHOOK_NEW=1 when a webhook 
 ask_questions() {
     select_guide_mode
     unset DISCORD_WEBHOOK CROWDSEC
+    REMOTE_DATABASE=
     say ""
     say "${bold}Welcome to the PlusEMU hotel installer!${reset}"
     say "This sets up your emulator, client and website on this server in about 10 minutes."
     say ""
 
     if [ -f "$STATE_FILE" ]; then
-        GUIDE_MODE=simple LOCAL=no
+        GUIDE_MODE=simple LOCAL=no REMOTE_DATABASE=
         # An older state file has no answer for these, so the questions are asked once.
         local trace=${-//[^x]/}
         { set +x; } 2> /dev/null
@@ -492,6 +544,7 @@ ask_questions() {
         . "$STATE_FILE"
         if [ -n "$trace" ]; then set -x; fi
         select_local "$LOCAL"
+        select_remote_database "$REMOTE_DATABASE"
         select_guide_mode "$GUIDE_MODE"
         if [ -z "${GUIDE_TOKEN:-}" ]; then GUIDE_TOKEN=$(random_secret 12); fi
         if is_local; then
@@ -510,6 +563,7 @@ ask_questions() {
     fi
 
     select_local
+    select_remote_database
     if is_local; then
         # The game connects through the same nginx as the website, so the browser sees one origin.
         DOMAIN=localhost WS_URL=ws://localhost/ws
@@ -553,6 +607,7 @@ ask_questions() {
         say "  Setup guide: $GUIDE_MODE. Selecting this guide does not change SSH, RDP, firewall, updates or backups."
         if [ "$HEALTH_ALERTS" = on ]; then say "  Health alerts: Discord"; else say "  Health alerts: log only (no Discord webhook)"; fi
         if [ "$GUIDE_MODE" = advanced ]; then say "  CrowdSec:    $CROWDSEC"; fi
+        if [ -n "$REMOTE_DATABASE" ]; then say "  Database:   open to ${REMOTE_DATABASE//,/, } (port 3306)"; fi
     fi
     if [ "${PLUSEMU_YES:-0}" != 1 ]; then
         local go
@@ -1256,7 +1311,10 @@ EOF
     systemctl enable --now "php$PHP-fpm" nginx
     systemctl reload nginx
     ok "nginx serves $SITE_URL"
-    if ! is_local; then configure_firewall; fi
+    if ! is_local; then
+        configure_firewall
+        configure_remote_database
+    fi
 }
 
 # HTTP stays open to everyone for the setup guide and the redirects. HTTPS only takes Cloudflare's addresses,
@@ -1278,6 +1336,45 @@ configure_firewall() {
         say "      ${yellow}Could not refresh Cloudflare's addresses; HTTPS keeps the previous ones. Try again later: sudo plusemu-cloudflare-ips${reset}"
     else
         say "      ${yellow}Could not download Cloudflare's addresses, so HTTPS stays open to every address. Try again later: sudo plusemu-cloudflare-ips${reset}"
+    fi
+}
+
+# MariaDB listens on every address only while remote access is on. The firewall and the accounts let in only the saved addresses.
+configure_remote_database() {
+    local entry rule host conf='' pattern="^ufw allow from ([^ ]+) to any port 3306 proto tcp comment '$DATABASE_TAG'\$"
+    local -A allowed=() accounts=()
+    local addresses=${REMOTE_DATABASE:-}
+    for entry in ${addresses//,/ }; do
+        allowed[$entry]=1
+        accounts[$(mariadb_host "$entry")]=1
+        ufw allow proto tcp from "$entry" to any port 3306 comment "$DATABASE_TAG" > /dev/null
+    done
+    while read -r rule; do
+        if [[ $rule =~ $pattern && -z ${allowed[${BASH_REMATCH[1]}]:-} ]]; then
+            ufw delete allow proto tcp from "${BASH_REMATCH[1]}" to any port 3306 comment "$DATABASE_TAG" > /dev/null
+        fi
+    done <<< "$(ufw show added)"
+    # Only accounts in the installer's address form are its own; others, such as 'hotel'@'%', belong to the owner.
+    while read -r host; do
+        if [[ $host =~ ^[0-9./]+$ && -z ${accounts[$host]:-} ]]; then sql <<< "DROP USER IF EXISTS 'hotel'@'$host';"; fi
+    done <<< "$(sql -N -e "SELECT Host FROM mysql.user WHERE User = 'hotel' AND Host <> 'localhost'")"
+    for host in "${!accounts[@]}"; do
+        sql <<EOF
+CREATE USER IF NOT EXISTS 'hotel'@'$host' IDENTIFIED BY '$DB_PASSWORD';
+ALTER USER 'hotel'@'$host' IDENTIFIED BY '$DB_PASSWORD';
+GRANT ALL PRIVILEGES ON plus.* TO 'hotel'@'$host';
+EOF
+    done
+    if [ -n "$addresses" ]; then conf=$'[mysqld]\nbind-address = 0.0.0.0'; fi
+    if [ "$conf" != "$(cat "$MARIADB_REMOTE_CONF" 2> /dev/null)" ]; then
+        if [ -n "$conf" ]; then printf '%s\n' "$conf" > "$MARIADB_REMOTE_CONF"; else rm -f "$MARIADB_REMOTE_CONF"; fi
+        systemctl restart mariadb
+        # The emulator keeps database connections open, so it starts again with new ones.
+        systemctl restart plusemu
+        wait_for_emulator
+    fi
+    if [ -n "$addresses" ]; then
+        ok "The database accepts connections on port 3306 from ${addresses//,/, } only"
     fi
 }
 
@@ -2199,6 +2296,17 @@ finish() {
     printf '      Password: %s\n' "$DB_PASSWORD" >&3
     say "      Connect locally: mariadb --host=127.0.0.1 --port=3306 --user=hotel --password plus"
     say "      Database root uses local socket authentication: sudo mariadb (no generated root password)."
+    if [ -n "${REMOTE_DATABASE:-}" ]; then
+        say ""
+        say "  Connect to the database from your PC (for example with HeidiSQL):"
+        say "      Network type: MariaDB or MySQL (TCP/IP)"
+        say "      Hostname / IP: $SERVER_IP    Port: 3306"
+        say "      User: hotel    Database: plus"
+        printf '      Password: %s\n' "$DB_PASSWORD" >&3
+        say "      Use the server's IP address, not your hotel's domain: Cloudflare does not pass database connections."
+        say "      Only ${REMOTE_DATABASE//,/, } can connect. When your PC's address changes, run the installer again with"
+        say "      --remote-database <new address>. Close the database again with --remote-database off."
+    fi
     say ""
     say "  Retrieve saved passwords: sudo cat $STATE_FILE"
     say "  Update the emulator and the client later with: sudo plusemu-update"
@@ -2625,7 +2733,7 @@ main() {
         case "$1" in
             --guide-mode)
                 if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
-                    die "Usage: install.sh [--local] [--guide-mode simple|advanced]"
+                    die "Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off]"
                 fi
                 GUIDE_MODE_OPTION=$2
                 shift 2
@@ -2634,7 +2742,14 @@ main() {
                 LOCAL_OPTION=1
                 shift
                 ;;
-            *) die "Unknown option: $1. Usage: install.sh [--local] [--guide-mode simple|advanced]" ;;
+            --remote-database)
+                if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+                    die "Usage: install.sh --remote-database <your PC's IPv4 address>[,<more addresses>] or --remote-database off"
+                fi
+                REMOTE_DATABASE_OPTION=$2
+                shift 2
+                ;;
+            *) die "Unknown option: $1. Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off]" ;;
         esac
     done
     select_guide_mode

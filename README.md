@@ -205,7 +205,7 @@ Every step is logged. If a step fails, the installer shows the last lines of the
    - It restores visitors' real IPs from Cloudflare and passes the game's WebSocket through to the emulator. The game connection carries the visitor's address in the `X-Real-IP` and `X-Forwarded-For` headers, because the emulator sees nginx as the peer.
    - It limits each visitor: 5 login, registration or password reset attempts per minute (plus a burst of 5), 30 housekeeping pages per minute (plus a burst of 20), 50 open requests and 20 game connections (many players can share one address, for example at a school). Over the limit, nginx answers 429. The game client and the hotel files have no limits.
    - It drops slow connections after 10 seconds and sends the `Strict-Transport-Security` and `Permissions-Policy` headers. `Strict-Transport-Security` covers the hotel domain only, not its subdomains.
-   - The `ufw` firewall allows only SSH, HTTP and HTTPS. The database and the emulator stay private.
+   - The `ufw` firewall allows only SSH, HTTP and HTTPS. The database and the emulator stay private, unless you open the database with [`--remote-database`](#connect-from-your-pc-with-heidisql-linux-server).
    - HTTPS is accepted only from Cloudflare's addresses, so nobody can go around Cloudflare to reach the hotel. HTTP stays open for the setup guide and the redirects, but nginx answers the hotel's own names only for Cloudflare and this server. `plusemu-cloudflare-ips` downloads Cloudflare's address lists every Sunday at 03:00 and updates the firewall and nginx. When a download fails, it changes nothing. If the download fails during a new install, HTTPS stays open to every address until the next successful run, and the installer says so.
 9. Secures the server:
    - `fail2ban` bans an address for 1 hour after 5 failed SSH logins in 10 minutes. When CrowdSec runs, CrowdSec bans SSH attackers instead and fail2ban is off (see [CrowdSec](#crowdsec-advanced-guide-linux)).
@@ -272,7 +272,32 @@ Use host `127.0.0.1`, port `3306`, database `plus`, username `hotel` and the dat
 mariadb --host=127.0.0.1 --port=3306 --user=hotel --password plus
 ```
 
-Enter the database password at the prompt. On Windows, use `mariadb.exe` from your MariaDB installation's `bin` folder. For a desktop database client, connect through an SSH tunnel to the server with destination `127.0.0.1:3306`; use your server's SSH address, not the Cloudflare-proxied hotel domain. Keep port 3306 private.
+Enter the database password at the prompt. On Windows, use `mariadb.exe` from your MariaDB installation's `bin` folder. For a desktop database client, connect through an SSH tunnel to the server with destination `127.0.0.1:3306`; use your server's SSH address, not the Cloudflare-proxied hotel domain. Without `--remote-database`, port 3306 stays private.
+
+### Connect from your PC with HeidiSQL (Linux server)
+
+You can let your own PC reach the database directly. Find your PC's public IPv4 address, for example on <https://api.ipify.org>. Then run the installer on the server again with that address:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash -s -- --remote-database 203.0.113.7
+```
+
+Replace `203.0.113.7` with your address. To allow more than one address, separate them with commas. A network such as `203.0.113.0/24` is allowed too, up to a `/8`. Only these addresses get through the firewall and have a database account. IPv6 addresses are not supported.
+
+In HeidiSQL, create a new session and fill in:
+
+| Field | Value |
+| --- | --- |
+| Network type | `MariaDB or MySQL (TCP/IP)` |
+| Hostname / IP | Your server's IP address. Not the hotel's domain: Cloudflare does not pass database connections. |
+| User | `hotel` |
+| Password | `DB_PASSWORD` from `sudo cat /etc/plusemu/hotel.env` |
+| Port | `3306` |
+| Databases | `plus` |
+
+The installer also prints these values when it finishes. Later runs keep the saved addresses. When your PC's address changes, run the installer again with `--remote-database <new address>`; the old address loses access. To close the database again, run it with `--remote-database off`.
+
+Opening or closing the database restarts MariaDB and the emulator, so players are disconnected for a moment. The connection is not encrypted unless your MariaDB has TLS (MariaDB 11.4 and newer turn it on by itself). The SSH tunnel above is the safer choice on a network you do not trust. A local install has no `--remote-database`: connect to `127.0.0.1` on that PC.
 
 Linux database root uses local socket authentication (`sudo mariadb`); no root password is generated. Windows database root uses the saved `DbRootPassword`.
 
@@ -482,6 +507,7 @@ To install without questions, set the answers in environment variables:
 
 | Variable | Meaning |
 |---|---|
+| `PLUSEMU_REMOTE_DATABASE=<addresses>` | Lets these IPv4 addresses reach the database on port 3306 (the same as `--remote-database`). `off` closes it again. See [Connect from your PC with HeidiSQL](#connect-from-your-pc-with-heidisql-linux-server). |
 | `PLUSEMU_LOCAL=1` | [Local install](#local-install) on this PC at `http://localhost` (the same as `--local` or `-Local`). `PLUSEMU_LOCAL=0` asks for a server install. A saved install keeps its choice. |
 | `PLUSEMU_DOMAIN` | Hotel domain (required, except for a local install) |
 | `PLUSEMU_WS_URL` | WebSocket address (default `wss://<domain>/ws`) |
