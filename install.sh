@@ -19,6 +19,8 @@
 # PLUSEMU_CROWDSEC=1 installs CrowdSec with the advanced guide (0 keeps it off).
 # --remote-database <addresses> (or PLUSEMU_REMOTE_DATABASE) lets these IPv4 addresses or networks,
 # separated by commas, reach the database on port 3306, for example from HeidiSQL. "off" closes it again.
+# --setup-ssh (or PLUSEMU_SETUP_SSH=1) asks for your SSH public key and then turns SSH password login off.
+# PLUSEMU_SSH_KEY gives the public key to an unattended run.
 set -Eeuo pipefail
 shopt -u patsub_replacement 2> /dev/null || true # bash 5.2 would expand "&" in template values
 
@@ -526,6 +528,11 @@ choose_options() { # the optional answers; DISCORD_WEBHOOK_NEW=1 when a webhook 
     choose_crowdsec
 }
 
+choose_ssh_key() { # with --setup-ssh, the key is asked first, while the owner is at the terminal
+    select_setup_ssh
+    if [ "$SETUP_SSH" = yes ]; then ask_ssh_key; fi
+}
+
 ask_questions() {
     select_guide_mode
     unset DISCORD_WEBHOOK CROWDSEC
@@ -545,6 +552,7 @@ ask_questions() {
         if [ -n "$trace" ]; then set -x; fi
         select_local "$LOCAL"
         select_remote_database "$REMOTE_DATABASE"
+        choose_ssh_key
         select_guide_mode "$GUIDE_MODE"
         if [ -z "${GUIDE_TOKEN:-}" ]; then GUIDE_TOKEN=$(random_secret 12); fi
         if is_local; then
@@ -564,6 +572,7 @@ ask_questions() {
 
     select_local
     select_remote_database
+    choose_ssh_key
     if is_local; then
         # The game connects through the same nginx as the website, so the browser sees one origin.
         DOMAIN=localhost WS_URL=ws://localhost/ws
@@ -1417,6 +1426,139 @@ sudo_user_has_keys() {
     [ -n "$home" ] && grep -qE '^[^#[:space:]]' "$home/.ssh/authorized_keys" 2> /dev/null
 }
 
+restore_sshd_dropin() { # restore_sshd_dropin <previous content>: an empty one removes the file
+    if [ -n "$1" ]; then printf '%s\n' "$1" > "$SSHD_DROPIN"; else rm -f "$SSHD_DROPIN"; fi
+}
+
+write_sshd_dropin() { # write_sshd_dropin <password login: on|off> <previous content>: fails, and keeps the previous file, when sshd rejects it
+    mkdir -p "$(dirname "$SSHD_DROPIN")"
+    # sshd -t needs this folder, which only exists once the SSH service has started.
+    install -d -m 755 /run/sshd 2> /dev/null || true
+    {
+        echo "# Written by the PlusEMU installer. sshd uses the first value it reads, so this file sorts before the other drop-ins."
+        echo "PermitRootLogin prohibit-password"
+        if [ "$1" = off ]; then
+            echo "PasswordAuthentication no"
+            echo "KbdInteractiveAuthentication no"
+        fi
+    } > "$SSHD_DROPIN"
+    if ! sshd -t; then
+        restore_sshd_dropin "$2"
+        say "      ${yellow}SSH was left as it is: sshd did not accept the new settings (see $LOG).${reset}"
+        return 1
+    fi
+    reload_ssh
+}
+
+reload_ssh() {
+    if ! systemctl try-reload-or-restart ssh.service; then
+        say "      ${yellow}The SSH service did not reload; the new SSH settings apply after a restart.${reset}"
+    fi
+}
+
+select_setup_ssh() { # sets SETUP_SSH to yes or no
+    case ${SETUP_SSH_OPTION:-${PLUSEMU_SETUP_SSH:-0}} in
+        1) SETUP_SSH=yes ;;
+        0) SETUP_SSH=no ;;
+        *) die "PLUSEMU_SETUP_SSH must be 1 (set up SSH key login) or 0." ;;
+    esac
+    if [ "$SETUP_SSH" = no ]; then return; fi
+    if is_local; then die "--setup-ssh is for servers. A local install leaves the SSH settings of this PC alone. Nothing was changed."; fi
+    if ! sshd_installed; then die "--setup-ssh needs an SSH server, and this server has none. Nothing was changed."; fi
+}
+
+valid_public_key() { # valid_public_key <line>: one OpenSSH public key that ssh-keygen can read
+    local file status=0
+    [[ $1 =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)\ [A-Za-z0-9+/]+=*(\ [^[:cntrl:]]*)?$ ]] || return 1
+    file=$(mktemp)
+    printf '%s\n' "$1" > "$file"
+    ssh-keygen -l -f "$file" > /dev/null 2>&1 || status=1
+    rm -f "$file"
+    return "$status"
+}
+
+ssh_account() { local user; user=$(sudo_user); printf '%s' "${user:-root}"; }
+
+ask_ssh_key() { # sets SSH_KEY to the owner's public key, from PLUSEMU_SSH_KEY or the terminal
+    local key=${PLUSEMU_SSH_KEY:-}
+    if [ -n "$key" ]; then
+        key=$(printf '%s' "$key" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        valid_public_key "$key" || die "PLUSEMU_SSH_KEY is not an SSH public key. Copy the whole line from your .pub file."
+        SSH_KEY=$key
+        return
+    fi
+    say ""
+    say "  ${bold}SSH key login${reset} for the account ${bold}$(ssh_account)${reset}. After this, SSH accepts your key only: passwords stop working."
+    say "  1. On your own PC (not on this server), make a key if you have none yet. Press Enter to accept the file name."
+    say "     A passphrase is optional; it protects the key if someone copies it."
+    say "       Windows (PowerShell):  ssh-keygen -t ed25519"
+    say "       Linux or macOS:        ssh-keygen -t ed25519"
+    say "  2. Show your public key and copy the whole line. It starts with ssh-ed25519."
+    say '       Windows (PowerShell):  Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub'
+    say "       Linux or macOS:        cat ~/.ssh/id_ed25519.pub"
+    say "  3. Paste the line here. Never paste the file without .pub: that is your private key and must stay on your PC."
+    while true; do
+        ask key "Your SSH public key"
+        key=$(printf '%s' "$key" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        if valid_public_key "$key"; then break; fi
+        if [[ $key == *PRIVATE* ]]; then
+            say "  ${yellow}That is your private key. Keep it on your PC; paste the line from the .pub file instead.${reset}"
+        else
+            say "  ${yellow}That is not an SSH public key. Copy the whole line from the .pub file, for example: ssh-ed25519 AAAA... you@pc${reset}"
+        fi
+    done
+    SSH_KEY=$key
+}
+
+# Password login goes off only after the owner logged in with the key in a new window, so nobody is locked out.
+setup_ssh_key() {
+    local account home dir file added=0 previous='' logged_in=y port login
+    account=$(ssh_account)
+    step "Setting up SSH key login for $account"
+    home=$(getent passwd "$account" | cut -d: -f6)
+    dir=$home/.ssh file=$home/.ssh/authorized_keys
+    mkdir -p "$dir"
+    touch "$file"
+    chmod 700 "$dir"
+    chmod 600 "$file"
+    chown "$account:$(id -gn "$account")" "$dir" "$file"
+    if ! grep -qxF -- "$SSH_KEY" "$file"; then
+        if [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then echo >> "$file"; fi
+        printf '%s\n' "$SSH_KEY" >> "$file"
+        added=1
+    fi
+    if [ -f "$SSHD_DROPIN" ]; then previous=$(< "$SSHD_DROPIN"); fi
+    if write_sshd_dropin off "$previous"; then
+        if [[ $(sshd -T 2> /dev/null) != *'passwordauthentication no'* ]]; then
+            say "      ${yellow}Another SSH setting turns password login on. Check: sudo sshd -T | grep -i passwordauthentication${reset}"
+            logged_in=n
+        elif [ "${PLUSEMU_YES:-0}" != 1 ]; then
+            port=$( (sshd -T 2> /dev/null || true) | awk '/^port / {print $2; exit}')
+            login="ssh $account@$SERVER_IP"
+            if [ -n "$port" ] && [ "$port" != 22 ]; then login="ssh -p $port $account@$SERVER_IP"; fi
+            say ""
+            say "  Keep this window open. Open a new window on your PC and log in with your key:"
+            say "      ${bold}$login${reset}"
+            say "  It must not ask for the server's password. A question for your key's passphrase is fine."
+            ask logged_in "Did that log you in? (y/n)"
+        fi
+    else
+        logged_in=n
+    fi
+    if [[ $logged_in =~ ^[Yy] ]]; then
+        ok "SSH: key login only for $account (password login is off, root may log in with a key only)"
+        return
+    fi
+    restore_sshd_dropin "$previous"
+    reload_ssh
+    if [ "$added" = 1 ]; then
+        grep -vxF -- "$SSH_KEY" "$file" > "$file.new" || true
+        cat "$file.new" > "$file"
+        rm -f "$file.new"
+    fi
+    say "      ${yellow}Password login stays on: the key login did not work. Check that you pasted the .pub file of the key you log in with, then run the installer again with --setup-ssh.${reset}"
+}
+
 harden_ssh() { # sets SSH_PASSWORDS to on, off or none
     SSH_PASSWORDS=on
     if ! sshd_installed; then
@@ -1437,25 +1579,9 @@ harden_ssh() { # sets SSH_PASSWORDS to on, off or none
         say "      ${yellow}SSH password login stays on: this session did not log in with an SSH key. The setup guide explains how to turn it off.${reset}"
         return
     fi
-    mkdir -p "$(dirname "$SSHD_DROPIN")"
-    # sshd -t needs this folder, which only exists once the SSH service has started.
-    install -d -m 755 /run/sshd 2> /dev/null || true
-    {
-        echo "# Written by the PlusEMU installer. sshd uses the first value it reads, so this file sorts before the other drop-ins."
-        echo "PermitRootLogin prohibit-password"
-        if [ "$SSH_PASSWORDS" = off ]; then
-            echo "PasswordAuthentication no"
-            echo "KbdInteractiveAuthentication no"
-        fi
-    } > "$SSHD_DROPIN"
-    if ! sshd -t; then
-        if [ -n "$previous" ]; then printf '%s\n' "$previous" > "$SSHD_DROPIN"; else rm -f "$SSHD_DROPIN"; fi
+    if ! write_sshd_dropin "$SSH_PASSWORDS" "$previous"; then
         SSH_PASSWORDS=on
-        say "      ${yellow}SSH was left as it is: sshd did not accept the new settings (see $LOG).${reset}"
         return
-    fi
-    if ! systemctl try-reload-or-restart ssh.service; then
-        say "      ${yellow}The SSH service did not reload; the new SSH settings apply after a restart.${reset}"
     fi
     if [ "$SSH_PASSWORDS" = off ]; then
         if [[ $(sshd -T 2> /dev/null) != *'passwordauthentication no'* ]]; then
@@ -2733,13 +2859,17 @@ main() {
         case "$1" in
             --guide-mode)
                 if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
-                    die "Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off]"
+                    die "Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off] [--setup-ssh]"
                 fi
                 GUIDE_MODE_OPTION=$2
                 shift 2
                 ;;
             --local)
                 LOCAL_OPTION=1
+                shift
+                ;;
+            --setup-ssh)
+                SETUP_SSH_OPTION=1
                 shift
                 ;;
             --remote-database)
@@ -2749,7 +2879,7 @@ main() {
                 REMOTE_DATABASE_OPTION=$2
                 shift 2
                 ;;
-            *) die "Unknown option: $1. Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off]" ;;
+            *) die "Unknown option: $1. Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off] [--setup-ssh]" ;;
         esac
     done
     select_guide_mode
@@ -2775,6 +2905,10 @@ main() {
     fi
     say "  Admin and database passwords are saved in $STATE_FILE. Retrieve them with: sudo cat $STATE_FILE"
     derive_settings
+    if [ "$SETUP_SSH" = yes ]; then
+        TOTAL_STEPS=$((TOTAL_STEPS + 1))
+        setup_ssh_key
+    fi
     install_packages
     install_toolchains
     download_releases
