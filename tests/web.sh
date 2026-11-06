@@ -27,6 +27,7 @@ printf '#!/usr/bin/env bash\necho "curl $*" >> "$FAKE_DIR/calls"\nexit 7\n' > "$
 chmod +x "$TEST_DIR/fakebin/"*
 export PATH=$TEST_DIR/fakebin:$PATH
 configure_firewall() { echo 'configure_firewall' >> "$FAKE_DIR/calls"; }
+configure_remote_database() { echo 'configure_remote_database' >> "$FAKE_DIR/calls"; }
 
 expect_site() { grep -qxF -- "$1" "$SITE" || { echo "expected in the site: $1"; cat "$SITE"; exit 1; }; }
 game_block() { sed -n "\#location = $1 {#,\#^    }#p" "$SITE"; }
@@ -48,6 +49,7 @@ expect_site '    server_name example.com;'
 expect_site '    listen 443 ssl;'
 [ -L "$NGINX_DIR/sites-enabled/hotel.conf" ]
 grep -qx 'configure_firewall' "$FAKE_DIR/calls"
+grep -qx 'configure_remote_database' "$FAKE_DIR/calls"
 
 # A game address of its own gets its own server with the same headers.
 WS_URL=wss://ws.example.com/game
