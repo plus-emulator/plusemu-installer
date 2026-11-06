@@ -214,7 +214,7 @@ Every step is logged. If a step fails, the installer shows the last lines of the
    - Installer, update, backup and Cloudflare address logs and the website log rotate daily and are kept for 14 days. The emulator logs to the system journal, which keeps 14 days and at most 1 GB.
    - A nightly backup runs at 04:00 (see [Nightly backups](#nightly-backups)).
    - A health check runs every 5 minutes (see [Health check and Discord alerts](#health-check-and-discord-alerts)).
-   - SSH lets root log in with a key only. SSH password login goes off only when your login uses an SSH key (this session, or the account that ran `sudo` has a key in `~/.ssh/authorized_keys`). Otherwise password login stays on, and the installer says so. The settings are in `/etc/ssh/sshd_config.d/10-plusemu.conf`.
+   - SSH lets root log in with a key only. SSH password login goes off only when your login uses an SSH key (this session, or the account that ran `sudo` has a key in `~/.ssh/authorized_keys`). Otherwise password login stays on, and the installer says so. To add your key and turn password login off, use [`--setup-ssh`](#ssh-key-login-only-linux-server). The settings are in `/etc/ssh/sshd_config.d/10-plusemu.conf`.
 10. Writes your setup guide.
 11. Connects your hotel to Cloudflare when you paste an API token (see [Connect Cloudflare automatically](#connect-cloudflare-automatically)).
 
@@ -302,6 +302,28 @@ Opening or closing the database restarts MariaDB and the emulator, so players ar
 Linux database root uses local socket authentication (`sudo mariadb`); no root password is generated. Windows database root uses the saved `DbRootPassword`.
 
 Change your initial admin password after logging in. The saved file still contains the initial value. Keep the file and terminal password summary private, and remove credentials before sharing logs or screenshots.
+
+### SSH key login only (Linux server)
+
+`--setup-ssh` adds your SSH key to the server and turns SSH password login off. After that, only your key can log in. Run it on a new server or on a hotel that is already installed:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash -s -- --setup-ssh
+```
+
+The installer asks for your public key first. It goes to the account that ran `sudo`, or to `root` when you are logged in as root. Make the key on your own PC, not on the server:
+
+1. Make a key, if you have none yet. Press Enter to accept the file name. A passphrase is optional; it protects the key if someone copies it.
+   - Windows (PowerShell): `ssh-keygen -t ed25519`
+   - Linux or macOS: `ssh-keygen -t ed25519`
+2. Show the public key and copy the whole line. It starts with `ssh-ed25519`.
+   - Windows (PowerShell): `Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub`
+   - Linux or macOS: `cat ~/.ssh/id_ed25519.pub`
+3. Paste the line into the installer. Never paste the file without `.pub`: that is your private key, and it must stay on your PC.
+
+Then the installer turns password login off and asks you to log in with your key in a new window, for example `ssh johndoe@203.0.113.10`. Keep the installer's window open while you try. When you answer yes, password login stays off. When you answer no, password login comes back on and the key is removed again, so you are never locked out. Later runs keep password login off.
+
+An unattended run takes the key from `PLUSEMU_SSH_KEY`. With `PLUSEMU_YES=1` it cannot ask you to test the key, so check the key before you use it. A local install has no `--setup-ssh`: it leaves the SSH settings of your PC alone.
 
 ## Nightly backups
 
@@ -507,6 +529,8 @@ To install without questions, set the answers in environment variables:
 
 | Variable | Meaning |
 |---|---|
+| `PLUSEMU_SETUP_SSH=1` | Adds your SSH key and turns SSH password login off (the same as `--setup-ssh`). See [SSH key login only](#ssh-key-login-only-linux-server). |
+| `PLUSEMU_SSH_KEY=<public key>` | The public key for `PLUSEMU_SETUP_SSH=1`, so the installer does not ask for it. |
 | `PLUSEMU_REMOTE_DATABASE=<addresses>` | Lets these IPv4 addresses reach the database on port 3306 (the same as `--remote-database`). `off` closes it again. See [Connect from your PC with HeidiSQL](#connect-from-your-pc-with-heidisql-linux-server). |
 | `PLUSEMU_LOCAL=1` | [Local install](#local-install) on this PC at `http://localhost` (the same as `--local` or `-Local`). `PLUSEMU_LOCAL=0` asks for a server install. A saved install keeps its choice. |
 | `PLUSEMU_DOMAIN` | Hotel domain (required, except for a local install) |
