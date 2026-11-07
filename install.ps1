@@ -382,7 +382,8 @@ function Test-Prerequisites {
     if ($free -lt 15) { throw "Not enough disk space on C: ($([int]$free) GB free, at least 15 GB needed)." }
     New-Item -ItemType Directory -Force -Path $StateDir, $HotelRoot, $Downloads | Out-Null
     # Only administrators may read the passwords and the log.
-    & icacls.exe $StateDir /inheritance:r /grant:r 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F' | Out-Null
+    # Use well-known SIDs so this works on non-English Windows (e.g. Administrateurs).
+    & icacls.exe $StateDir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Could not protect $StateDir." }
     Set-Content -Path $script:Log -Value "PlusEMU installer log $(Get-Date -Format s)" -Encoding UTF8
 }
@@ -1112,10 +1113,11 @@ function Set-IisSite {
     Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'url' -Value 'http://127.0.0.1:8080/api/{R:1}'
 
     # IIS needs to read the website, and write Atom's storage and cache.
-    Run icacls.exe "$HotelRoot\cms" /grant 'IIS_IUSRS:(OI)(CI)RX' 'IUSR:(OI)(CI)RX' /Q
+    # Well-known SIDs: IIS_IUSRS, IUSR, Administrators, SYSTEM (locale-independent).
+    Run icacls.exe "$HotelRoot\cms" /grant '*S-1-5-32-568:(OI)(CI)RX' '*S-1-5-17:(OI)(CI)RX' /Q
     Set-HotelPermissions
     foreach ($dir in "$HotelRoot\cms\storage", "$HotelRoot\cms\bootstrap\cache") { Run icacls.exe $dir /grant "IIS AppPool\$($pool):(OI)(CI)M" /T /Q }
-    Run icacls.exe "$HotelRoot\cms\.env" /inheritance:r /grant:r 'Administrators:F' 'SYSTEM:F' "IIS AppPool\$($pool):R"
+    Run icacls.exe "$HotelRoot\cms\.env" /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' "IIS AppPool\$($pool):R"
     Set-IisLimits $site $isLocal
     Start-Website -Name $site -ErrorAction SilentlyContinue
     if ((Get-WebAppPoolState -Name $pool).Value -eq 'Started') { Restart-WebAppPool -Name $pool } else { Start-WebAppPool -Name $pool }
@@ -1234,11 +1236,12 @@ function Set-IisLimits($Site, [bool]$IsLocal = $false) {
 
 function Set-HotelPermissions {
     # IIS needs to read the client and the hotel files; only administrators may read the emulator's passwords.
+    # Well-known SIDs stay valid when built-in group names are localized.
     foreach ($dir in 'client', 'hotel-files') {
         $path = Join-Path $HotelRoot $dir
-        if (Test-Path $path) { Run icacls.exe $path /grant 'IIS_IUSRS:(OI)(CI)RX' 'IUSR:(OI)(CI)RX' /Q }
+        if (Test-Path $path) { Run icacls.exe $path /grant '*S-1-5-32-568:(OI)(CI)RX' '*S-1-5-17:(OI)(CI)RX' /Q }
     }
-    Run icacls.exe (Join-Path (Join-Path $HotelRoot 'emulator') 'Config') /inheritance:r /grant:r 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F'
+    Run icacls.exe (Join-Path (Join-Path $HotelRoot 'emulator') 'Config') /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F'
 }
 
 # Windows Update policy: install every day at 05:00 and restart only when an update needs it.
