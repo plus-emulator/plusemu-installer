@@ -795,12 +795,12 @@ ALTER USER 'hotel'@'localhost' IDENTIFIED BY '$DB_PASSWORD';
 GRANT ALL PRIVILEGES ON plus.* TO 'hotel'@'localhost';
 FLUSH PRIVILEGES;
 EOF
-    # The import ends by filling server_status, so a missing or empty one means it never finished.
-    local imported=0
-    if [ "$(sql -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'plus' AND table_name = 'server_status'")" = 1 ]; then
-        imported=$(sql -N plus -e 'SELECT COUNT(*) FROM server_status')
+    # The import has no accounts and the website adds the first one, so a database with accounts is a hotel and is never replaced.
+    local accounts=0
+    if [ "$(sql -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'plus' AND table_name = 'users'")" = 1 ]; then
+        accounts=$(sql -N plus -e 'SELECT COUNT(*) FROM users')
     fi
-    if [ "$imported" = 0 ]; then
+    if [ "$accounts" = 0 ]; then
         sql -e "DROP DATABASE plus; CREATE DATABASE plus CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
         sql plus < "$HOTEL_ROOT/emulator/Database/FreshInstall.sql"
         ok "Imported the PlusEMU database ($(sql -N plus -e 'SELECT COUNT(*) FROM furniture') furniture types)"

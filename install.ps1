@@ -792,12 +792,12 @@ function Initialize-HotelDatabase {
     Step 'Creating the hotel database'
     $password = $state.DbPassword
     Sql "CREATE DATABASE IF NOT EXISTS plus CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; CREATE USER IF NOT EXISTS 'hotel'@'localhost' IDENTIFIED BY '$password'; ALTER USER 'hotel'@'localhost' IDENTIFIED BY '$password'; GRANT ALL PRIVILEGES ON plus.* TO 'hotel'@'localhost'; FLUSH PRIVILEGES;" | Out-Null
-    # The import ends by filling server_status, so a missing or empty one means it never finished.
-    $imported = '0'
-    if ("$(Sql "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'plus' AND table_name = 'server_status'")".Trim() -eq '1') {
-        $imported = "$(Sql 'SELECT COUNT(*) FROM server_status' 'plus')".Trim()
+    # The import has no accounts and the website adds the first one, so a database with accounts is a hotel and is never replaced.
+    $accounts = '0'
+    if ("$(Sql "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'plus' AND table_name = 'users'")".Trim() -eq '1') {
+        $accounts = "$(Sql 'SELECT COUNT(*) FROM users' 'plus')".Trim()
     }
-    if ($imported -eq '0') {
+    if ($accounts -eq '0') {
         Sql 'DROP DATABASE plus; CREATE DATABASE plus CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;' | Out-Null
         Import-Database "$HotelRoot\emulator\Database\FreshInstall.sql"
         Ok "Imported the PlusEMU database ($("$(Sql 'SELECT COUNT(*) FROM furniture' 'plus')".Trim()) furniture types)"
