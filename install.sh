@@ -69,6 +69,9 @@ TTY=/dev/tty
 LOGROTATE_CONF=/etc/logrotate.d/plusemu
 JOURNALD_DROPIN=/etc/systemd/journald.conf.d/90-plusemu.conf
 FAIL2BAN_JAIL=/etc/fail2ban/jail.d/plusemu.local
+CAMERA_ENV=/etc/plusemu/camera.env
+CAMERA_BROWSERS=/opt/plusemu-camera-browsers
+CAMERA_APPARMOR=/etc/apparmor.d/plusemu-camera
 HEALTH_COMMAND=/usr/local/sbin/plusemu-health
 HEALTH_CRON=/etc/cron.d/plusemu-health
 HEALTH_LOG=/var/log/plusemu-health.log
@@ -85,7 +88,7 @@ CROWDSEC_LAPI=127.0.0.1:8085
 MODE=install
 PHP=8.5
 NODE_MAJOR=22
-TOTAL_STEPS=11
+TOTAL_STEPS=12
 STEP=0
 
 # ---------------------------------------------------------------- output
@@ -840,6 +843,16 @@ write_emulator_config() { # write_emulator_config <config.json>: the emulator's 
         | .Rcon.Hostname = \"127.0.0.1\" | .Rcon.Port = 30001 | .Rcon.AllowedAddresses = [\"127.0.0.1\", \"localhost\"]
         | $limits" "$1" > "$1.new"
     mv "$1.new" "$1"
+    camera_settings "$1"
+}
+
+camera_settings() { # camera_settings <config.json>: a private camera service password and a photo folder that nginx serves
+    jq --arg bearer "$(random_secret 48)" --arg photos "$HOTEL_ROOT/camera" '
+        .Camera.Bearer |= (if ((. // "") | length) < 32 then $bearer else . end)
+        | .Camera.OutputDirectory |= (if (. // "camera") == "camera" then $photos else . end)' "$1" > "$1.new"
+    # Writing over the file keeps its owner and permissions.
+    cat "$1.new" > "$1"
+    rm -f "$1.new"
 }
 
 start_emulator() {
@@ -852,6 +865,8 @@ start_emulator() {
     write_emulator_config "$config"
     chmod 600 "$config"
     chown -R plusemu:plusemu "$out"
+    # The emulator writes camera photos there and cannot create the folder itself.
+    mkdir -p "$HOTEL_ROOT/camera" && chown plusemu:plusemu "$HOTEL_ROOT/camera"
 
     cat > /etc/systemd/system/plusemu.service <<EOF
 [Unit]
@@ -879,6 +894,103 @@ EOF
     systemctl restart plusemu
     wait_for_emulator || die "The emulator didn't start. See: journalctl -u plusemu -n 100"
     ok "The emulator is running (service: plusemu)"
+}
+
+allow_chromium_sandbox() { # Ubuntu 23.10 and newer give user namespaces, which Chromium's sandbox needs, only to programs with an AppArmor profile
+    if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2> /dev/null)" != 1 ] || ! command -v apparmor_parser > /dev/null; then return 0; fi
+    cat > "$CAMERA_APPARMOR" <<EOF
+abi <abi/4.0>,
+include <tunables/global>
+
+profile plusemu-camera $CAMERA_BROWSERS/chromium_headless_shell-*/chrome-*/chrome-headless-shell flags=(unconfined) {
+  userns,
+}
+EOF
+    apparmor_parser -r "$CAMERA_APPARMOR" || true
+}
+
+camera_service() { # install and start the installed emulator's camera service; fails when it cannot
+    local app=$HOTEL_ROOT/emulator/CameraRenderer configuration=$HOTEL_ROOT/client/configuration node bearer sandbox=1
+    node=$(command -v node) || return 1
+    bearer=$(sed '1s/^\xEF\xBB\xBF//' "$HOTEL_ROOT/emulator/Config/config.json" | jq -r '.Camera.Bearer // ""') || return 1
+    [ "${#bearer}" -ge 32 ] || return 1
+    (cd "$app" && npm ci --omit=dev --no-audit --no-fund) || return 1
+    (cd "$app" && PLAYWRIGHT_BROWSERS_PATH=$CAMERA_BROWSERS npx playwright install --with-deps --only-shell chromium) || return 1
+    chown -R plusemu:plusemu "$app" || return 1
+    allow_chromium_sandbox
+    # Some servers (containers, older kernels) cannot run Chromium's sandbox. The service only opens its own page.
+    if ! runuser -u plusemu -- env -C "$app" PLAYWRIGHT_BROWSERS_PATH="$CAMERA_BROWSERS" "$node" --input-type=module \
+        -e "const { chromium } = await import('playwright'); await (await chromium.launch()).close();"; then
+        sandbox=0
+    fi
+    install -d -m 700 "$(dirname "$CAMERA_ENV")" || return 1
+    (umask 077 && cat > "$CAMERA_ENV" <<EOF
+CAMERA_RENDERER_SECRET=$bearer
+CAMERA_ASSET_LAYOUT=hotel-files
+CAMERA_ASSET_ROOT=$HOTEL_ROOT/hotel-files
+CAMERA_IMAGES_ROOT=$HOTEL_ROOT/hotel-files/c_images
+CAMERA_MEDIA_ROOT=$HOTEL_ROOT/camera
+CAMERA_PAGE_ROOT=$HOTEL_ROOT/client
+CAMERA_RENDERER_CONFIG=$configuration/renderer-config.json
+CAMERA_UI_CONFIG=$configuration/ui-config.json
+CAMERA_FURNIDATA_URL=http://127.0.0.1:8080/api/gamedata/furnidata
+CAMERA_CHROMIUM_SANDBOX=$sandbox
+PLAYWRIGHT_BROWSERS_PATH=$CAMERA_BROWSERS
+EOF
+    ) || return 1
+    cat > /etc/systemd/system/plusemu-camera.service <<EOF || return 1
+[Unit]
+Description=PlusEMU camera (draws the photos)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=plusemu
+WorkingDirectory=$app
+EnvironmentFile=$CAMERA_ENV
+ExecStart=$node server.mjs
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload && systemctl enable plusemu-camera && systemctl restart plusemu-camera || return 1
+    for _ in $(seq 1 30); do
+        if port_answers 3921; then return 0; fi
+        sleep 1
+    done
+    return 1
+}
+
+refresh_camera() { # after an update or a restore: the camera service of the emulator that is now installed
+    if [ ! -f "$HOTEL_ROOT/emulator/CameraRenderer/server.mjs" ]; then
+        systemctl disable --now plusemu-camera 2> /dev/null || true
+        return
+    fi
+    if camera_service; then
+        ok "The camera is running"
+    else
+        say "      ${yellow}The camera could not be set up, so photos do not work. See: journalctl -u plusemu-camera -n 50${reset}"
+    fi
+}
+
+install_camera() {
+    step "Setting up the camera"
+    if [ ! -f "$HOTEL_ROOT/emulator/CameraRenderer/server.mjs" ]; then
+        ok "Skipped: this PlusEMU release has no camera service yet. Get it later with: sudo plusemu-update"
+        return
+    fi
+    if camera_service; then
+        ok "Players can take photos (service plusemu-camera)"
+    else
+        say "      ${yellow}The camera could not be set up, so photos do not work yet. The rest of the hotel works.${reset}"
+        say "      ${yellow}Details: $LOG and journalctl -u plusemu-camera -n 50. Run the installer again to retry.${reset}"
+    fi
 }
 
 install_cms() {
@@ -1269,6 +1381,16 @@ $ws_main
     # Answered by the emulator: FurnitureData.json built from the furniture table, and badge rarity.
     location = /api/gamedata/furnidata { proxy_pass http://127.0.0.1:8080; }
     location = /api/badges/leaderboard { proxy_pass http://127.0.0.1:8080; }
+
+    # Camera photos and room thumbnails, written by the emulator.
+    location ~ "^/camera/(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:_small)?|thumbnail/[0-9]+)\.png\$" {
+        root $HOTEL_ROOT;
+        limit_except GET HEAD { deny all; }
+        add_header X-Content-Type-Options nosniff always;
+        add_header Cache-Control no-cache;
+        try_files \$uri =404;
+    }
+    location /camera/ { return 404; }
 
     # Furniture, clothes, badges and texts.
     location /hotel-files/ {
@@ -1735,7 +1857,7 @@ nightly_backup() {
     partial=$target.partial
     install -d -m 700 "$partial"
     mariadb-dump --protocol=socket -uroot --single-transaction --routines --triggers --events plus | gzip > "$partial/database.sql.gz"
-    for path in emulator/Config client/configuration cms/.env cms/storage/app hotel-files/gamedata; do
+    for path in emulator/Config client/configuration cms/.env cms/storage/app hotel-files/gamedata camera; do
         if [ -e "$HOTEL_ROOT/$path" ]; then saved+=("$path"); fi
     done
     # Exit code 1 only means a file changed while it was read.
@@ -2672,6 +2794,7 @@ rollback_update() {
     wait_for_emulator || die "The restored emulator didn't start. See: journalctl -u plusemu -n 100"
     prune_snapshots
     ok "Restored $target"
+    refresh_camera
     say ""
     say "  ${green}${bold}Done.${reset} To undo this, run the same command again: sudo plusemu-update --rollback"
 }
@@ -2775,6 +2898,7 @@ update_main() {
         stage_emulator "$latest_emulator" "$WORK/emulator"
         if [ "$update_assets" = 1 ]; then cp "$WORK/emulator/Config/figuredata.xml" "$WORK/figuredata.xml"; fi
         keep_emulator_files "$HOTEL_ROOT/emulator" "$WORK/emulator"
+        camera_settings "$WORK/emulator/Config/config.json"
         if [ "$update_assets" = 1 ]; then
             mv "$WORK/figuredata.xml" "$WORK/emulator/Config/figuredata.xml"
             chown plusemu:plusemu "$WORK/emulator/Config/figuredata.xml"
@@ -2825,12 +2949,16 @@ update_main() {
 
     step "Starting the emulator"
     if [ "$update_emulator" = 1 ]; then
+        mkdir -p "$HOTEL_ROOT/camera" && chown plusemu:plusemu "$HOTEL_ROOT/camera"
         systemctl start plusemu
         wait_for_emulator || die "The new emulator didn't start. See: journalctl -u plusemu -n 100"
         EMULATOR_STOPPED=0
         ok "The emulator is running"
+        refresh_camera
     else
         ok "The emulator kept running"
+        # The camera draws photos with the client, so it loads the new one.
+        if [ "$update_client" = 1 ]; then systemctl try-restart plusemu-camera; fi
     fi
     RESTORE_FROM=
     EMULATOR_VERSION=$latest_emulator CLIENT_VERSION=$latest_client
@@ -2896,7 +3024,7 @@ main() {
     if [ ! -f "$STATE_FILE" ]; then first=1; fi
     ask_questions
     if is_local; then
-        TOTAL_STEPS=10
+        TOTAL_STEPS=11
         # A first run that stops here keeps no settings, so this PC can still get a server install.
         if ! (check_local_ports); then
             if [ "$first" = 1 ]; then rm -f "$STATE_FILE"; fi
@@ -2916,6 +3044,7 @@ main() {
     download_hotel_files
     start_emulator
     write_client_config
+    install_camera
     install_cms
     configure_web
     secure_server

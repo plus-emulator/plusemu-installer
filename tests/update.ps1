@@ -51,6 +51,7 @@ function Sql([string]$Query, [string]$Database = '') { $Calls.Add("sql $Query");
 function Stop-EmulatorService { $Calls.Add('stop') }
 function Start-EmulatorService { $Calls.Add('start') }
 function Wait-Emulator { return $true }
+function Get-Service { }
 function Set-HotelPermissions { $Calls.Add('permissions') }
 # Windows does not allow moving a folder while a program uses a file in it; the first moves of a locked folder fail.
 $script:LockedMoves = @{}

@@ -47,6 +47,11 @@ expect_game '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for
 grep -qx 'real_ip_header CF-Connecting-IP;' "$REAL_IP_CONF"
 expect_site '    server_name example.com;'
 expect_site '    listen 443 ssl;'
+# Camera photos and room thumbnails come from the emulator's photo folder; nothing else under /camera/ is served.
+expect_site '    location ~ "^/camera/(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:_small)?|thumbnail/[0-9]+)\.png$" {'
+expect_site "        root $HOTEL_ROOT;"
+expect_site '        try_files $uri =404;'
+expect_site '    location /camera/ { return 404; }'
 [ -L "$NGINX_DIR/sites-enabled/hotel.conf" ]
 grep -qx 'configure_firewall' "$FAKE_DIR/calls"
 grep -qx 'configure_remote_database' "$FAKE_DIR/calls"

@@ -80,7 +80,7 @@ $script:Log        = "$StateDir\install.log"
 $PhpDir     = 'C:\PHP'
 $NodeMajor  = 22
 $MariaDbSeries = '11.4'
-$script:TotalSteps = 12
+$script:TotalSteps = 13
 $script:Step = 0
 
 # `irm | iex` runs in the user's own session, so these are restored at the end.
@@ -832,6 +832,18 @@ function Disable-EmulatorLimits($Json) {
     $Json.LoginThrottle | Add-Member -MemberType NoteProperty -Name MaxFailuresPerIp -Value 0 -Force
 }
 
+# A private password between the emulator and its camera service, and a photo folder that IIS serves.
+function Set-CameraSettings($Json) {
+    if (-not $Json.PSObject.Properties['Camera']) { $Json | Add-Member -MemberType NoteProperty -Name Camera -Value ([pscustomobject]@{}) }
+    $camera = $Json.Camera
+    if (-not $camera.PSObject.Properties['Bearer'] -or "$($camera.Bearer)".Length -lt 32) {
+        $camera | Add-Member -MemberType NoteProperty -Name Bearer -Value (New-Secret 48) -Force
+    }
+    if (-not $camera.PSObject.Properties['OutputDirectory'] -or "$($camera.OutputDirectory)" -in @('', 'camera')) {
+        $camera | Add-Member -MemberType NoteProperty -Name OutputDirectory -Value (Join-Path $HotelRoot 'camera') -Force
+    }
+}
+
 function Start-Emulator {
     Step 'Starting the emulator'
     $out = "$HotelRoot\emulator"
@@ -843,6 +855,7 @@ function Start-Emulator {
     $json.Nitro.Hostname = '127.0.0.1'; $json.Nitro.Port = 2096; $json.Nitro.Name = 'Volt'
     $json.Rcon.Hostname = '127.0.0.1'; $json.Rcon.Port = 30001; $json.Rcon.AllowedAddresses = @('127.0.0.1', 'localhost')
     if ($state.Local) { Disable-EmulatorLimits $json }
+    Set-CameraSettings $json
     Write-Utf8 $config ($json | ConvertTo-Json -Depth 20)
     # Every packet is logged at Trace level by default, which floods the log.
     $nlog = "$out\Config\nlog.config"
@@ -862,6 +875,104 @@ function Start-Emulator {
     Restart-Service PlusEMU
     if (Wait-Emulator) { Ok 'The emulator is running (service: PlusEMU)'; return }
     throw "The emulator didn't start. See $out\service\shawl_for_PlusEMU_rCURRENT.log"
+}
+
+function Get-NodeExe {
+    $local = Join-Path (Join-Path $StateDir 'node') 'node.exe'
+    if (Test-Path $local) { return $local }
+    return (Get-Command node -ErrorAction Stop).Source
+}
+
+# The camera service runs from its own copy of the emulator's CameraRenderer folder, so an update can move the emulator folder.
+function Install-CameraService {
+    $source = Join-Path (Join-Path $HotelRoot 'emulator') 'CameraRenderer'
+    $root = Join-Path $HotelRoot 'camera-service'
+    $app = Join-Path $root 'app'
+    $browsers = Join-Path $root 'browsers'
+    $envFile = Join-Path $root 'camera.env'
+    $node = Get-NodeExe
+    $bin = Split-Path $node
+    $config = Get-Content (Join-Path (Join-Path (Join-Path $HotelRoot 'emulator') 'Config') 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    $bearer = "$($config.Camera.Bearer)"
+    if ($bearer.Length -lt 32) { throw 'The emulator has no camera password.' }
+    if (Get-Service PlusEMUCamera -ErrorAction SilentlyContinue) { Stop-Service PlusEMUCamera }
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+    if (Test-Path $app) { Remove-Item $app -Recurse -Force }
+    Copy-Item $source $app -Recurse
+    Push-Location $app
+    $previous = $env:PLAYWRIGHT_BROWSERS_PATH
+    try {
+        Run (Join-Path $bin 'npm.cmd') ci --omit=dev --no-audit --no-fund
+        $env:PLAYWRIGHT_BROWSERS_PATH = $browsers
+        Run (Join-Path $bin 'npx.cmd') playwright install --only-shell chromium
+    } finally {
+        $env:PLAYWRIGHT_BROWSERS_PATH = $previous
+        Pop-Location
+    }
+    $photos = Join-Path $HotelRoot 'camera'
+    New-Item -ItemType Directory -Force -Path $photos | Out-Null
+    $configuration = Join-Path (Join-Path $HotelRoot 'client') 'configuration'
+    Write-Utf8 $envFile (@(
+        "CAMERA_RENDERER_SECRET=$bearer"
+        'CAMERA_ASSET_LAYOUT=hotel-files'
+        "CAMERA_ASSET_ROOT=$(Join-Path $HotelRoot 'hotel-files')"
+        "CAMERA_IMAGES_ROOT=$(Join-Path (Join-Path $HotelRoot 'hotel-files') 'c_images')"
+        "CAMERA_MEDIA_ROOT=$photos"
+        "CAMERA_PAGE_ROOT=$(Join-Path $HotelRoot 'client')"
+        "CAMERA_RENDERER_CONFIG=$(Join-Path $configuration 'renderer-config.json')"
+        "CAMERA_UI_CONFIG=$(Join-Path $configuration 'ui-config.json')"
+        'CAMERA_FURNIDATA_URL=http://127.0.0.1:8080/api/gamedata/furnidata'
+        "PLAYWRIGHT_BROWSERS_PATH=$browsers"
+    ) -join "`n")
+    # The file holds the camera password: only administrators and the service may read it.
+    Run icacls.exe $envFile /inheritance:r /grant:r 'Administrators:F' 'SYSTEM:F' /Q
+    $shawl = Join-Path $root 'shawl.exe'
+    Copy-Item (Join-Path (Join-Path (Join-Path $HotelRoot 'emulator') 'service') 'shawl.exe') $shawl -Force
+    if (-not (Get-Service PlusEMUCamera -ErrorAction SilentlyContinue)) {
+        Run $shawl add --name PlusEMUCamera --cwd $app '--' $node "--env-file=$envFile" server.mjs
+        Run sc.exe config PlusEMUCamera start= auto DisplayName= 'PlusEMU camera (draws the photos)'
+    }
+    Start-Service PlusEMUCamera
+    for ($i = 0; $i -lt 30; $i++) {
+        try { Invoke-WebRequest 'http://127.0.0.1:3921/effects' -UseBasicParsing -TimeoutSec 2 | Out-Null; $up = $true } catch { $up = $null -ne $_.Exception.Response }
+        if ($up) { return }
+        Start-Sleep 1
+    }
+    throw 'The camera service did not start.'
+}
+
+function Install-Camera {
+    Step 'Setting up the camera'
+    if (-not (Test-Path (Join-Path (Join-Path (Join-Path $HotelRoot 'emulator') 'CameraRenderer') 'server.mjs'))) {
+        Ok 'Skipped: this PlusEMU release has no camera service yet. Get it later with: plusemu-update'
+        return
+    }
+    try {
+        Install-CameraService
+        Ok 'Players can take photos (service: PlusEMUCamera)'
+    } catch {
+        Write-Log "Camera setup failed: $_"
+        Say '      The camera could not be set up, so photos do not work yet. The rest of the hotel works.' 'Yellow'
+        Say "      Details: $script:Log and $(Join-Path (Join-Path $HotelRoot 'camera-service') 'shawl_for_PlusEMUCamera_rCURRENT.log'). Run the installer again to retry." 'Yellow'
+    }
+}
+
+# After an update or a restore: the camera service of the emulator that is now installed.
+function Update-CameraService {
+    if (-not (Test-Path (Join-Path (Join-Path (Join-Path $HotelRoot 'emulator') 'CameraRenderer') 'server.mjs'))) {
+        if (Get-Service PlusEMUCamera -ErrorAction SilentlyContinue) {
+            Stop-Service PlusEMUCamera
+            Run sc.exe config PlusEMUCamera start= disabled
+        }
+        return
+    }
+    try {
+        Install-CameraService
+        Ok 'The camera is running'
+    } catch {
+        Write-Log "Camera setup failed: $_"
+        Say "      The camera could not be set up, so photos do not work. See $script:Log" 'Yellow'
+    }
 }
 
 function Wait-Emulator {
@@ -1049,9 +1160,21 @@ function Set-IisSite {
             }
         }
     }
-    foreach ($dir in @(@('client', "$HotelRoot\client"), @('hotel-files', "$HotelRoot\hotel-files"))) {
+    New-Item -ItemType Directory -Force -Path "$HotelRoot\camera" | Out-Null
+    foreach ($dir in @(@('client', "$HotelRoot\client"), @('hotel-files', "$HotelRoot\hotel-files"), @('camera', "$HotelRoot\camera"))) {
         if (-not (Get-WebVirtualDirectory -Site $site -Name $dir[0])) { New-WebVirtualDirectory -Site $site -Name $dir[0] -PhysicalPath $dir[1] | Out-Null }
     }
+    # Camera photos and room thumbnails, written by the emulator. Only PNG files are served.
+    Write-Utf8 "$HotelRoot\camera\web.config" @'
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <system.webServer>
+    <staticContent><clientCache cacheControlMode="DisableCache" /></staticContent>
+    <security><requestFiltering><fileExtensions allowUnlisted="false"><add fileExtension=".png" allowed="true" /></fileExtensions></requestFiltering></security>
+    <httpProtocol><customHeaders><remove name="X-Content-Type-Options" /><add name="X-Content-Type-Options" value="nosniff" /></customHeaders></httpProtocol>
+  </system.webServer>
+</configuration>
+'@
     Write-Utf8 "$HotelRoot\hotel-files\web.config" @'
 <?xml version="1.0" encoding="UTF-8"?>
 <configuration>
@@ -1234,7 +1357,7 @@ function Set-IisLimits($Site, [bool]$IsLocal = $false) {
 
 function Set-HotelPermissions {
     # IIS needs to read the client and the hotel files; only administrators may read the emulator's passwords.
-    foreach ($dir in 'client', 'hotel-files') {
+    foreach ($dir in 'client', 'hotel-files', 'camera') {
         $path = Join-Path $HotelRoot $dir
         if (Test-Path $path) { Run icacls.exe $path /grant 'IIS_IUSRS:(OI)(CI)RX' 'IUSR:(OI)(CI)RX' /Q }
     }
@@ -1303,7 +1426,7 @@ function Invoke-NightlyBackup {
         $zip = New-Object IO.Compression.GZipStream($out, [IO.Compression.CompressionMode]::Compress)
         try { $in.CopyTo($zip) } finally { $zip.Dispose(); $out.Dispose(); $in.Dispose() }
         Remove-Item $sql
-        $files = @('emulator/Config', 'client/configuration', 'cms/.env', 'cms/storage/app', 'hotel-files/gamedata') | Where-Object { Test-Path (Join-Path $HotelRoot $_) }
+        $files = @('emulator/Config', 'client/configuration', 'cms/.env', 'cms/storage/app', 'hotel-files/gamedata', 'camera') | Where-Object { Test-Path (Join-Path $HotelRoot $_) }
         # Exit code 1 only means a file changed while it was read.
         $code = Invoke-Tar (@('-C', $HotelRoot, '-czf', (Join-Path $partial 'hotel.tar.gz')) + $files)
         if ($code -notin 0, 1) { throw "Backing up the hotel files failed (tar exit code $code)." }
@@ -2063,7 +2186,9 @@ function Copy-EmulatorSettings($Old, $New) {
     try { $installed = Get-Content (Join-Path $oldConfig 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json }
     catch { throw "Could not read $(Join-Path $oldConfig 'config.json'). Fix the file, then run the update again. Nothing was changed." }
     # Keep every installed setting and add the settings this release introduced.
-    Write-Utf8 (Join-Path $newConfig 'config.json') ((Merge-Json $defaults $installed) | ConvertTo-Json -Depth 20)
+    $merged = Merge-Json $defaults $installed
+    Set-CameraSettings $merged
+    Write-Utf8 (Join-Path $newConfig 'config.json') ($merged | ConvertTo-Json -Depth 20)
 }
 
 function Copy-ClientSettings($Old, $New) {
@@ -2265,6 +2390,7 @@ function Restore-LastBackup {
     if (-not (Wait-Emulator)) { throw "The restored emulator didn't start. See $(Join-Path (Join-Path (Join-Path $HotelRoot 'emulator') 'service') 'shawl_for_PlusEMU_rCURRENT.log')" }
     Remove-OldSnapshots
     Ok "Restored $($target.FullName)"
+    Update-CameraService
     Say ''
     Say '  Done. To undo this, run the same command again: plusemu-update -Rollback' 'Green'
 }
@@ -2430,8 +2556,11 @@ function Update-Hotel([switch]$Check) {
         if (-not (Wait-Emulator)) { throw "The new emulator didn't start. See $(Join-Path (Join-Path $emulator 'service') 'shawl_for_PlusEMU_rCURRENT.log')" }
         $script:EmulatorStopped = $false
         Ok 'The emulator is running'
+        Update-CameraService
     } else {
         Ok 'The emulator kept running'
+        # The camera draws photos with the client, so it loads the new one.
+        if ($updateClient -and (Get-Service PlusEMUCamera -ErrorAction SilentlyContinue)) { Restart-Service PlusEMUCamera }
     }
     $script:RestoreFrom = $null
     $script:Versions.EmulatorVersion = $latestEmulator
@@ -2486,7 +2615,7 @@ function Install-Hotel {
     $first = -not (Test-Path $StateFile)
     Read-Answers
     if ($state.Local) {
-        $script:TotalSteps = 11
+        $script:TotalSteps = 12
         # A first run that stops here keeps no settings, so this PC can still get a server install.
         try { Assert-FreePorts }
         catch {
@@ -2504,6 +2633,7 @@ function Install-Hotel {
     Get-HotelFiles
     Start-Emulator
     Write-ClientConfig
+    Install-Camera
     Install-Cms
     Set-IisSite
     Protect-Server
