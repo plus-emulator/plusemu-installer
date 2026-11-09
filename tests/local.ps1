@@ -368,7 +368,7 @@ try {
     # ---------------------------------------------------------------- the whole run
 
     $steps = 'Get-InstallerFiles', 'Get-Derived', 'Install-WebServer', 'Install-Toolchains', 'Install-Database', 'Get-Releases', 'Initialize-HotelDatabase', 'Get-HotelFiles',
-             'Start-Emulator', 'Write-ClientConfig', 'Install-Cms', 'Set-IisSite', 'Protect-Server', 'Write-Guide', 'Write-UpdateCommand', 'Connect-Cloudflare', 'Assert-FreePorts'
+             'Start-Emulator', 'Write-ClientConfig', 'Install-Camera', 'Install-Cms', 'Set-IisSite', 'Protect-Server', 'Write-Guide', 'Write-UpdateCommand', 'Connect-Cloudflare', 'Assert-FreePorts'
     foreach ($name in $steps) { . ([scriptblock]::Create("function $name { `$script:Calls.Add('$name') }")) }
     function Complete-Install { $script:Calls.Add("Complete-Install $script:TotalSteps") }
     Remove-Item $StateFile
@@ -378,19 +378,19 @@ try {
     Remove-Item Env:\PLUSEMU_LOCAL
     Assert ($Calls -contains 'Assert-FreePorts' -and $Calls -contains 'Set-IisSite') "Local steps: $($Calls -join ', ')"
     Assert ($Calls -notcontains 'Connect-Cloudflare') 'A local install ran the Cloudflare step'
-    Assert ($Calls -contains 'Complete-Install 11') "Local steps: $($Calls -join ', ')"
+    Assert ($Calls -contains 'Complete-Install 12') "Local steps: $($Calls -join ', ')"
     Assert ($Calls.IndexOf('Assert-FreePorts') -lt $Calls.IndexOf('Install-WebServer')) 'The port check came after the installation started'
     Assert ($Calls | Where-Object { $_ -like 'open *index.html' }) 'The local guide was not opened in the browser'
 
     Remove-Item $StateFile
     Reset-Calls
-    $script:TotalSteps = 12
+    $script:TotalSteps = 13
     Invoke-Answers @{ PLUSEMU_DOMAIN = 'example.com'; PLUSEMU_WS_URL = 'wss://example.com/ws'; PLUSEMU_HOTEL_NAME = 'Example'; PLUSEMU_ADMIN_USER = 'admin'; PLUSEMU_ADMIN_EMAIL = 'admin@example.com'; PLUSEMU_YES = '1' }
     $env:PLUSEMU_YES = '1'
     Install-Hotel *> $null
     Remove-Item Env:\PLUSEMU_YES
     Assert ($Calls -contains 'Connect-Cloudflare' -and $Calls -notcontains 'Assert-FreePorts') "Server steps: $($Calls -join ', ')"
-    Assert ($Calls -contains 'Complete-Install 12') "Server steps: $($Calls -join ', ')"
+    Assert ($Calls -contains 'Complete-Install 13') "Server steps: $($Calls -join ', ')"
     Write-Host 'PowerShell local install checks passed'
 } finally {
     foreach ($name in $presets) { Remove-Item "Env:\$name" -ErrorAction SilentlyContinue }

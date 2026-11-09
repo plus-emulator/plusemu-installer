@@ -199,30 +199,32 @@ Every step is logged. If a step fails, the installer shows the last lines of the
 4. Creates the `plus` database and imports the PlusEMU schema.
 5. Downloads the hotel files.
 6. Starts the emulator as the `plusemu` systemd service.
-7. Installs the Atom CMS website and creates your admin account.
-8. Configures nginx and the firewall:
+7. Starts the camera as the `plusemu-camera` systemd service. It draws the players' photos and room thumbnails with Chromium and the installed client. It listens on `127.0.0.1:3921` only. nginx serves the photos from `/var/www/hotel/camera` at `/camera/`. On Ubuntu 23.10 and newer, an AppArmor profile in `/etc/apparmor.d/plusemu-camera` lets Chromium use its sandbox. Where the sandbox cannot run at all, for example in some containers, the camera runs without it. An emulator release without the camera skips this step; `plusemu-update` adds the camera later.
+8. Installs the Atom CMS website and creates your admin account.
+9. Configures nginx and the firewall:
    - nginx starts with a temporary self-signed HTTPS certificate. The Cloudflare step or the setup guide replaces it with a Cloudflare Origin CA certificate for **Full (strict)**.
    - It restores visitors' real IPs from Cloudflare and passes the game's WebSocket through to the emulator. The game connection carries the visitor's address in the `X-Real-IP` and `X-Forwarded-For` headers, because the emulator sees nginx as the peer.
    - It limits each visitor: 5 login, registration or password reset attempts per minute (plus a burst of 5), 30 housekeeping pages per minute (plus a burst of 20), 50 open requests and 20 game connections (many players can share one address, for example at a school). Over the limit, nginx answers 429. The game client and the hotel files have no limits.
    - It drops slow connections after 10 seconds and sends the `Strict-Transport-Security` and `Permissions-Policy` headers. `Strict-Transport-Security` covers the hotel domain only, not its subdomains.
    - The `ufw` firewall allows only SSH, HTTP and HTTPS. The database and the emulator stay private, unless you open the database with [`--remote-database`](#connect-from-your-pc-with-heidisql-linux-server).
    - HTTPS is accepted only from Cloudflare's addresses, so nobody can go around Cloudflare to reach the hotel. HTTP stays open for the setup guide and the redirects, but nginx answers the hotel's own names only for Cloudflare and this server. `plusemu-cloudflare-ips` downloads Cloudflare's address lists every Sunday at 03:00 and updates the firewall and nginx. When a download fails, it changes nothing. If the download fails during a new install, HTTPS stays open to every address until the next successful run, and the installer says so.
-9. Secures the server:
-   - `fail2ban` bans an address for 1 hour after 5 failed SSH logins in 10 minutes. When CrowdSec runs, CrowdSec bans SSH attackers instead and fail2ban is off (see [CrowdSec](#crowdsec-advanced-guide-linux)).
-   - Security updates from Debian or Ubuntu install every day at 05:00 server time with `unattended-upgrades`. The server restarts right after, but only when an update needs it. Unused packages are removed. The emulator, the client, the website and PHP are not touched: update them with `plusemu-update` and the PHP script below.
-   - Network settings in `/etc/sysctl.d/90-plusemu.conf` turn on SYN cookies and raise the queues for new connections, so a flood of connections does not stop the server.
-   - Installer, update, backup and Cloudflare address logs and the website log rotate daily and are kept for 14 days. The emulator logs to the system journal, which keeps 14 days and at most 1 GB.
-   - A nightly backup runs at 04:00 (see [Nightly backups](#nightly-backups)).
-   - A health check runs every 5 minutes (see [Health check and Discord alerts](#health-check-and-discord-alerts)).
-   - SSH lets root log in with a key only. SSH password login goes off only when your login uses an SSH key (this session, or the account that ran `sudo` has a key in `~/.ssh/authorized_keys`). Otherwise password login stays on, and the installer says so. To add your key and turn password login off, use [`--setup-ssh`](#ssh-key-login-only-linux-server). The settings are in `/etc/ssh/sshd_config.d/10-plusemu.conf`.
-10. Writes your setup guide.
-11. Connects your hotel to Cloudflare when you paste an API token (see [Connect Cloudflare automatically](#connect-cloudflare-automatically)).
+10. Secures the server:
+    - `fail2ban` bans an address for 1 hour after 5 failed SSH logins in 10 minutes. When CrowdSec runs, CrowdSec bans SSH attackers instead and fail2ban is off (see [CrowdSec](#crowdsec-advanced-guide-linux)).
+    - Security updates from Debian or Ubuntu install every day at 05:00 server time with `unattended-upgrades`. The server restarts right after, but only when an update needs it. Unused packages are removed. The emulator, the client, the website and PHP are not touched: update them with `plusemu-update` and the PHP script below.
+    - Network settings in `/etc/sysctl.d/90-plusemu.conf` turn on SYN cookies and raise the queues for new connections, so a flood of connections does not stop the server.
+    - Installer, update, backup and Cloudflare address logs and the website log rotate daily and are kept for 14 days. The emulator logs to the system journal, which keeps 14 days and at most 1 GB.
+    - A nightly backup runs at 04:00 (see [Nightly backups](#nightly-backups)).
+    - A health check runs every 5 minutes (see [Health check and Discord alerts](#health-check-and-discord-alerts)).
+    - SSH lets root log in with a key only. SSH password login goes off only when your login uses an SSH key (this session, or the account that ran `sudo` has a key in `~/.ssh/authorized_keys`). Otherwise password login stays on, and the installer says so. To add your key and turn password login off, use [`--setup-ssh`](#ssh-key-login-only-linux-server). The settings are in `/etc/ssh/sshd_config.d/10-plusemu.conf`.
+11. Writes your setup guide.
+12. Connects your hotel to Cloudflare when you paste an API token (see [Connect Cloudflare automatically](#connect-cloudflare-automatically)).
 
 **Windows** (`install.ps1`) follows the same steps with Windows equivalents:
 
 - IIS with URL Rewrite, the reverse proxy and WebSockets. The game connection carries the visitor's address in the `X-Real-IP` header (from Cloudflare's `CF-Connecting-IP`), and the reverse proxy adds `X-Forwarded-For` without the port. On Windows 10 and 11, IIS comes from the optional Windows features.
 - MariaDB 11.4
 - The emulator as the `PlusEMU` Windows service
+- The camera as the `PlusEMUCamera` Windows service, in `C:\Hotel\camera-service`. IIS serves the photos from `C:\Hotel\camera` at `/camera/`.
 - Windows Firewall rules for the website: HTTP and HTTPS are accepted only from Cloudflare's addresses, so nobody can go around Cloudflare to reach the hotel. Windows needs no open HTTP port, because the setup guide is a file on the desktop. The *PlusEMU Cloudflare addresses* task updates the addresses every Sunday at 03:00. When a download fails, it changes nothing. If the download fails during a new install, the website stays open to every address until the next successful run, and the installer says so. The installer turns off the *World Wide Web Services* rules that IIS adds, because they let every address in. A rule that you add yourself for ports 80 or 443 also lets every address in.
 - An account lockout policy: an account locks for 10 minutes after 10 wrong passwords in 10 minutes, the default of new Windows versions. A lower limit would let an attacker keep the built-in Administrator locked out. RDP and SSH are not opened or changed.
 - The *PlusEMU log cleanup* task removes emulator, website and IIS logs older than 14 days, every day at 03:30. Windows has SYN flood protection built in and has no settings for it, so the installer changes nothing there.
@@ -255,6 +257,9 @@ The pages the installer generates, such as the setup guide and the client config
 | Refresh Cloudflare's addresses now | `sudo plusemu-cloudflare-ips` | `Start-ScheduledTask 'PlusEMU Cloudflare addresses'` |
 | Restart the emulator | `sudo systemctl restart plusemu` | `Restart-Service PlusEMU` |
 | Watch the emulator log | `sudo journalctl -u plusemu -f` | `Get-Content C:\Hotel\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 50 -Wait` |
+| Restart the camera | `sudo systemctl restart plusemu-camera` | `Restart-Service PlusEMUCamera` |
+| Watch the camera log | `sudo journalctl -u plusemu-camera -f` | `Get-Content C:\Hotel\camera-service\shawl_for_PlusEMUCamera_rCURRENT.log -Tail 50 -Wait` |
+| Camera photos | `/var/www/hotel/camera` | `C:\Hotel\camera` |
 | Setup guide | `/var/www/hotel/setup-guide/index.html`, at `http://<server IP>/<token>/` (local install: `http://localhost/<token>/`) | `C:\Hotel\setup-guide\index.html` and *Hotel setup guide* on the desktop |
 | Node.js of a local install | `/opt/plusemu-node` | `C:\ProgramData\PlusEMU\node` |
 
@@ -330,7 +335,7 @@ An unattended run takes the key from `PLUSEMU_SSH_KEY`. With `PLUSEMU_YES=1` it 
 Every night at 04:00 server time, the installer's backup saves what a download cannot bring back. It keeps the newest 7 backups, each in its own folder named by its time (UTC):
 
 - `database.sql.gz`: the whole `plus` database.
-- `hotel.tar.gz`: the emulator's `Config` folder, the client's `configuration` folder, the website's `.env` file and uploads (`cms/storage/app`), and the hotel's texts (`hotel-files/gamedata`).
+- `hotel.tar.gz`: the emulator's `Config` folder, the client's `configuration` folder, the website's `.env` file and uploads (`cms/storage/app`), the hotel's texts (`hotel-files/gamedata`) and the camera photos (`camera`).
 - `settings.tar.gz`: the saved answers, passwords and versions. On Linux also the HTTPS certificate in `/etc/ssl/plusemu`. On Windows the certificate stays in the Windows certificate store; export it yourself if you need a copy.
 
 The backup leaves out what the installer or `plusemu-update` downloads again: the emulator and client programs and the stock hotel files. Furniture, clothes or badges that you added to `hotel-files` yourself are not in the backup, so keep your own copy of them. When an update is running, the backup waits for it. When the disk has less than 2 GB free plus the size of the database, it makes no backup and writes the reason in the backup log. The update backups (newest 3) stay separate.
@@ -431,15 +436,33 @@ plusemu-update
 - Installs the new versions and runs the database migrations.
 - Installs the newest hotel files pack (furniture, clothing, effects, badges, texts, icons, sounds, about 550 MB) whenever it changed, so the hotel never misses stock content. Files you added to `hotel-files` stay. The emulator's clothing data (`Config/figuredata.xml`) is replaced by the release's one that matches the pack.
 - Keeps your `Config/` and `configuration/` files and anything you added. New settings are added, your own values stay.
+- Sets up the camera when the new emulator release has it (see [Camera on an installed hotel](#camera-on-an-installed-hotel)).
 - Restores the backup automatically if any step fails.
 
 **Options** (Linux `--check`, Windows `-Check`, and so on)
 - `check`: show available updates, change nothing.
 - `yes`: update without the "Update now?" question.
+- `install-camera`: set up the camera only, without updating anything (see [Camera on an installed hotel](#camera-on-an-installed-hotel)).
 - `rollback`: restore the last backup. The database goes back too, so progress since then is lost.
 - `assets`: hotel files only, without stopping the emulator. Adds every stock file the hotel lacks and leaves the files it already has as they are. Only the `gamedata` index (clothing, effects, products, texts) is replaced; the previous one is kept in the backups folder as `gamedata-<version>`. Run the full update afterwards when new clothing does not show: the emulator's clothing data comes with it.
 
 `--with-assets` is still accepted and does nothing: the hotel files are part of every update now.
+
+### Camera on an installed hotel
+
+Hotels installed before the camera came to the installer get it with one command. It needs a PlusEMU release that has the camera service; when yours has none yet, run `plusemu-update` instead, which sets up the camera too.
+
+```bash
+sudo plusemu-update --install-camera
+```
+
+```powershell
+plusemu-update -InstallCamera
+```
+
+Without `plusemu-update`, run the installer with the same option: `curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash -s -- --install-camera`.
+
+It gives the emulator its camera settings, starts the camera service and adds the `/camera/` route to your nginx site or IIS website. Your own changes to the nginx site stay. When the emulator settings change, the emulator restarts once, which disconnects the players for a moment. Running it again changes nothing.
 
 ### Examples
 ```bash

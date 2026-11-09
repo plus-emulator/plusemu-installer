@@ -152,14 +152,14 @@ LATEST_EMULATOR=v2.0.0 LATEST_CLIENT=client-v2.0.0
 run_update --check
 grep -Fq v2.0.0 "$TEST_DIR/terminal"
 grep -Fq client-v2.0.0 "$TEST_DIR/terminal"
-diff -r "$TEST_DIR/original" "$HOTEL_ROOT"
+diff -r -x camera "$TEST_DIR/original" "$HOTEL_ROOT"
 [[ $(snapshots) == 0 && ! -e "$TEST_DIR/calls" ]]
 
 # A download that fails its checksum stops before the hotel is touched.
 good_sums=$(< "$RELEASES/v2.0.0/SHA256SUMS")
 printf '%064d  plusemu-linux-x64.tar.gz\n' 0 > "$RELEASES/v2.0.0/SHA256SUMS"
 fails --yes
-diff -r "$TEST_DIR/original" "$HOTEL_ROOT"
+diff -r -x camera "$TEST_DIR/original" "$HOTEL_ROOT"
 [[ $(snapshots) == 0 ]]
 if grep -q 'systemctl stop' "$TEST_DIR/calls" 2> /dev/null; then exit 1; fi
 printf '%s\n' "$good_sums" > "$RELEASES/v2.0.0/SHA256SUMS"
@@ -168,7 +168,7 @@ printf '%s\n' "$good_sums" > "$RELEASES/v2.0.0/SHA256SUMS"
 : > "$TEST_DIR/terminal"
 MIGRATION=fail
 fails --yes
-diff -r "$TEST_DIR/original" "$HOTEL_ROOT"
+diff -r -x camera "$TEST_DIR/original" "$HOTEL_ROOT"
 [[ $(snapshots) == 1 ]]
 grep -q 'DROP DATABASE' "$TEST_DIR/calls"
 grep -Fq 'CREATE TABLE users' "$TEST_DIR/sql-input"
@@ -180,7 +180,7 @@ grep -qi restored "$TEST_DIR/terminal"
 : > "$TEST_DIR/calls"
 MIGRATION=interrupted
 fails --yes
-diff -r "$TEST_DIR/original" "$HOTEL_ROOT"
+diff -r -x camera "$TEST_DIR/original" "$HOTEL_ROOT"
 [[ $(snapshots) == 2 ]]
 grep -q 'DROP DATABASE' "$TEST_DIR/calls"
 [[ $(grep systemctl "$TEST_DIR/calls" | tail -1) == *'start plusemu'* ]]
@@ -236,12 +236,12 @@ grep -qi 'up to date' "$TEST_DIR/terminal"
 # --rollback returns to the state before the last update, database included.
 : > "$TEST_DIR/sql-input"
 run_update --yes --rollback
-diff -r "$TEST_DIR/original" "$HOTEL_ROOT"
+diff -r -x camera "$TEST_DIR/original" "$HOTEL_ROOT"
 grep -Fq 'CREATE TABLE users' "$TEST_DIR/sql-input"
 [[ ! -e $VERSIONS_FILE && $(snapshots) == 3 ]]
 # The rollback saved the state it replaced, so a second rollback undoes it.
 run_update --yes --rollback
-diff -r "$TEST_DIR/updated" "$HOTEL_ROOT"
+diff -r -x camera "$TEST_DIR/updated" "$HOTEL_ROOT"
 grep -qx "EMULATOR_VERSION='v2.0.0'" "$VERSIONS_FILE"
 
 # Only the newest three backups are kept.
@@ -268,19 +268,19 @@ cp -a "$HOTEL_ROOT" "$TEST_DIR/before-assets"
 run_update --check
 grep -Fq "$pack_version" "$TEST_DIR/terminal"
 if grep -qi 'everything is up to date' "$TEST_DIR/terminal"; then exit 1; fi
-diff -r "$TEST_DIR/before-assets" "$HOTEL_ROOT"
+diff -r -x camera "$TEST_DIR/before-assets" "$HOTEL_ROOT"
 
 # A damaged pack changes nothing.
 good_sums=$(< "$RELEASES/hotel-files/SHA256SUMS")
 printf '%064d  hotel-files.tar.gz\n' 0 > "$RELEASES/hotel-files/SHA256SUMS"
 fails --yes
-diff -r "$TEST_DIR/before-assets" "$HOTEL_ROOT"
+diff -r -x camera "$TEST_DIR/before-assets" "$HOTEL_ROOT"
 printf '%s\n' "$good_sums" > "$RELEASES/hotel-files/SHA256SUMS"
 
 # A failed update restores the hotel files too.
 MIGRATION=fail
 fails --yes
-diff -r "$TEST_DIR/before-assets" "$HOTEL_ROOT"
+diff -r -x camera "$TEST_DIR/before-assets" "$HOTEL_ROOT"
 MIGRATION=ok
 
 # The update installs the stock pack over the hotel files and the emulator's matching clothing data.
@@ -311,7 +311,7 @@ if grep -q 'systemctl stop' "$TEST_DIR/calls"; then exit 1; fi
 
 # --rollback also returns the hotel files.
 run_update --yes --rollback
-diff -r "$TEST_DIR/before-assets" "$HOTEL_ROOT"
+diff -r -x camera "$TEST_DIR/before-assets" "$HOTEL_ROOT"
 
 # A re-run of the installer refreshes the hotel files when the published pack changed, and keeps added files.
 EMULATOR_VERSION=v2.2.0 CLIENT_VERSION=client-v2.0.0 ASSETS_VERSION=unknown
