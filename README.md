@@ -436,15 +436,33 @@ plusemu-update
 - Installs the new versions and runs the database migrations.
 - Installs the newest hotel files pack (furniture, clothing, effects, badges, texts, icons, sounds, about 550 MB) whenever it changed, so the hotel never misses stock content. Files you added to `hotel-files` stay. The emulator's clothing data (`Config/figuredata.xml`) is replaced by the release's one that matches the pack.
 - Keeps your `Config/` and `configuration/` files and anything you added. New settings are added, your own values stay.
+- Sets up the camera when the new emulator release has it (see [Camera on an installed hotel](#camera-on-an-installed-hotel)).
 - Restores the backup automatically if any step fails.
 
 **Options** (Linux `--check`, Windows `-Check`, and so on)
 - `check`: show available updates, change nothing.
 - `yes`: update without the "Update now?" question.
+- `install-camera`: set up the camera only, without updating anything (see [Camera on an installed hotel](#camera-on-an-installed-hotel)).
 - `rollback`: restore the last backup. The database goes back too, so progress since then is lost.
 - `assets`: hotel files only, without stopping the emulator. Adds every stock file the hotel lacks and leaves the files it already has as they are. Only the `gamedata` index (clothing, effects, products, texts) is replaced; the previous one is kept in the backups folder as `gamedata-<version>`. Run the full update afterwards when new clothing does not show: the emulator's clothing data comes with it.
 
 `--with-assets` is still accepted and does nothing: the hotel files are part of every update now.
+
+### Camera on an installed hotel
+
+Hotels installed before the camera came to the installer get it with one command. It needs a PlusEMU release that has the camera service; when yours has none yet, run `plusemu-update` instead, which sets up the camera too.
+
+```bash
+sudo plusemu-update --install-camera
+```
+
+```powershell
+plusemu-update -InstallCamera
+```
+
+Without `plusemu-update`, run the installer with the same option: `curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash -s -- --install-camera`.
+
+It gives the emulator its camera settings, starts the camera service and adds the `/camera/` route to your nginx site or IIS website. Your own changes to the nginx site stay. When the emulator settings change, the emulator restarts once, which disconnects the players for a moment. Running it again changes nothing.
 
 ### Examples
 ```bash

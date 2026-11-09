@@ -22,8 +22,9 @@
 # or, when that command is missing, with the installer itself:
 #   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.ps1))) -Update
 # -WithAssets is accepted for older instructions and ignored: the hotel files are always part of an update.
+# Set up the camera on a hotel that is already installed: plusemu-update -InstallCamera
 
-param([string]$GuideMode, [switch]$Local, [switch]$Update, [switch]$Check, [switch]$Yes, [switch]$Rollback, [switch]$Assets, [switch]$WithAssets)
+param([string]$GuideMode, [switch]$Local, [switch]$Update, [switch]$Check, [switch]$Yes, [switch]$Rollback, [switch]$Assets, [switch]$WithAssets, [switch]$InstallCamera)
 
 function Get-Setting($Name, $Default) {
     $value = [Environment]::GetEnvironmentVariable($Name)
@@ -968,6 +969,7 @@ function Update-CameraService {
     }
     try {
         Install-CameraService
+        Set-CameraWebsite
         Ok 'The camera is running'
     } catch {
         Write-Log "Camera setup failed: $_"
@@ -1097,6 +1099,25 @@ $user->forceFill(['username' => getenv('ADMIN_USER'), 'mail' => getenv('ADMIN_EM
     Ok "Website installed (admin: $($state.AdminUser))"
 }
 
+# Camera photos and room thumbnails, written by the emulator, at /camera/. Only PNG files are served.
+function Set-CameraWebsite {
+    Import-Module WebAdministration
+    $photos = Join-Path $HotelRoot 'camera'
+    New-Item -ItemType Directory -Force -Path $photos | Out-Null
+    if (-not (Get-WebVirtualDirectory -Site 'Hotel' -Name 'camera')) { New-WebVirtualDirectory -Site 'Hotel' -Name 'camera' -PhysicalPath $photos | Out-Null }
+    Write-Utf8 (Join-Path $photos 'web.config') @'
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <system.webServer>
+    <staticContent><clientCache cacheControlMode="DisableCache" /></staticContent>
+    <security><requestFiltering><fileExtensions allowUnlisted="false"><add fileExtension=".png" allowed="true" /></fileExtensions></requestFiltering></security>
+    <httpProtocol><customHeaders><remove name="X-Content-Type-Options" /><add name="X-Content-Type-Options" value="nosniff" /></customHeaders></httpProtocol>
+  </system.webServer>
+</configuration>
+'@
+    Run icacls.exe $photos /grant 'IIS_IUSRS:(OI)(CI)RX' 'IUSR:(OI)(CI)RX' /Q
+}
+
 function Set-IisSite {
     $isLocal = [bool]$state.Local
     if ($isLocal) { Step 'Configuring the IIS website for http://localhost' } else { Step 'Configuring the IIS website, HTTPS and the firewall' }
@@ -1160,21 +1181,10 @@ function Set-IisSite {
             }
         }
     }
-    New-Item -ItemType Directory -Force -Path "$HotelRoot\camera" | Out-Null
-    foreach ($dir in @(@('client', "$HotelRoot\client"), @('hotel-files', "$HotelRoot\hotel-files"), @('camera', "$HotelRoot\camera"))) {
+    foreach ($dir in @(@('client', "$HotelRoot\client"), @('hotel-files', "$HotelRoot\hotel-files"))) {
         if (-not (Get-WebVirtualDirectory -Site $site -Name $dir[0])) { New-WebVirtualDirectory -Site $site -Name $dir[0] -PhysicalPath $dir[1] | Out-Null }
     }
-    # Camera photos and room thumbnails, written by the emulator. Only PNG files are served.
-    Write-Utf8 "$HotelRoot\camera\web.config" @'
-<?xml version="1.0" encoding="UTF-8"?>
-<configuration>
-  <system.webServer>
-    <staticContent><clientCache cacheControlMode="DisableCache" /></staticContent>
-    <security><requestFiltering><fileExtensions allowUnlisted="false"><add fileExtension=".png" allowed="true" /></fileExtensions></requestFiltering></security>
-    <httpProtocol><customHeaders><remove name="X-Content-Type-Options" /><add name="X-Content-Type-Options" value="nosniff" /></customHeaders></httpProtocol>
-  </system.webServer>
-</configuration>
-'@
+    Set-CameraWebsite
     Write-Utf8 "$HotelRoot\hotel-files\web.config" @'
 <?xml version="1.0" encoding="UTF-8"?>
 <configuration>
@@ -2610,6 +2620,48 @@ function Invoke-Update([switch]$Check, [switch]$Yes, [switch]$Rollback, [switch]
     }
 }
 
+# -InstallCamera: set up the camera on a hotel that is already installed.
+function Invoke-InstallCamera {
+    Assert-Administrator
+    $emulator = Join-Path $HotelRoot 'emulator'
+    if (-not (Test-Path $StateFile) -or -not (Test-Path (Join-Path $emulator 'Plus Emulator.exe'))) {
+        throw 'No hotel from the PlusEMU installer was found on this server. Install one first.'
+    }
+    if (-not (Test-Path (Join-Path (Join-Path $emulator 'CameraRenderer') 'server.mjs'))) {
+        throw 'Your PlusEMU version has no camera yet. Update it with: plusemu-update. The update sets up the camera too.'
+    }
+    New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+    try { $lock = [IO.File]::Open($LockFile, 'OpenOrCreate', 'ReadWrite', 'None') }
+    catch { throw 'An update or a backup is running. Try again in a few minutes.' }
+    try {
+        $script:state = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $script:TotalSteps = 2
+        $script:Step = 0
+        Step 'Setting up the camera'
+        $config = Join-Path (Join-Path $emulator 'Config') 'config.json'
+        $json = Get-Content $config -Raw -Encoding UTF8 | ConvertFrom-Json
+        $before = $json | ConvertTo-Json -Depth 20
+        Set-CameraSettings $json
+        if (($json | ConvertTo-Json -Depth 20) -ne $before) {
+            Write-Utf8 $config ($json | ConvertTo-Json -Depth 20)
+            # The emulator reads its camera password when it starts.
+            Restart-Service PlusEMU
+            if (-not (Wait-Emulator)) { throw "The emulator didn't start. See $(Join-Path (Join-Path $emulator 'service') 'shawl_for_PlusEMU_rCURRENT.log')" }
+            Ok 'The emulator restarted with the camera settings (players were disconnected)'
+        }
+        Install-CameraService
+        Ok 'The camera service is running (service: PlusEMUCamera)'
+        Step 'Serving the photos'
+        Set-CameraWebsite
+        Ok 'IIS serves the photos at /camera/'
+        Say ''
+        Say 'Players can take photos now. They may need to reload the hotel page.' 'Green'
+        Say ''
+    } finally {
+        $lock.Dispose()
+    }
+}
+
 function Install-Hotel {
     Get-InstallerFiles
     $first = -not (Test-Path $StateFile)
@@ -2644,7 +2696,9 @@ function Install-Hotel {
 }
 
 try {
-    if ($Update) {
+    if ($InstallCamera) {
+        Invoke-InstallCamera
+    } elseif ($Update) {
         Invoke-Update -Check:$Check -Yes:$Yes -Rollback:$Rollback -Assets:$Assets
     } else {
         Test-Prerequisites

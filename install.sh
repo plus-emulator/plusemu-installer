@@ -972,11 +972,53 @@ refresh_camera() { # after an update or a restore: the camera service of the emu
         systemctl disable --now plusemu-camera 2> /dev/null || true
         return
     fi
-    if camera_service; then
+    if camera_service && add_camera_route; then
         ok "The camera is running"
     else
         say "      ${yellow}The camera could not be set up, so photos do not work. See: journalctl -u plusemu-camera -n 50${reset}"
     fi
+}
+
+camera_main() { # --install-camera: set up the camera on a hotel that is already installed
+    MODE=update
+    trap 'on_error $LINENO' ERR
+    preflight 1
+    if [ ! -f "$STATE_FILE" ] || [ ! -x "$HOTEL_ROOT/emulator/Plus Emulator" ]; then
+        die "No hotel from the PlusEMU installer was found on this server. Install one first."
+    fi
+    if [ ! -f "$HOTEL_ROOT/emulator/CameraRenderer/server.mjs" ]; then
+        die "Your PlusEMU version has no camera yet. Update it with: sudo plusemu-update. The update sets up the camera too."
+    fi
+    exec 9> "$LOCK_FILE"
+    flock -n 9 || die "An update or a backup is running. Try again in a few minutes."
+    exec >> "$LOG" 2>&1
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+    if is_local; then export PATH=/opt/plusemu-node/bin:$PATH; fi
+    command -v node > /dev/null || die "Node.js is missing. Run the installer again without --install-camera to repair the hotel."
+    TOTAL_STEPS=2
+    local config=$HOTEL_ROOT/emulator/Config/config.json before
+    sed -i '1s/^\xEF\xBB\xBF//' "$config"
+
+    step "Setting up the camera"
+    before=$(cat "$config")
+    camera_settings "$config"
+    mkdir -p "$HOTEL_ROOT/camera" && chown plusemu:plusemu "$HOTEL_ROOT/camera"
+    if [ "$(cat "$config")" != "$before" ]; then
+        # The emulator reads its camera settings when it starts.
+        systemctl restart plusemu
+        wait_for_emulator || die "The emulator didn't start. See: journalctl -u plusemu -n 100"
+        ok "The emulator restarted with the camera settings (players were disconnected)"
+    fi
+    camera_service || die "The camera service did not start. See $LOG and: journalctl -u plusemu-camera -n 50"
+    ok "The camera service is running (plusemu-camera)"
+
+    step "Serving the photos"
+    add_camera_route || die "Could not add the /camera/ route to $NGINX_DIR/sites-available/hotel.conf. Nothing was changed there. See $LOG"
+    ok "nginx serves the photos at /camera/"
+    say ""
+    say "${green}${bold}✓ Players can take photos now.${reset} They may need to reload the hotel page."
+    say ""
 }
 
 install_camera() {
@@ -1207,6 +1249,37 @@ limit_conn_status 429;
 EOF
 }
 
+camera_locations() { # the nginx block that serves camera photos and room thumbnails
+    cat <<EOF
+    # Camera photos and room thumbnails, written by the emulator.
+    location ~ "^/camera/(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:_small)?|thumbnail/[0-9]+)\.png\$" {
+        root $HOTEL_ROOT;
+        limit_except GET HEAD { deny all; }
+        add_header X-Content-Type-Options nosniff always;
+        add_header Cache-Control no-cache;
+        try_files \$uri =404;
+    }
+    location /camera/ { return 404; }
+EOF
+}
+
+add_camera_route() { # adds the camera block to a site written by an older installer; keeps the owner's own changes
+    local site=$NGINX_DIR/sites-available/hotel.conf block previous
+    [ -f "$site" ] || return 1
+    if grep -q '^    location /camera/ ' "$site"; then return 0; fi
+    block=$(camera_locations)
+    previous=$(cat "$site")
+    BLOCK=$block awk '
+        !done && ($0 == "    # Furniture, clothes, badges and texts." || $0 ~ /^    location \/hotel-files\/ \{/) { print ENVIRON["BLOCK"]; print ""; done = 1 }
+        { print }
+        END { exit !done }' <<< "$previous" > "$site" || { printf '%s\n' "$previous" > "$site"; return 1; }
+    if ! nginx -t; then
+        printf '%s\n' "$previous" > "$site"
+        return 1
+    fi
+    systemctl reload nginx
+}
+
 ws_location() { # the nginx block that hands the game connection to the emulator
     local limit='limit_conn plusemu_ws 20;'
     if is_local; then limit=''; fi
@@ -1382,15 +1455,7 @@ $ws_main
     location = /api/gamedata/furnidata { proxy_pass http://127.0.0.1:8080; }
     location = /api/badges/leaderboard { proxy_pass http://127.0.0.1:8080; }
 
-    # Camera photos and room thumbnails, written by the emulator.
-    location ~ "^/camera/(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:_small)?|thumbnail/[0-9]+)\.png\$" {
-        root $HOTEL_ROOT;
-        limit_except GET HEAD { deny all; }
-        add_header X-Content-Type-Options nosniff always;
-        add_header Cache-Control no-cache;
-        try_files \$uri =404;
-    }
-    location /camera/ { return 404; }
+$(camera_locations)
 
     # Furniture, clothes, badges and texts.
     location /hotel-files/ {
@@ -2809,7 +2874,11 @@ update_main() {
             --assets) assets_only=1 ;;
             --with-assets) ;; # the hotel files are always updated now; older guides still name this option
             --rollback) rollback=1 ;;
-            *) die "Unknown option: $arg. Usage: plusemu-update [--check] [--yes] [--assets] [--rollback]" ;;
+            --install-camera)
+                camera_main
+                return
+                ;;
+            *) die "Unknown option: $arg. Usage: plusemu-update [--check] [--yes] [--assets] [--rollback] [--install-camera]" ;;
         esac
     done
     MODE=update
@@ -2987,7 +3056,7 @@ main() {
         case "$1" in
             --guide-mode)
                 if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
-                    die "Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off] [--setup-ssh]"
+                    die "Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off] [--setup-ssh] [--install-camera]"
                 fi
                 GUIDE_MODE_OPTION=$2
                 shift 2
@@ -3000,6 +3069,10 @@ main() {
                 SETUP_SSH_OPTION=1
                 shift
                 ;;
+            --install-camera)
+                camera_main
+                return
+                ;;
             --remote-database)
                 if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
                     die "Usage: install.sh --remote-database <your PC's IPv4 address>[,<more addresses>] or --remote-database off"
@@ -3007,7 +3080,7 @@ main() {
                 REMOTE_DATABASE_OPTION=$2
                 shift 2
                 ;;
-            *) die "Unknown option: $1. Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off] [--setup-ssh]" ;;
+            *) die "Unknown option: $1. Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off] [--setup-ssh] [--install-camera]" ;;
         esac
     done
     select_guide_mode

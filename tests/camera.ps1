@@ -99,6 +99,39 @@ try {
     Update-CameraService
     Assert ($script:Calls -contains 'Stop-Service PlusEMUCamera') "Calls: $($script:Calls -join '; ')"
     Assert ($script:Calls -contains 'sc.exe config PlusEMUCamera start= disabled') "Calls: $($script:Calls -join '; ')"
+
+    # -InstallCamera sets up the camera on an installed hotel, and restarts the emulator only when its settings change.
+    $StateFile = Join-Path $StateDir 'hotel.json'
+    $LockFile = Join-Path $testDir 'lock'
+    New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+    Set-Content $StateFile '{"Local":false}'
+    Set-Content (Join-Path $emulator 'Plus Emulator.exe') 'emulator'
+    function Assert-Administrator { }
+    function Wait-Emulator { return $true }
+    function Import-Module { }
+    $script:VirtualDirs = @{}
+    function Get-WebVirtualDirectory($Site, $Name) { if ($script:VirtualDirs.ContainsKey($Name)) { return $Name } }
+    function New-WebVirtualDirectory($Site, $Name, $PhysicalPath) { $script:VirtualDirs[$Name] = $PhysicalPath; $script:Calls.Add("New-WebVirtualDirectory $Site $Name") }
+    Write-Utf8 (Join-Path (Join-Path $emulator 'Config') 'config.json') '{"Camera":{"Bearer":"","OutputDirectory":"camera"}}'
+    $failed = $null
+    try { Invoke-InstallCamera *> $null } catch { $failed = "$_" }
+    Assert ($failed -like '*Your PlusEMU version has no camera yet*') "Without a camera service: $failed"
+    Set-Content (Join-Path $renderer 'server.mjs') 'server'
+    $script:Calls.Clear()
+    $output = Invoke-InstallCamera 6>&1 | Out-String
+    $config = Get-Content (Join-Path (Join-Path $emulator 'Config') 'config.json') -Raw | ConvertFrom-Json
+    Assert ($config.Camera.Bearer.Length -eq 48) 'No camera password after -InstallCamera'
+    Assert ($script:Calls -contains 'Restart-Service PlusEMU') "Calls: $($script:Calls -join '; ')"
+    Assert ($script:Calls -contains 'New-WebVirtualDirectory Hotel camera') "Calls: $($script:Calls -join '; ')"
+    Assert (Test-Path (Join-Path (Join-Path $HotelRoot 'camera') 'web.config')) 'The photo folder has no web.config'
+    $values = @{}
+    foreach ($line in Get-Content $envFile) { $key, $value = $line -split '=', 2; $values[$key] = $value }
+    Assert ($values.CAMERA_RENDERER_SECRET -eq $config.Camera.Bearer) 'The camera service has another password'
+    Assert ($output -like '*Players can take photos now*') "Output: $output"
+    $script:Calls.Clear()
+    Invoke-InstallCamera *> $null
+    Assert ($script:Calls -notcontains 'Restart-Service PlusEMU') 'The emulator restarted without a settings change'
+    Assert ($script:Calls -notcontains 'New-WebVirtualDirectory Hotel camera') 'The photo folder was added twice'
     Write-Host 'PowerShell camera checks passed'
 } finally {
     Remove-Item $testDir -Recurse -Force -ErrorAction SilentlyContinue

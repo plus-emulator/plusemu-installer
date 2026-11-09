@@ -17,7 +17,7 @@ CAMERA_ENV=$TEST_DIR/etc/camera.env
 CAMERA_BROWSERS=$TEST_DIR/browsers
 CAMERA_APPARMOR=$TEST_DIR/apparmor
 mkdir -p "$TEST_DIR/fakebin" "$HOTEL_ROOT/emulator/Config" "$HOTEL_ROOT/emulator/CameraRenderer"
-for program in npm npx systemctl apparmor_parser; do
+for program in npm npx systemctl apparmor_parser nginx; do
     printf '#!/usr/bin/env bash\necho "%s $*" >> "%s/calls"\n' "$program" "$TEST_DIR" > "$TEST_DIR/fakebin/$program"
 done
 chmod +x "$TEST_DIR/fakebin/"*
@@ -93,5 +93,73 @@ rm "$HOTEL_ROOT/emulator/CameraRenderer/server.mjs"
 : > "$TEST_DIR/calls"
 refresh_camera
 grep -q 'systemctl disable --now plusemu-camera' "$TEST_DIR/calls"
+
+# A site from an older installer gets the photo route before the hotel files, and keeps the owner's own lines.
+NGINX_DIR=$TEST_DIR/nginx
+site=$NGINX_DIR/sites-available/hotel.conf
+mkdir -p "$NGINX_DIR/sites-available"
+cat > "$site" <<'EOF'
+server {
+    # my own note
+    location = /api/badges/leaderboard { proxy_pass http://127.0.0.1:8080; }
+
+    # Furniture, clothes, badges and texts.
+    location /hotel-files/ {
+        expires 7d;
+    }
+}
+EOF
+original=$(cat "$site")
+: > "$TEST_DIR/calls"
+add_camera_route
+grep -qxF '    # my own note' "$site"
+grep -qxF '    location /camera/ { return 404; }' "$site"
+grep -qxF "        root $HOTEL_ROOT;" "$site"
+[ "$(grep -n '/camera/ { return 404' "$site" | cut -d: -f1)" -lt "$(grep -n 'Furniture, clothes' "$site" | cut -d: -f1)" ]
+grep -qF '\.png$" {' "$site"
+grep -q 'systemctl reload nginx' "$TEST_DIR/calls"
+# A second run changes nothing.
+routed=$(cat "$site")
+add_camera_route
+[ "$(cat "$site")" = "$routed" ]
+# A site nginx rejects goes back to what it was.
+printf '%s\n' "$original" > "$site"
+nginx() { [ "$1" != -t ]; }
+! add_camera_route
+[ "$(cat "$site")" = "$original" ]
+unset -f nginx
+# A site without the hotel files location is left alone.
+printf 'server {\n}\n' > "$site"
+! add_camera_route
+[ "$(cat "$site")" = "$(printf 'server {\n}')" ]
+
+# --install-camera sets up the camera on an installed hotel, and restarts the emulator only for a new password.
+printf '%s\n' "$original" > "$site"
+STATE_FILE=$TEST_DIR/etc/hotel.env
+LOCK_FILE=$TEST_DIR/lock
+LOG=$TEST_DIR/camera.log
+printf "LOCAL='no'\n" > "$STATE_FILE"
+touch "$HOTEL_ROOT/emulator/Plus Emulator" && chmod +x "$HOTEL_ROOT/emulator/Plus Emulator"
+preflight() { :; }
+wait_for_emulator() { :; }
+port_answers() { [ "$1" = 3921 ]; }
+echo '{"Camera":{"Bearer":"","OutputDirectory":"camera"}}' > "$config"
+(main --install-camera) && exit 1 # no camera in this emulator release yet
+grep -q 'Your PlusEMU version has no camera yet' "$TEST_DIR/terminal"
+touch "$HOTEL_ROOT/emulator/CameraRenderer/server.mjs"
+: > "$TEST_DIR/calls"
+(main --install-camera)
+bearer=$(jq -r .Camera.Bearer "$config")
+[ "${#bearer}" = 48 ]
+[ "$(env_value CAMERA_RENDERER_SECRET)" = "$bearer" ]
+grep -q 'systemctl restart plusemu$' "$TEST_DIR/calls"
+grep -q 'systemctl restart plusemu-camera' "$TEST_DIR/calls"
+grep -qxF '    location /camera/ { return 404; }' "$site"
+grep -q 'Players can take photos now' "$TEST_DIR/terminal"
+: > "$TEST_DIR/calls"
+(main --install-camera)
+[ "$(jq -r .Camera.Bearer "$config")" = "$bearer" ]
+if grep -q 'systemctl restart plusemu$' "$TEST_DIR/calls"; then echo 'the emulator restarted without a new password'; exit 1; fi
+[ "$(grep -c '/camera/ { return 404' "$site")" = 1 ]
 
 printf 'Bash camera checks passed\n' >&4
