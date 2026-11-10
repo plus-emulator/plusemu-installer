@@ -72,6 +72,8 @@ FAIL2BAN_JAIL=/etc/fail2ban/jail.d/plusemu.local
 CAMERA_ENV=/etc/plusemu/camera.env
 CAMERA_BROWSERS=/opt/plusemu-camera-browsers
 CAMERA_APPARMOR=/etc/apparmor.d/plusemu-camera
+AVATAR_SECRET_FILE=/etc/plusemu/avatar-imager.secret
+AVATAR_CRON=/etc/cron.d/plusemu-avatars
 HEALTH_COMMAND=/usr/local/sbin/plusemu-health
 HEALTH_CRON=/etc/cron.d/plusemu-health
 HEALTH_LOG=/var/log/plusemu-health.log
@@ -909,8 +911,36 @@ EOF
     apparmor_parser -r "$CAMERA_APPARMOR" || true
 }
 
+avatar_secret() { # the secret the website signs avatar addresses with; made once and kept
+    if [ ! -s "$AVATAR_SECRET_FILE" ]; then
+        install -d -m 700 "$(dirname "$AVATAR_SECRET_FILE")" || return 1
+        (umask 077 && random_secret 48 > "$AVATAR_SECRET_FILE") || return 1
+    fi
+    cat "$AVATAR_SECRET_FILE"
+}
+
+draws_avatars() { [ -f "$HOTEL_ROOT/emulator/CameraRenderer/avatar.mjs" ]; } # this emulator release draws avatar images
+
+website_avatars() { # the website uses the hotel's own avatar images only while the camera service can draw them
+    local cms=$HOTEL_ROOT/cms secret="" current
+    [ -f "$cms/.env" ] || return 0
+    if draws_avatars && [ -f "$cms/app/Services/Avatar/AvatarImager.php" ]; then secret=$(avatar_secret) || return 1; fi
+    if [ -n "$secret" ]; then
+        printf '17 4 * * * plusemu find %s -type f -atime +60 -delete; find %s -mindepth 2 -type d -empty -delete\n' "$HOTEL_ROOT/avatars" "$HOTEL_ROOT/avatars" > "$AVATAR_CRON"
+    else
+        rm -f "$AVATAR_CRON"
+    fi
+    current=$(sed -n 's/^AVATAR_IMAGER_SECRET="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$cms/.env" | tail -n 1)
+    if [ "$current" = "$secret" ]; then return 0; fi
+    set_env "$cms/.env" AVATAR_IMAGER_SECRET "$secret"
+    # The website reads its settings from a cache.
+    if [ -f "$cms/bootstrap/cache/config.php" ]; then
+        (cd "$cms" && php artisan config:cache && chown -R www-data:www-data bootstrap/cache) || return 1
+    fi
+}
+
 camera_service() { # install and start the installed emulator's camera service; fails when it cannot
-    local app=$HOTEL_ROOT/emulator/CameraRenderer configuration=$HOTEL_ROOT/client/configuration node bearer sandbox=1
+    local app=$HOTEL_ROOT/emulator/CameraRenderer configuration=$HOTEL_ROOT/client/configuration node bearer sandbox=1 avatars=""
     node=$(command -v node) || return 1
     bearer=$(sed '1s/^\xEF\xBB\xBF//' "$HOTEL_ROOT/emulator/Config/config.json" | jq -r '.Camera.Bearer // ""') || return 1
     [ "${#bearer}" -ge 32 ] || return 1
@@ -922,6 +952,11 @@ camera_service() { # install and start the installed emulator's camera service; 
     if ! runuser -u plusemu -- env -C "$app" PLAYWRIGHT_BROWSERS_PATH="$CAMERA_BROWSERS" "$node" --input-type=module \
         -e "const { chromium } = await import('playwright'); await (await chromium.launch()).close();"; then
         sandbox=0
+    fi
+    if draws_avatars; then
+        avatars=$(avatar_secret) || return 1
+        avatars=$(printf 'AVATAR_IMAGER_SECRET=%s\nAVATAR_IMAGER_ROOT=%s' "$avatars" "$HOTEL_ROOT/avatars")
+        mkdir -p "$HOTEL_ROOT/avatars" && chown plusemu:plusemu "$HOTEL_ROOT/avatars" || return 1
     fi
     install -d -m 700 "$(dirname "$CAMERA_ENV")" || return 1
     (umask 077 && cat > "$CAMERA_ENV" <<EOF
@@ -936,6 +971,7 @@ CAMERA_UI_CONFIG=$configuration/ui-config.json
 CAMERA_FURNIDATA_URL=http://127.0.0.1:8080/api/gamedata/furnidata
 CAMERA_CHROMIUM_SANDBOX=$sandbox
 PLAYWRIGHT_BROWSERS_PATH=$CAMERA_BROWSERS
+$avatars
 EOF
     ) || return 1
     cat > /etc/systemd/system/plusemu-camera.service <<EOF || return 1
@@ -974,6 +1010,9 @@ refresh_camera() { # after an update or a restore: the camera service of the emu
     fi
     if camera_service && add_camera_route; then
         ok "The camera is running"
+        if ! { add_avatar_route && website_avatars; }; then
+            say "      ${yellow}Avatar images could not be set up, so the website keeps the avatar images it has now.${reset}"
+        fi
     else
         say "      ${yellow}The camera could not be set up, so photos do not work. See: journalctl -u plusemu-camera -n 50${reset}"
     fi
@@ -1098,6 +1137,7 @@ UPDATE website_settings SET value = CASE \`key\`
     ELSE value END
 WHERE \`key\` IN ('nitro_path', 'rcon_ip', 'rcon_port', 'badges_path', 'furniture_icons_path');
 EOF
+    website_avatars
     php artisan optimize:clear
     php artisan optimize
     chown -R www-data:www-data storage bootstrap/cache
@@ -1242,6 +1282,7 @@ map $request_method $plusemu_login_key {
 }
 limit_req_zone $plusemu_login_key zone=plusemu_login:10m rate=5r/m;
 limit_req_zone $binary_remote_addr zone=plusemu_housekeeping:10m rate=30r/m;
+limit_req_zone $binary_remote_addr zone=plusemu_avatars:10m rate=20r/s;
 limit_conn_zone $binary_remote_addr zone=plusemu_conn:10m;
 limit_conn_zone $binary_remote_addr zone=plusemu_ws:10m;
 limit_req_status 429;
@@ -1268,6 +1309,57 @@ add_camera_route() { # adds the camera block to a site written by an older insta
     [ -f "$site" ] || return 1
     if grep -q '^    location /camera/ ' "$site"; then return 0; fi
     block=$(camera_locations)
+    previous=$(cat "$site")
+    BLOCK=$block awk '
+        !done && ($0 == "    # Furniture, clothes, badges and texts." || $0 ~ /^    location \/hotel-files\/ \{/) { print ENVIRON["BLOCK"]; print ""; done = 1 }
+        { print }
+        END { exit !done }' <<< "$previous" > "$site" || { printf '%s\n' "$previous" > "$site"; return 1; }
+    if ! nginx -t; then
+        printf '%s\n' "$previous" > "$site"
+        return 1
+    fi
+    systemctl reload nginx
+}
+
+avatar_locations() { # the nginx block that serves avatar images
+    local limit='limit_req zone=plusemu_avatars burst=200 nodelay;'
+    if is_local; then limit=''; fi
+    cat <<EOF
+    # Avatar images. nginx serves a stored image itself and asks the camera service only for a missing one.
+    location /avatars/ {
+        root $HOTEL_ROOT;
+        limit_except GET HEAD { deny all; }
+        # Other websites cannot show these images on their pages.
+        valid_referers none server_names;
+        if (\$invalid_referer) { return 403; }
+        add_header X-Content-Type-Options nosniff always;
+        add_header Cross-Origin-Resource-Policy same-site always;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        try_files \$uri @avatar;
+    }
+    location @avatar {
+        $limit
+        proxy_pass http://127.0.0.1:3921;
+        proxy_read_timeout 30s;
+        proxy_intercept_errors on;
+        error_page 404 429 500 502 503 504 = @avatar_missing;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Cross-Origin-Resource-Policy same-site always;
+    }
+    # An image that cannot be drawn right now is empty, and browsers ask for it again next time.
+    location @avatar_missing {
+        add_header Cache-Control no-store always;
+        empty_gif;
+    }
+EOF
+}
+
+add_avatar_route() { # adds the avatar block to a site written by an older installer; keeps the owner's own changes
+    local site=$NGINX_DIR/sites-available/hotel.conf block previous
+    [ -f "$site" ] || return 1
+    if grep -q '^    location /avatars/ ' "$site"; then return 0; fi
+    if ! is_local; then request_limits; fi
+    block=$(avatar_locations)
     previous=$(cat "$site")
     BLOCK=$block awk '
         !done && ($0 == "    # Furniture, clothes, badges and texts." || $0 ~ /^    location \/hotel-files\/ \{/) { print ENVIRON["BLOCK"]; print ""; done = 1 }
@@ -1456,6 +1548,8 @@ $ws_main
     location = /api/badges/leaderboard { proxy_pass http://127.0.0.1:8080; }
 
 $(camera_locations)
+
+$(avatar_locations)
 
     # Furniture, clothes, badges and texts.
     location /hotel-files/ {
