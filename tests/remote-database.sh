@@ -174,4 +174,53 @@ grep -q 'User: hotel    Database: plus' "$TEST_DIR/terminal"
 grep -q 'Only 203.0.113.7 can connect' "$TEST_DIR/terminal"
 if grep -q Secret123 "$TEST_DIR/log"; then echo 'the database password is in the log'; exit 1; fi
 
+# On a hotel that is already installed, --remote-database changes only the database access.
+# The website, emulator and client stay as they are.
+LOG=$TEST_DIR/install.log LOCK_FILE=$TEST_DIR/update.lock
+preflight() { :; }
+derive_settings() { SERVER_IP=192.0.2.1; }
+for step in load_installer_files ask_questions install_packages install_toolchains download_releases setup_database \
+    download_hotel_files start_emulator write_client_config install_camera install_cms configure_web secure_server \
+    write_guide install_update_command connect_cloudflare finish; do
+    eval "$step() { echo $step >> \"\$FAKE_DIR/steps\"; }"
+done
+: > "$FAKE_DIR/steps"
+: > "$FAKE_DIR/rules"
+: > "$FAKE_DIR/users"
+rm -f "$MARIADB_REMOTE_CONF"
+unset PLUSEMU_DOMAIN PLUSEMU_WS_URL PLUSEMU_HOTEL_NAME PLUSEMU_ADMIN_USER PLUSEMU_ADMIN_EMAIL
+REMOTE_DATABASE_OPTION='' LOCAL=no DB_PASSWORD=Secret123 REMOTE_DATABASE=
+save_state
+: > "$TEST_DIR/terminal"
+(main --remote-database 203.0.113.7,198.51.100.4)
+[ ! -s "$FAKE_DIR/steps" ] || { echo 'the hotel was reinstalled:'; cat "$FAKE_DIR/steps"; exit 1; }
+expect_rule 203.0.113.7
+expect_rule 198.51.100.4
+[ "$(users)" = '198.51.100.4 203.0.113.7' ]
+grep -qx 'bind-address = 0.0.0.0' "$MARIADB_REMOTE_CONF"
+(source "$STATE_FILE"; [ "$REMOTE_DATABASE" = 203.0.113.7,198.51.100.4 ] && [ "$DB_PASSWORD" = Secret123 ])
+grep -q 'Hostname / IP: 192.0.2.1    Port: 3306' "$TEST_DIR/terminal"
+grep -q 'Password: Secret123' "$TEST_DIR/terminal"
+if grep -q Secret123 "$LOG"; then echo 'the database password is in the log'; exit 1; fi
+# A later run replaces the list, and "off" closes the database again.
+(main --remote-database 198.51.100.4)
+expect_no_rule 203.0.113.7
+[ "$(users)" = 198.51.100.4 ]
+(main --remote-database off)
+[ ! -s "$FAKE_DIR/rules" ]
+[ ! -e "$MARIADB_REMOTE_CONF" ]
+(source "$STATE_FILE"; [ -z "$REMOTE_DATABASE" ])
+[ ! -s "$FAKE_DIR/steps" ]
+# A wrong address changes nothing.
+fails main --remote-database 2001:db8::1
+(source "$STATE_FILE"; [ -z "$REMOTE_DATABASE" ])
+# A local hotel has no remote database.
+sed -i "s/^LOCAL=.*/LOCAL='yes'/" "$STATE_FILE"
+fails main --remote-database 203.0.113.7
+sed -i "s/^LOCAL=.*/LOCAL='no'/" "$STATE_FILE"
+# Without an installed hotel, the option belongs to a full install.
+rm "$STATE_FILE"
+(SETUP_SSH=no; main --remote-database 203.0.113.7)
+grep -qx install_cms "$FAKE_DIR/steps"
+
 printf 'Bash remote database checks passed\n' >&4
