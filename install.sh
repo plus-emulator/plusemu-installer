@@ -19,6 +19,7 @@
 # PLUSEMU_CROWDSEC=1 installs CrowdSec with the advanced guide (0 keeps it off).
 # --remote-database <addresses> (or PLUSEMU_REMOTE_DATABASE) lets these IPv4 addresses or networks,
 # separated by commas, reach the database on port 3306, for example from HeidiSQL. "off" closes it again.
+# On an installed hotel, --remote-database changes only the database access and leaves the rest of the hotel alone.
 # --setup-ssh (or PLUSEMU_SETUP_SSH=1) asks for your SSH public key and then turns SSH password login off.
 # PLUSEMU_SSH_KEY gives the public key to an unattended run.
 set -Eeuo pipefail
@@ -1574,6 +1575,46 @@ EOF
     fi
 }
 
+remote_database_summary() {
+    say ""
+    say "  Connect to the database from your PC (for example with HeidiSQL):"
+    say "      Network type: MariaDB or MySQL (TCP/IP)"
+    say "      Hostname / IP: $SERVER_IP    Port: 3306"
+    say "      User: hotel    Database: plus"
+    printf '      Password: %s\n' "$DB_PASSWORD" >&3
+    say "      Use the server's IP address, not your hotel's domain: Cloudflare does not pass database connections."
+    say "      Only ${REMOTE_DATABASE//,/, } can connect. When your PC's address changes, run the installer again with"
+    say "      --remote-database <new address>. Close the database again with --remote-database off."
+}
+
+remote_database_main() { # --remote-database on a hotel that is already installed: changes only who can reach the database
+    MODE=update
+    trap 'on_error $LINENO' ERR
+    preflight 1
+    exec 9> "$LOCK_FILE"
+    flock -n 9 || die "An update or a backup is running. Try again in a few minutes."
+    exec >> "$LOG" 2>&1
+    local trace=${-//[^x]/}
+    { set +x; } 2> /dev/null
+    LOCAL=no REMOTE_DATABASE=
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+    if [ -n "$trace" ]; then set -x; fi
+    select_remote_database "$REMOTE_DATABASE"
+    derive_settings
+    TOTAL_STEPS=1
+    step "Setting who can reach the database"
+    configure_remote_database
+    save_state
+    if [ -n "$REMOTE_DATABASE" ]; then
+        remote_database_summary
+    else
+        ok "The database is private again: only this server can reach it"
+    fi
+    say ""
+    say "  Only the database access changed. The website, emulator and client stay as they are."
+}
+
 # ---------------------------------------------------------------- server hardening
 
 sshd_installed() { command -v sshd > /dev/null; }
@@ -2609,17 +2650,7 @@ finish() {
     printf '      Password: %s\n' "$DB_PASSWORD" >&3
     say "      Connect locally: mariadb --host=127.0.0.1 --port=3306 --user=hotel --password plus"
     say "      Database root uses local socket authentication: sudo mariadb (no generated root password)."
-    if [ -n "${REMOTE_DATABASE:-}" ]; then
-        say ""
-        say "  Connect to the database from your PC (for example with HeidiSQL):"
-        say "      Network type: MariaDB or MySQL (TCP/IP)"
-        say "      Hostname / IP: $SERVER_IP    Port: 3306"
-        say "      User: hotel    Database: plus"
-        printf '      Password: %s\n' "$DB_PASSWORD" >&3
-        say "      Use the server's IP address, not your hotel's domain: Cloudflare does not pass database connections."
-        say "      Only ${REMOTE_DATABASE//,/, } can connect. When your PC's address changes, run the installer again with"
-        say "      --remote-database <new address>. Close the database again with --remote-database off."
-    fi
+    if [ -n "${REMOTE_DATABASE:-}" ]; then remote_database_summary; fi
     say ""
     say "  Retrieve saved passwords: sudo cat $STATE_FILE"
     say "  Update the emulator and the client later with: sudo plusemu-update"
@@ -3083,6 +3114,10 @@ main() {
             *) die "Unknown option: $1. Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off] [--setup-ssh] [--install-camera]" ;;
         esac
     done
+    if [ -n "${REMOTE_DATABASE_OPTION:-}" ] && [ -f "$STATE_FILE" ]; then
+        remote_database_main
+        return
+    fi
     select_guide_mode
     trap 'on_error $LINENO' ERR
     preflight

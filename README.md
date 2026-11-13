@@ -281,13 +281,13 @@ Enter the database password at the prompt. On Windows, use `mariadb.exe` from yo
 
 ### Connect from your PC with HeidiSQL (Linux server)
 
-You can let your own PC reach the database directly. Find your PC's public IPv4 address, for example on <https://api.ipify.org>. Then run the installer on the server again with that address:
+You can let your own PC reach the database directly. Find your PC's public IPv4 address, for example on <https://api.ipify.org>. Then run the installer on the server with that address:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash -s -- --remote-database 203.0.113.7
 ```
 
-Replace `203.0.113.7` with your address. To allow more than one address, separate them with commas. A network such as `203.0.113.0/24` is allowed too, up to a `/8`. Only these addresses get through the firewall and have a database account. IPv6 addresses are not supported.
+Replace `203.0.113.7` with your address. On a hotel that is already installed, this changes only who can reach the database. The website, emulator and client stay as they are, so your own changes to them are kept. To allow more than one address, separate them with commas. A network such as `203.0.113.0/24` is allowed too, up to a `/8`. Only these addresses get through the firewall and have a database account. IPv6 addresses are not supported.
 
 In HeidiSQL, create a new session and fill in:
 
@@ -554,7 +554,7 @@ To install without questions, set the answers in environment variables:
 |---|---|
 | `PLUSEMU_SETUP_SSH=1` | Adds your SSH key and turns SSH password login off (the same as `--setup-ssh`). See [SSH key login only](#ssh-key-login-only-linux-server). |
 | `PLUSEMU_SSH_KEY=<public key>` | The public key for `PLUSEMU_SETUP_SSH=1`, so the installer does not ask for it. |
-| `PLUSEMU_REMOTE_DATABASE=<addresses>` | Lets these IPv4 addresses reach the database on port 3306 (the same as `--remote-database`). `off` closes it again. See [Connect from your PC with HeidiSQL](#connect-from-your-pc-with-heidisql-linux-server). |
+| `PLUSEMU_REMOTE_DATABASE=<addresses>` | Lets these IPv4 addresses reach the database on port 3306 during a full install or rerun. `off` closes it again. To change only the database access of an installed hotel, use `--remote-database`. See [Connect from your PC with HeidiSQL](#connect-from-your-pc-with-heidisql-linux-server). |
 | `PLUSEMU_LOCAL=1` | [Local install](#local-install) on this PC at `http://localhost` (the same as `--local` or `-Local`). `PLUSEMU_LOCAL=0` asks for a server install. A saved install keeps its choice. |
 | `PLUSEMU_DOMAIN` | Hotel domain (required, except for a local install) |
 | `PLUSEMU_WS_URL` | WebSocket address (default `wss://<domain>/ws`) |
