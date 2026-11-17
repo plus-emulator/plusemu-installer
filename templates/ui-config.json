@@ -112,6 +112,7 @@
     "motto.max.length": 38,
     "bot.name.max.length": 15,
     "pet.package.name.max.length": 15,
+    "recycler.number_of_slots": 8,
     "wired.action.bot.talk.to.avatar.max.length": 64,
     "wired.action.bot.talk.max.length": 64,
     "wired.action.chat.max.length": 100,
