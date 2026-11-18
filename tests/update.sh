@@ -23,6 +23,9 @@ RELEASES=$TEST_DIR/releases
 MIGRATION=ok
 
 preflight() { ARCH=x64; }
+uname() { echo x86_64; }
+CPUINFO=$TEST_DIR/cpuinfo
+printf 'flags\t\t: fpu sse2 pni cx16 ssse3 sse4_1 sse4_2 popcnt\n' > "$CPUINFO"
 load_installer_files() { TEMPLATES=$ROOT/templates; }
 chown() { :; }
 systemctl() { printf 'systemctl %s\n' "$*" >> "$TEST_DIR/calls"; }
@@ -163,6 +166,18 @@ diff -r -x camera "$TEST_DIR/original" "$HOTEL_ROOT"
 [[ $(snapshots) == 0 ]]
 if grep -q 'systemctl stop' "$TEST_DIR/calls" 2> /dev/null; then exit 1; fi
 printf '%s\n' "$good_sums" > "$RELEASES/v2.0.0/SHA256SUMS"
+
+# A processor that cannot run the new emulator stops the update before the hotel is touched; --check still reports.
+good_cpu=$(< "$CPUINFO")
+printf 'flags\t\t: fpu sse2 pni cx16\n' > "$CPUINFO"
+: > "$TEST_DIR/terminal"
+fails --yes
+grep -Fq 'popcnt ssse3 sse4_1 sse4_2' "$TEST_DIR/terminal"
+diff -r -x camera "$TEST_DIR/original" "$HOTEL_ROOT"
+[[ $(snapshots) == 0 ]]
+if grep -q 'systemctl stop' "$TEST_DIR/calls" 2> /dev/null; then exit 1; fi
+run_update --check
+printf '%s\n' "$good_cpu" > "$CPUINFO"
 
 # A failed migration restores the previous emulator, client and database.
 : > "$TEST_DIR/terminal"
