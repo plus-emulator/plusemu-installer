@@ -17,7 +17,7 @@ To try PlusEMU or to work on it on your own PC, use a [local install](#local-ins
 | | Linux | Windows |
 |---|---|---|
 | System | Debian 12/13 or Ubuntu 22.04/24.04/26.04 | Windows Server 2019/2022/2025 (Windows 10/11 for a [local install](#local-install)) |
-| Processor | 64-bit (x86_64 or arm64) | 64-bit |
+| Processor | 64-bit: arm64, or x86_64 at the x86-64-v2 level (SSE4.2 and POPCNT) | 64-bit at the x86-64-v2 level (SSE4.2 and POPCNT) |
 | Free disk space | 10 GB | 15 GB on `C:` |
 | Access | root (`sudo`) | PowerShell as Administrator |
 
