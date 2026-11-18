@@ -27,7 +27,7 @@ try {
     function Get-NetTCPConnection($State, $LocalPort) { if ([int]$LocalPort -eq 80) { return [pscustomobject]@{ LocalPort = 80; OwningProcess = 777 } } }
     function Get-Process($Id) { return [pscustomobject]@{ Id = 777; ProcessName = 'httpd'; Path = 'C:\Apache24\bin\httpd.exe' } }
     $script:Calls = [Collections.Generic.List[string]]::new()
-    foreach ($name in 'Get-InstallerFiles', 'Get-Derived', 'Install-WebServer', 'Install-Toolchains', 'Install-Database', 'Get-Releases', 'Initialize-HotelDatabase',
+    foreach ($name in 'Get-InstallerFiles', 'Get-EmulatorRelease', 'Get-Derived', 'Install-WebServer', 'Install-Toolchains', 'Install-Database', 'Get-Releases', 'Initialize-HotelDatabase',
                       'Get-HotelFiles', 'Start-Emulator', 'Write-ClientConfig', 'Install-Cms', 'Set-IisSite', 'Protect-Server', 'Write-Guide', 'Write-UpdateCommand',
                       'Connect-Cloudflare', 'Open-LocalGuide', 'Complete-Install') {
         . ([scriptblock]::Create("function $name { `$script:Calls.Add('$name') }"))

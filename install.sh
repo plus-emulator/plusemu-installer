@@ -391,12 +391,12 @@ preflight() { # preflight [free GB needed]
 require_processor() { # the emulator's .NET runtime needs these x86-64 instructions; old virtual processor types lack them
     local flags flag missing=''
     [ "$(uname -m)" = x86_64 ] || return 0
-    flags=$(grep -m 1 '^flags' "$CPUINFO" 2> /dev/null | cut -d: -f2 || true)
-    [ -n "$flags" ] || return 0
-    for flag in cx16 popcnt pni ssse3 sse4_1 sse4_2; do
-        [[ " $flags " == *" $flag "* ]] || missing+=" $flag"
-    done
-    [ -z "$missing" ] || die "This server's processor cannot run PlusEMU: it lacks$missing. Nothing was changed. On a virtual server, ask your provider for a newer processor type (for example \"host\" or \"x86-64-v2\")."
+    while IFS= read -r flags; do
+        for flag in cx16 popcnt pni ssse3 sse4_1 sse4_2; do
+            [[ " $flags " == *" $flag "* ]] || missing+=" $flag"
+        done
+        [ -z "$missing" ] || die "This server's processor cannot run PlusEMU: it lacks$missing. Nothing was changed. On a virtual server, ask your provider for a newer processor type (for example \"host\" or \"x86-64-v2\")."
+    done < <(sed -n 's/^flags[[:space:]]*:[[:space:]]*//p' "$CPUINFO" 2> /dev/null)
 }
 
 load_installer_files() {

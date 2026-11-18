@@ -35,6 +35,11 @@ expect_terminal 'ask your provider'
 cpu 'Old CPU' "${NEW/ popcnt/ popcnt_extra}"
 refused 'a processor without popcnt'
 
+# The scheduler can run the emulator on any online CPU.
+cpu 'First CPU' "$NEW"
+printf 'processor : 1\nflags : %s\n' "$OLD" >> "$CPUINFO"
+refused 'a later CPU without the needed instructions'
+
 # A system that lists no flags is not refused.
 printf 'processor\t: 0\n' > "$CPUINFO"
 require_processor

@@ -367,7 +367,7 @@ try {
 
     # ---------------------------------------------------------------- the whole run
 
-    $steps = 'Get-InstallerFiles', 'Get-Derived', 'Install-WebServer', 'Install-Toolchains', 'Install-Database', 'Get-Releases', 'Initialize-HotelDatabase', 'Get-HotelFiles',
+    $steps = 'Get-InstallerFiles', 'Get-EmulatorRelease', 'Get-Derived', 'Install-WebServer', 'Install-Toolchains', 'Install-Database', 'Get-Releases', 'Initialize-HotelDatabase', 'Get-HotelFiles',
              'Start-Emulator', 'Write-ClientConfig', 'Install-Camera', 'Install-Cms', 'Set-IisSite', 'Protect-Server', 'Write-Guide', 'Write-UpdateCommand', 'Connect-Cloudflare', 'Assert-FreePorts'
     foreach ($name in $steps) { . ([scriptblock]::Create("function $name { `$script:Calls.Add('$name') }")) }
     function Complete-Install { $script:Calls.Add("Complete-Install $script:TotalSteps") }

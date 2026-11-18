@@ -44,6 +44,10 @@ $script:Calls = [Collections.Generic.List[string]]::new()
 
 # External programs and Windows-only steps are replaced; everything else is the real installer code.
 function Assert-Administrator { }
+function Run($Exe, $Argument) {
+    if ((Split-Path $Exe -Leaf) -ne 'Plus Emulator.exe' -or $Argument -ne '--check-runtime') { throw "Unexpected program: $Exe $Argument" }
+    if ($script:RuntimeFails) { throw 'Runtime startup failed' }
+}
 function Get-InstallerFiles { $script:Templates = Join-Path $root 'templates' }
 function Add-MachinePath($Dir) { $Calls.Add("path $Dir") }
 function Invoke-WebRequest { throw 'offline' }
@@ -112,6 +116,7 @@ function New-EmulatorRelease($Tag) {
     $release = Join-Path $Releases $Tag
     New-Item -ItemType Directory -Force (Join-Path $dir 'Config'), (Join-Path $dir 'Database'), $release | Out-Null
     Set-Content (Join-Path $dir 'Plus Emulator.exe') "emulator $Tag"
+    Set-Content (Join-Path $dir 'check-runtime.cmd') 'runtime check'
     Set-Content (Join-Path $dir "new-$Tag.dll") $Tag
     Write-Bom (Join-Path (Join-Path $dir 'Config') 'config.json') '{"Database": {"Password": "", "Port": 3306, "Timeout": 30}, "NewSection": {"Enabled": true}}'
     Set-Content (Join-Path (Join-Path $dir 'Config') 'nlog.config') 'default nlog'
@@ -221,6 +226,13 @@ try {
     Assert ((Get-Tree $HotelRoot) -ceq $original) 'A bad checksum changed the hotel'
     Assert ((Get-Snapshots).Count -eq 0 -and -not ($Calls -contains 'stop')) 'A bad checksum stopped the emulator or made a backup'
     Set-Content $sums $goodSums -NoNewline
+
+    $script:RuntimeFails = $true
+    Assert (Test-UpdateFails -Yes) 'An emulator that cannot start was accepted'
+    Assert ($LastError -like '*processor*') "Wrong runtime error: $LastError"
+    Assert ((Get-Tree $HotelRoot) -ceq $original) 'A failed runtime check changed the hotel'
+    Assert ((Get-Snapshots).Count -eq 0 -and -not ($Calls -contains 'stop')) 'A failed runtime check stopped the hotel or made a backup'
+    $script:RuntimeFails = $false
 
     # Only one update runs at a time.
     $lock = [IO.File]::Open($LockFile, 'OpenOrCreate', 'ReadWrite', 'None')
