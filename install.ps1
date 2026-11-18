@@ -739,7 +739,7 @@ function Get-EmulatorRelease {
     if (Test-Path (Join-Path $out 'Plus Emulator.exe')) { return }
     $version = Get-ReleaseVersion $EmulatorRepo $EmulatorUrl
     if (-not $version) { throw "Could not find the latest PlusEMU release. Check the server's internet connection." }
-    $staged = Join-Path $Downloads ([guid]::NewGuid().ToString())
+    $staged = Join-Path $HotelRoot ".emulator-$([guid]::NewGuid())"
     try {
         Expand-EmulatorRelease $version $staged
         if (Test-Path $out) { Remove-Item $out -Recurse -Force }

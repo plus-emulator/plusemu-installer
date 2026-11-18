@@ -234,6 +234,19 @@ try {
     Assert ((Get-Snapshots).Count -eq 0 -and -not ($Calls -contains 'stop')) 'A failed runtime check stopped the hotel or made a backup'
     $script:RuntimeFails = $false
 
+    & {
+        $HotelRoot = Join-Path $testDir 'new hotel'
+        $VersionsFile = Join-Path $HotelRoot 'versions.json'
+        New-Item -ItemType Directory $HotelRoot | Out-Null
+        $script:RuntimeFails = $true
+        try { Get-EmulatorRelease; throw 'Accepted an incompatible new install' }
+        catch { Assert ("$_" -like '*x86-64-v2*') "Wrong install error: $_" }
+        Assert (-not (Get-ChildItem -Force $HotelRoot)) 'A failed install left a partial emulator or saved a version'
+        $script:RuntimeFails = $false
+        Get-EmulatorRelease
+        Assert ((Get-Versions).EmulatorVersion -eq 'v2.0.0') 'The install did not recover after the CPU check passed'
+    }
+
     # Only one update runs at a time.
     $lock = [IO.File]::Open($LockFile, 'OpenOrCreate', 'ReadWrite', 'None')
     try { Assert (Test-UpdateFails -Check) 'A second update ran while another holds the lock' } finally { $lock.Dispose() }
