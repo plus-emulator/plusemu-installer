@@ -58,6 +58,7 @@ SSHD_DROPIN=/etc/ssh/sshd_config.d/10-plusemu.conf
 NGINX_DIR=/etc/nginx
 REAL_IP_CONF=$NGINX_DIR/conf.d/cloudflare-real-ip.conf
 CLOUDFLARE_COMMAND=/usr/local/sbin/plusemu-cloudflare-ips
+CPUINFO=/proc/cpuinfo
 CLOUDFLARE_CRON=/etc/cron.d/plusemu-cloudflare-ips
 CLOUDFLARE_LOG=/var/log/plusemu-cloudflare-ips.log
 CLOUDFLARE_TAG=plusemu-cloudflare
@@ -385,6 +386,10 @@ preflight() { # preflight [free GB needed]
         *) die "Unsupported processor: $(uname -m). A 64-bit (x86_64 or arm64) server is required." ;;
     esac
     require_free_space "${1:-10}"
+}
+
+require_processor() { # the emulator's .NET runtime needs these x86-64 instructions; old virtual processor types lack them
+    :
 }
 
 load_installer_files() {
@@ -2981,6 +2986,7 @@ update_main() {
         say "  Install the update with: sudo plusemu-update"
         return
     fi
+    if [ "$update_emulator" = 1 ]; then require_processor; fi
     say ""
     say "  Your settings and added files are kept, and a backup is made first."
     if [ "$update_assets" = 1 ]; then
@@ -3121,6 +3127,7 @@ main() {
     select_guide_mode
     trap 'on_error $LINENO' ERR
     preflight
+    require_processor
     # Updates, backups and the health check wait for the installer.
     exec 9> "$LOCK_FILE"
     flock -n 9 || die "An update or a backup is running. Try again in a few minutes."
