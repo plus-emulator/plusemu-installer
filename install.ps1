@@ -337,6 +337,11 @@ function Expand-EmulatorRelease($Version, $Dir) {
     Expand-Archive $file $Dir -Force
     Remove-Item $file
     if (-not (Test-Path (Join-Path $Dir 'Plus Emulator.exe'))) { throw "The PlusEMU $Version download is incomplete. Nothing was changed. Try again later." }
+    # Older releases ignore unknown arguments and would start the hotel.
+    if (Test-Path (Join-Path $Dir 'check-runtime.cmd')) {
+        try { Run (Join-Path $Dir 'Plus Emulator.exe') --check-runtime }
+        catch { throw "PlusEMU $Version could not start. Check the installer log. The .NET 11 release needs an x86-64-v2 processor." }
+    }
 }
 
 function Expand-ClientRelease($Version, $Dir) {
@@ -728,23 +733,28 @@ function Install-Database {
     Ok "MariaDB ($(Split-Path (Split-Path (Split-Path $MariaDb)) -Leaf))"
 }
 
-function Get-Releases {
-    Step 'Downloading PlusEMU, the Volt client and Atom CMS'
-    # A re-run repairs and keeps the installed releases; plusemu-update updates them.
+function Get-EmulatorRelease {
     Read-Versions
     $out = Join-Path $HotelRoot 'emulator'
-    if (Test-Path (Join-Path $out 'Plus Emulator.exe')) {
-        Ok 'PlusEMU (already installed)'
-    } else {
-        $version = Get-ReleaseVersion $EmulatorRepo $EmulatorUrl
-        if (-not $version) { throw "Could not find the latest PlusEMU release. Check the server's internet connection." }
+    if (Test-Path (Join-Path $out 'Plus Emulator.exe')) { return }
+    $version = Get-ReleaseVersion $EmulatorRepo $EmulatorUrl
+    if (-not $version) { throw "Could not find the latest PlusEMU release. Check the server's internet connection." }
+    $staged = Join-Path $HotelRoot ".emulator-$([guid]::NewGuid())"
+    try {
+        Expand-EmulatorRelease $version $staged
         if (Test-Path $out) { Remove-Item $out -Recurse -Force }
-        Expand-EmulatorRelease $version $out
-        $script:Versions.EmulatorVersion = $version
-        Save-Versions
-        Ok "PlusEMU $version"
+        Move-Item $staged $out
+    } finally {
+        if (Test-Path $staged) { Remove-Item $staged -Recurse -Force }
     }
+    $script:Versions.EmulatorVersion = $version
+    Save-Versions
+    Ok "PlusEMU $version"
+}
 
+function Get-Releases {
+    Step 'Downloading the Volt client and Atom CMS'
+    $out = Join-Path $HotelRoot 'emulator'
     $client = Join-Path $HotelRoot 'client'
     if (Test-Path (Join-Path $client 'index.html')) {
         Ok 'Volt client (already installed)'
@@ -2676,6 +2686,7 @@ function Install-Hotel {
         }
     }
     Say "  Admin and database passwords are saved in $StateFile. Retrieve them in Administrator PowerShell: Get-Content $StateFile"
+    Get-EmulatorRelease
     Get-Derived
     Install-WebServer
     Install-Toolchains
