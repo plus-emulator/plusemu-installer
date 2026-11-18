@@ -52,6 +52,11 @@ expect_site '    location ~ "^/camera/(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-
 expect_site "        root $HOTEL_ROOT;"
 expect_site '        try_files $uri =404;'
 expect_site '    location /camera/ { return 404; }'
+# Avatar images come from the avatar folder; a missing one is drawn by the camera service.
+expect_site '    location /avatars/ {'
+expect_site '        try_files $uri @avatar;'
+expect_site '    location @avatar_missing {'
+grep -q 'zone=plusemu_avatars' "$NGINX_DIR/conf.d/plusemu-limits.conf"
 [ -L "$NGINX_DIR/sites-enabled/hotel.conf" ]
 grep -qx 'configure_firewall' "$FAKE_DIR/calls"
 grep -qx 'configure_remote_database' "$FAKE_DIR/calls"
