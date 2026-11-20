@@ -2234,11 +2234,57 @@ function Copy-ClientSettings($Old, $New) {
         $defaults = Get-Content (Join-Path $rendered $file) -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($shipped.ContainsKey($file)) { $defaults = Merge-Json $shipped[$file] $defaults }
         if (-not (Test-Path $target)) { Write-Utf8 $target ($defaults | ConvertTo-Json -Depth 20); continue }
+        $renderer = $null
+        if ($file -eq 'renderer-config.json') { try { $renderer = Invoke-RendererHabbicons $target } catch { } }
+        if ($renderer -eq 'invalid') {
+            Say "      Kept configuration/$file as it is: it is not plain JSON, so no new settings were added." 'Yellow'
+            continue
+        }
         try { $merged = Merge-Json $defaults (Get-Content $target -Raw -Encoding UTF8 | ConvertFrom-Json) }
         catch { Say "      Kept configuration/$file as it is: it is not plain JSON, so no new settings were added." 'Yellow'; continue }
         Write-Utf8 $target ($merged | ConvertTo-Json -Depth 20)
     }
     Remove-Item $rendered -Recurse -Force
+    Use-CurrentHabbicons $New
+}
+
+function Invoke-RendererHabbicons($Config, $Set) {
+    $node = Get-NodeExe
+    $arguments = @('-', $Config)
+    if ($Set) { $arguments += $Set }
+    @'
+const fs = require('node:fs');
+const [file, set] = process.argv.slice(2);
+const bytes = fs.readFileSync(file);
+let settings;
+try {
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    settings = JSON.parse(text, (key, value, context) =>
+        typeof value === 'number' ? JSON.rawJSON(context.source) : value);
+} catch (error) {
+    if (!(error instanceof SyntaxError) && error.code !== 'ERR_ENCODING_INVALID_ENCODED_DATA') throw error;
+    console.log('invalid');
+    process.exit(0);
+}
+if (set && settings?.['habbicons.asset.hash'] === 'default') {
+    settings['habbicons.asset.hash'] = set;
+    fs.writeFileSync(file, JSON.stringify(settings, null, 4) + '\n');
+    console.log('updated');
+}
+'@ | & $node @arguments
+    if ($LASTEXITCODE -ne 0) { throw "Could not process $Config." }
+}
+
+function Use-CurrentHabbicons($Client) {
+    $set = 'habbo-225e1f8a'
+    $config = Join-Path $Client 'configuration/renderer-config.json'
+    if (-not (Test-Path -LiteralPath (Join-Path $Client "habbicons/$set") -PathType Container)) { return }
+    if (-not (Test-Path -LiteralPath $config -PathType Leaf)) { return }
+    try { $result = Invoke-RendererHabbicons $config $set } catch { return }
+    switch ($result) {
+        'invalid' { Say '      Kept configuration/renderer-config.json as it is: it is not plain JSON, so the habbicon set was not checked.' 'Yellow' }
+        'updated' { Say "  Habbicons now use the $set set, which has the zombie icons." }
+    }
 }
 
 function Invoke-DatabaseDump($File) {
@@ -2488,6 +2534,7 @@ function Update-Hotel([switch]$Check) {
     else { Say "  Hotel files:        $($installed.AssetsVersion) (up to date)" }
     if (-not $updateEmulator -and -not $updateClient -and -not $updateAssets) {
         Say ''
+        if (-not $Check) { Use-CurrentHabbicons (Join-Path $HotelRoot 'client') }
         Say '  Everything is up to date.' 'Green'
         return
     }
@@ -2582,6 +2629,7 @@ function Update-Hotel([switch]$Check) {
         # The camera draws photos with the client, so it loads the new one.
         if ($updateClient -and (Get-Service PlusEMUCamera -ErrorAction SilentlyContinue)) { Restart-Service PlusEMUCamera }
     }
+    if (-not $updateClient) { Use-CurrentHabbicons $client }
     $script:RestoreFrom = $null
     $script:Versions.EmulatorVersion = $latestEmulator
     $script:Versions.ClientVersion = $latestClient
@@ -2620,7 +2668,10 @@ function Invoke-Update([switch]$Check, [switch]$Yes, [switch]$Rollback, [switch]
         $script:Work = $null
         try {
             if ($Rollback) { Restore-LastBackup }
-            elseif ($Assets) { Update-HotelFiles -Check:$Check }
+            elseif ($Assets) {
+                Update-HotelFiles -Check:$Check
+                if (-not $Check) { Use-CurrentHabbicons (Join-Path $HotelRoot 'client') }
+            }
             else { Update-Hotel -Check:$Check }
         } finally {
             Complete-Update

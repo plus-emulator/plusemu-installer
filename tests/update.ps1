@@ -125,10 +125,15 @@ function New-EmulatorRelease($Tag) {
     Compress-Archive -Path (Join-Path $dir '*') -DestinationPath (Join-Path $release 'plusemu-win-x64.zip') -Force
     Write-Sums $release 'plusemu-win-x64.zip'
 }
-function New-ClientRelease($Tag) {
+function New-ClientRelease($Tag, $HabbiconSet = '') {
     $dir = Join-Path (Join-Path $testDir 'build') $Tag
     $release = Join-Path $Releases $Tag
     New-Item -ItemType Directory -Force (Join-Path $dir 'assets'), (Join-Path $dir 'configuration'), (Join-Path $dir 'plugins'), $release | Out-Null
+    if ($HabbiconSet) {
+        $icons = Join-Path (Join-Path $dir 'habbicons') $HabbiconSet
+        New-Item -ItemType Directory -Force $icons | Out-Null
+        Set-Content (Join-Path $icons 'icons.png') 'icons'
+    }
     Set-Content (Join-Path $dir 'index.html') "client $Tag"
     Set-Content (Join-Path (Join-Path $dir 'assets') "index-$Tag.js") 'bundle'
     # The release ships its own default settings; the updater adds the ones a hotel lacks.
@@ -196,7 +201,9 @@ try {
     Set-Content (Join-Path (Join-Path $emulator 'backups') 'before-migration.sql') 'dump'
     Set-Content (Join-Path $client 'index.html') 'client old'
     Set-Content (Join-Path (Join-Path $client 'assets') 'index-old.js') 'old bundle'
-    Set-Content (Join-Path $clientConfig 'renderer-config.json') '{"socket.url": "wss://custom.example.com/game", "my.setting": 1}'
+    New-Item -ItemType Directory -Force (Join-Path $client 'habbicons/habbo-225e1f8a') | Out-Null
+    Set-Content (Join-Path $client 'habbicons/habbo-225e1f8a/icons.png') 'icons'
+    Set-Content (Join-Path $clientConfig 'renderer-config.json') '{"habbicons.asset.hash": "default", "socket.url": "wss://custom.example.com/game", "my.setting": 1}'
     Set-Content (Join-Path $clientConfig 'ui-config.json') '{"hotel.name": "Mine"}'
     Set-Content (Join-Path $clientConfig 'client-mode.json') '{"apiBaseUrl": "https://example.com"}'
     Set-Content (Join-Path $clientConfig 'UITexts_en.jsonc') '{"text": "mine"}'
@@ -440,6 +447,68 @@ try {
     Assert ((Get-Versions).ClientVersion -eq 'v1.0.0') 'The lower client tag was not recorded'
     Invoke-TestUpdate -Yes
     Assert ($Terminal -match 'Everything is up to date') "The lower client tag was installed again: $Terminal"
+
+    # The stock habbicon set "default" lacks the zombie icons, so every run moves a hotel on it to the set its client ships.
+    $rendererFile = Join-Path $clientConfig 'renderer-config.json'
+    function Set-Habbicons($Set) {
+        $settings = Get-Json $rendererFile
+        $settings | Add-Member -NotePropertyName 'habbicons.asset.hash' -NotePropertyValue $Set -Force
+        Write-Utf8 $rendererFile ($settings | ConvertTo-Json -Depth 20)
+    }
+    function Get-Habbicons { return (Get-Json $rendererFile).'habbicons.asset.hash' }
+    Remove-Item (Join-Path $client 'habbicons') -Recurse -Force
+    Set-Habbicons 'default'
+    Invoke-TestUpdate -Yes
+    Assert ((Get-Habbicons) -eq 'default') 'The habbicon set changed although the client lacks the new set'
+    $setPath = Join-Path $client 'habbicons/habbo-225e1f8a'
+    New-Item -ItemType Directory -Force (Split-Path $setPath) | Out-Null
+    New-Item -ItemType File $setPath | Out-Null
+    Invoke-TestUpdate -Yes
+    Assert ((Get-Habbicons) -ceq 'default') 'A file was accepted as an icon directory'
+    Remove-Item $setPath
+    New-Item -ItemType Directory -Force (Join-Path (Join-Path $client 'habbicons') 'habbo-225e1f8a') | Out-Null
+    $before = Get-Content $rendererFile -Raw
+    Invoke-TestUpdate -Check
+    Assert ((Get-Content $rendererFile -Raw) -ceq $before) 'Check changed the habbicon set'
+    $Calls.Clear()
+    Invoke-TestUpdate -Yes
+    Assert ((Get-Habbicons) -eq 'habbo-225e1f8a') 'An up-to-date run kept the stock habbicon set'
+    $renderer = Get-Json $rendererFile
+    Assert ($renderer.'socket.url' -eq 'wss://custom.example.com/game' -and $renderer.'my.setting' -eq 1) 'Custom renderer settings were lost'
+    Assert ($Terminal.Contains('habbo-225e1f8a') -and $Terminal -match 'Everything is up to date') "The habbicon change or the up-to-date line is missing: $Terminal"
+    Assert (-not ($Calls -contains 'stop')) 'The habbicon change stopped the emulator'
+    Invoke-TestUpdate -Yes
+    Assert (-not $Terminal.Contains('habbo-225e1f8a')) "A current habbicon set was reported again: $Terminal"
+    # A set the owner chose stays.
+    Set-Habbicons 'my-icons'
+    Invoke-TestUpdate -Yes
+    Invoke-TestUpdate -Assets
+    Assert ((Get-Habbicons) -eq 'my-icons') 'The habbicon set the owner chose was replaced'
+    foreach ($value in @('DEFAULT', @('default'))) {
+        Set-Habbicons $value
+        $before = [IO.File]::ReadAllText($rendererFile)
+        Invoke-TestUpdate -Yes
+        Assert ([IO.File]::ReadAllText($rendererFile) -ceq $before) 'The updater replaced a custom habbicon value'
+    }
+    # -Assets moves the stock set too.
+    Set-Habbicons 'default'
+    Invoke-TestUpdate -Assets
+    Assert ((Get-Habbicons) -eq 'habbo-225e1f8a' -and $Terminal.Contains('habbo-225e1f8a')) "-Assets kept the stock habbicon set: $Terminal"
+    # A file that is not plain JSON is kept as it is, with a note.
+    $json = Get-Content $rendererFile -Raw
+    Set-Content $rendererFile '{"habbicons.asset.hash": "default",'
+    $before = Get-Content $rendererFile -Raw
+    Invoke-TestUpdate -Yes
+    Assert ((Get-Content $rendererFile -Raw) -ceq $before -and $Terminal.Contains('not plain JSON')) "A file that is not plain JSON was changed or not reported: $Terminal"
+    # A client update gives the same result, also when the installed client lacks the new set.
+    Write-Utf8 $rendererFile $json
+    Set-Habbicons 'default'
+    Remove-Item (Join-Path $client 'habbicons') -Recurse -Force
+    New-ClientRelease 'v1.1.0' 'habbo-225e1f8a'
+    $script:LatestClient = 'v1.1.0'
+    Invoke-TestUpdate -Yes
+    Assert ((Get-Text (Join-Path $client 'index.html')) -eq 'client v1.1.0') 'The client with the new habbicon set was not installed'
+    Assert ((Get-Habbicons) -eq 'habbo-225e1f8a' -and (Get-Json $rendererFile).'my.setting' -eq 1) 'A client update kept the stock habbicon set or lost a setting'
     Write-Host 'PowerShell update checks passed'
 } catch {
     Write-Host "Failed: $_" -ForegroundColor Red

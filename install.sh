@@ -2730,13 +2730,52 @@ keep_client_files() { # keep_client_files <installed dir> <new dir>
         fi
         if [ ! -f "$new/configuration/$file" ]; then
             cp "$rendered/$file" "$new/configuration/$file"
+        elif [ "$file" = renderer-config.json ] && [ "$(renderer_habbicons "$new/configuration/$file")" = invalid ]; then
+            say "      ${yellow}Kept configuration/$file as it is: it is not plain JSON, so no new settings were added.${reset}"
         elif jq -s '.[0] * .[1]' "$rendered/$file" "$new/configuration/$file" > "$rendered/$file.new" 2> /dev/null; then
+            if [ "$file" = renderer-config.json ]; then
+                cp --attributes-only --preserve=mode,ownership "$new/configuration/$file" "$rendered/$file.new"
+            fi
             mv "$rendered/$file.new" "$new/configuration/$file"
         else
             say "      ${yellow}Kept configuration/$file as it is: it is not plain JSON, so no new settings were added.${reset}"
         fi
     done
     rm -rf "$rendered"
+    use_current_habbicons "$new"
+}
+
+renderer_habbicons() { # renderer_habbicons <config> [set]: without a set, only validate the JSON
+    node - "$@" <<'JS'
+const fs = require('node:fs');
+const [file, set] = process.argv.slice(2);
+const bytes = fs.readFileSync(file);
+let settings;
+try {
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    settings = JSON.parse(text, (key, value, context) =>
+        typeof value === 'number' ? JSON.rawJSON(context.source) : value);
+} catch (error) {
+    if (!(error instanceof SyntaxError) && error.code !== 'ERR_ENCODING_INVALID_ENCODED_DATA') throw error;
+    console.log('invalid');
+    process.exit(0);
+}
+if (set && settings?.['habbicons.asset.hash'] === 'default') {
+    settings['habbicons.asset.hash'] = set;
+    fs.writeFileSync(file, JSON.stringify(settings, null, 4) + '\n');
+    console.log('updated');
+}
+JS
+}
+
+use_current_habbicons() {
+    local config=$1/configuration/renderer-config.json set=habbo-225e1f8a result
+    [ -d "$1/habbicons/$set" ] && [ -f "$config" ] || return 0
+    result=$(renderer_habbicons "$config" "$set") || return 0
+    case "$result" in
+        invalid) say "      ${yellow}Kept configuration/renderer-config.json as it is: it is not plain JSON, so the habbicon set was not checked.${reset}" ;;
+        updated) say "  Habbicons now use the $set set, which has the zombie icons." ;;
+    esac
 }
 
 create_snapshot() { # create_snapshot [with the hotel files: 0|1]: sets SNAPSHOT to a new backup
@@ -2953,6 +2992,7 @@ update_main() {
     fi
     if [ "$assets_only" = 1 ]; then
         add_hotel_files "$check"
+        if [ "$check" = 0 ]; then use_current_habbicons "$HOTEL_ROOT/client"; fi
         return
     fi
 
@@ -2985,6 +3025,7 @@ update_main() {
     fi
     if [ "$update_emulator" = 0 ] && [ "$update_client" = 0 ] && [ "$update_assets" = 0 ]; then
         say ""
+        if [ "$check" = 0 ]; then use_current_habbicons "$HOTEL_ROOT/client"; fi
         say "  ${green}Everything is up to date.${reset}"
         return
     fi
@@ -3073,6 +3114,7 @@ update_main() {
         # The camera draws photos with the client, so it loads the new one.
         if [ "$update_client" = 1 ]; then systemctl try-restart plusemu-camera; fi
     fi
+    if [ "$update_client" = 0 ]; then use_current_habbicons "$HOTEL_ROOT/client"; fi
     RESTORE_FROM=
     EMULATOR_VERSION=$latest_emulator CLIENT_VERSION=$latest_client
     if [ "$update_assets" = 1 ]; then ASSETS_VERSION=$latest_assets; fi
