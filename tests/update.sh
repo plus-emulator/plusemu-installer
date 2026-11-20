@@ -136,7 +136,9 @@ printf 'plugin\n' > "$emulator/plugins/MyPlugin/MyPlugin.dll"
 printf 'dump\n' > "$emulator/backups/before-migration.sql"
 printf 'client old\n' > "$client/index.html"
 printf 'old bundle\n' > "$client/assets/index-old.js"
-printf '{"socket.url": "wss://custom.example.com/game", "my.setting": 1}\n' > "$client/configuration/renderer-config.json"
+mkdir -p "$client/habbicons/habbo-225e1f8a"
+touch "$client/habbicons/habbo-225e1f8a/icons.png"
+printf '{"habbicons.asset.hash": "default", "socket.url": "wss://custom.example.com/game", "my.setting": 1}\n' > "$client/configuration/renderer-config.json"
 printf '{"hotel.name": "Mine"}\n' > "$client/configuration/ui-config.json"
 printf '{"apiBaseUrl": "https://example.com"}\n' > "$client/configuration/client-mode.json"
 printf '{"text": "mine"}\n' > "$client/configuration/UITexts_en.jsonc"
@@ -403,8 +405,10 @@ grep -qi 'everything is up to date' "$TEST_DIR/terminal"
 renderer=$client/configuration/renderer-config.json
 set_habbicons() { jq --arg set "$1" '."habbicons.asset.hash" = $set' "$renderer" > "$TEST_DIR/renderer" && cat "$TEST_DIR/renderer" > "$renderer"; }
 habbicons() { jq -r '."habbicons.asset.hash"' "$renderer"; }
+rm -rf "$client/habbicons"
 set_habbicons default
-chmod 644 "$renderer"
+chmod 640 "$renderer"
+metadata=$(stat -c %u:%g:%a "$renderer")
 # A client without the new set keeps the old one.
 run_update --yes
 [[ $(habbicons) == default ]]
@@ -417,7 +421,7 @@ cmp "$renderer" "$TEST_DIR/renderer-before"
 run_update --yes
 [[ $(habbicons) == habbo-225e1f8a ]]
 [[ $(jq -r '."socket.url"' "$renderer") == wss://custom.example.com/game && $(jq -r '."my.setting"' "$renderer") == 1 ]]
-[[ $(stat -c %a "$renderer") == 644 ]]
+[[ $(stat -c %u:%g:%a "$renderer") == "$metadata" ]]
 grep -Fq habbo-225e1f8a "$TEST_DIR/terminal"
 grep -qi 'everything is up to date' "$TEST_DIR/terminal"
 if grep -q 'systemctl' "$TEST_DIR/calls"; then exit 1; fi
@@ -429,6 +433,10 @@ set_habbicons my-icons
 run_update --yes
 run_update --assets
 [[ $(habbicons) == my-icons ]]
+set_habbicons $'default\n'
+cp "$renderer" "$TEST_DIR/renderer-before"
+run_update --yes --with-assets
+cmp "$renderer" "$TEST_DIR/renderer-before"
 # --assets moves the stock set too.
 set_habbicons default
 : > "$TEST_DIR/terminal"

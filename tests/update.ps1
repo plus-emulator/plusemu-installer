@@ -201,7 +201,9 @@ try {
     Set-Content (Join-Path (Join-Path $emulator 'backups') 'before-migration.sql') 'dump'
     Set-Content (Join-Path $client 'index.html') 'client old'
     Set-Content (Join-Path (Join-Path $client 'assets') 'index-old.js') 'old bundle'
-    Set-Content (Join-Path $clientConfig 'renderer-config.json') '{"socket.url": "wss://custom.example.com/game", "my.setting": 1}'
+    New-Item -ItemType Directory -Force (Join-Path $client 'habbicons/habbo-225e1f8a') | Out-Null
+    Set-Content (Join-Path $client 'habbicons/habbo-225e1f8a/icons.png') 'icons'
+    Set-Content (Join-Path $clientConfig 'renderer-config.json') '{"habbicons.asset.hash": "default", "socket.url": "wss://custom.example.com/game", "my.setting": 1}'
     Set-Content (Join-Path $clientConfig 'ui-config.json') '{"hotel.name": "Mine"}'
     Set-Content (Join-Path $clientConfig 'client-mode.json') '{"apiBaseUrl": "https://example.com"}'
     Set-Content (Join-Path $clientConfig 'UITexts_en.jsonc') '{"text": "mine"}'
@@ -454,9 +456,16 @@ try {
         Write-Utf8 $rendererFile ($settings | ConvertTo-Json -Depth 20)
     }
     function Get-Habbicons { return (Get-Json $rendererFile).'habbicons.asset.hash' }
+    Remove-Item (Join-Path $client 'habbicons') -Recurse -Force
     Set-Habbicons 'default'
     Invoke-TestUpdate -Yes
     Assert ((Get-Habbicons) -eq 'default') 'The habbicon set changed although the client lacks the new set'
+    $setPath = Join-Path $client 'habbicons/habbo-225e1f8a'
+    New-Item -ItemType Directory -Force (Split-Path $setPath) | Out-Null
+    New-Item -ItemType File $setPath | Out-Null
+    Invoke-TestUpdate -Yes
+    Assert ((Get-Habbicons) -ceq 'default') 'A file was accepted as an icon directory'
+    Remove-Item $setPath
     New-Item -ItemType Directory -Force (Join-Path (Join-Path $client 'habbicons') 'habbo-225e1f8a') | Out-Null
     $before = Get-Content $rendererFile -Raw
     Invoke-TestUpdate -Check
@@ -475,6 +484,12 @@ try {
     Invoke-TestUpdate -Yes
     Invoke-TestUpdate -Assets
     Assert ((Get-Habbicons) -eq 'my-icons') 'The habbicon set the owner chose was replaced'
+    foreach ($value in @('DEFAULT', @('default'))) {
+        Set-Habbicons $value
+        $before = [IO.File]::ReadAllText($rendererFile)
+        Invoke-TestUpdate -Yes
+        Assert ([IO.File]::ReadAllText($rendererFile) -ceq $before) 'The updater replaced a custom habbicon value'
+    }
     # -Assets moves the stock set too.
     Set-Habbicons 'default'
     Invoke-TestUpdate -Assets
