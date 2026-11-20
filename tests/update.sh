@@ -451,6 +451,16 @@ cp "$renderer" "$TEST_DIR/renderer-before"
 run_update --yes
 cmp "$renderer" "$TEST_DIR/renderer-before"
 grep -Fq 'not plain JSON' "$TEST_DIR/terminal"
+# Without a working Node.js the update still finishes and leaves the setting alone.
+cp "$TEST_DIR/renderer-json" "$renderer"
+set_habbicons default
+cp "$renderer" "$TEST_DIR/renderer-before"
+node() { return 127; }
+: > "$TEST_DIR/terminal"
+run_update --yes
+unset -f node
+cmp "$renderer" "$TEST_DIR/renderer-before"
+grep -qi 'everything is up to date' "$TEST_DIR/terminal"
 # A client update gives the same result, also when the installed client lacks the new set.
 cp "$TEST_DIR/renderer-json" "$renderer"
 set_habbicons default
