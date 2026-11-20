@@ -2737,6 +2737,21 @@ keep_client_files() { # keep_client_files <installed dir> <new dir>
         fi
     done
     rm -rf "$rendered"
+    use_current_habbicons "$new"
+}
+
+use_current_habbicons() { # use_current_habbicons <client dir>
+    # The stock "default" set lacks the zombie icons and its set ids no longer match the emulator. Other values are the owner's choice.
+    local config=$1/configuration/renderer-config.json set=habbo-225e1f8a current updated
+    [ -d "$1/habbicons/$set" ] && [ -f "$config" ] || return 0
+    if ! current=$(jq -r '."habbicons.asset.hash"' "$config" 2> /dev/null); then
+        say "      ${yellow}Kept configuration/renderer-config.json as it is: it is not plain JSON, so the habbicon set was not checked.${reset}"
+        return 0
+    fi
+    [ "$current" = default ] || return 0
+    updated=$(jq --arg set "$set" '."habbicons.asset.hash" = $set' "$config")
+    printf '%s\n' "$updated" > "$config"
+    say "  Habbicons now use the $set set, which has the zombie icons."
 }
 
 create_snapshot() { # create_snapshot [with the hotel files: 0|1]: sets SNAPSHOT to a new backup
@@ -2951,6 +2966,7 @@ update_main() {
         rollback_update
         return
     fi
+    if [ "$check" = 0 ]; then use_current_habbicons "$HOTEL_ROOT/client"; fi
     if [ "$assets_only" = 1 ]; then
         add_hotel_files "$check"
         return

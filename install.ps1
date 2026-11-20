@@ -2239,6 +2239,20 @@ function Copy-ClientSettings($Old, $New) {
         Write-Utf8 $target ($merged | ConvertTo-Json -Depth 20)
     }
     Remove-Item $rendered -Recurse -Force
+    Use-CurrentHabbicons $New
+}
+
+# The stock "default" set lacks the zombie icons and its set ids no longer match the emulator. Other values are the owner's choice.
+function Use-CurrentHabbicons($Client) {
+    $set = 'habbo-225e1f8a'
+    $config = Join-Path (Join-Path $Client 'configuration') 'renderer-config.json'
+    if (-not (Test-Path -LiteralPath (Join-Path (Join-Path $Client 'habbicons') $set)) -or -not (Test-Path -LiteralPath $config)) { return }
+    try { $settings = Get-Content -LiteralPath $config -Raw -Encoding UTF8 | ConvertFrom-Json }
+    catch { Say '      Kept configuration/renderer-config.json as it is: it is not plain JSON, so the habbicon set was not checked.' 'Yellow'; return }
+    if ($settings.'habbicons.asset.hash' -ne 'default') { return }
+    $settings.'habbicons.asset.hash' = $set
+    Write-Utf8 $config ($settings | ConvertTo-Json -Depth 20)
+    Say "  Habbicons now use the $set set, which has the zombie icons."
 }
 
 function Invoke-DatabaseDump($File) {
@@ -2619,6 +2633,7 @@ function Invoke-Update([switch]$Check, [switch]$Yes, [switch]$Rollback, [switch]
         $script:EmulatorStopped = $false
         $script:Work = $null
         try {
+            if (-not $Rollback -and -not $Check) { Use-CurrentHabbicons (Join-Path $HotelRoot 'client') }
             if ($Rollback) { Restore-LastBackup }
             elseif ($Assets) { Update-HotelFiles -Check:$Check }
             else { Update-Hotel -Check:$Check }
