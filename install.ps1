@@ -2234,7 +2234,9 @@ function Copy-ClientSettings($Old, $New) {
         $defaults = Get-Content (Join-Path $rendered $file) -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($shipped.ContainsKey($file)) { $defaults = Merge-Json $shipped[$file] $defaults }
         if (-not (Test-Path $target)) { Write-Utf8 $target ($defaults | ConvertTo-Json -Depth 20); continue }
-        if ($file -eq 'renderer-config.json' -and (Invoke-RendererHabbicons $target) -eq 'invalid') {
+        $renderer = $null
+        if ($file -eq 'renderer-config.json') { try { $renderer = Invoke-RendererHabbicons $target } catch { } }
+        if ($renderer -eq 'invalid') {
             Say "      Kept configuration/$file as it is: it is not plain JSON, so no new settings were added." 'Yellow'
             continue
         }
@@ -2278,7 +2280,8 @@ function Use-CurrentHabbicons($Client) {
     $config = Join-Path $Client 'configuration/renderer-config.json'
     if (-not (Test-Path -LiteralPath (Join-Path $Client "habbicons/$set") -PathType Container)) { return }
     if (-not (Test-Path -LiteralPath $config -PathType Leaf)) { return }
-    switch (Invoke-RendererHabbicons $config $set) {
+    try { $result = Invoke-RendererHabbicons $config $set } catch { return }
+    switch ($result) {
         'invalid' { Say '      Kept configuration/renderer-config.json as it is: it is not plain JSON, so the habbicon set was not checked.' 'Yellow' }
         'updated' { Say "  Habbicons now use the $set set, which has the zombie icons." }
     }

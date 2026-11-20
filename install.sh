@@ -2771,7 +2771,7 @@ JS
 use_current_habbicons() {
     local config=$1/configuration/renderer-config.json set=habbo-225e1f8a result
     [ -d "$1/habbicons/$set" ] && [ -f "$config" ] || return 0
-    result=$(renderer_habbicons "$config" "$set")
+    result=$(renderer_habbicons "$config" "$set") || return 0
     case "$result" in
         invalid) say "      ${yellow}Kept configuration/renderer-config.json as it is: it is not plain JSON, so the habbicon set was not checked.${reset}" ;;
         updated) say "  Habbicons now use the $set set, which has the zombie icons." ;;
