@@ -76,9 +76,10 @@ make_emulator_release() { # make_emulator_release <tag>
     (cd "$RELEASES/$1" && sha256sum plusemu-linux-x64.tar.gz > SHA256SUMS)
 }
 
-make_client_release() { # make_client_release <tag>
+make_client_release() { # make_client_release <tag> [habbicon set the release ships]
     local dir=$TEST_DIR/build/$1
     mkdir -p "$dir/assets" "$dir/configuration" "$dir/plugins" "$RELEASES/$1"
+    if [ -n "${2:-}" ]; then mkdir -p "$dir/habbicons/$2" && printf 'icons\n' > "$dir/habbicons/$2/icons.png"; fi
     printf 'client %s\n' "$1" > "$dir/index.html"
     printf 'bundle\n' > "$dir/assets/index-$1.js"
     # The release ships its own default settings; the updater adds the ones a hotel lacks.
@@ -86,7 +87,7 @@ make_client_release() { # make_client_release <tag>
     printf '{"socket.url": "wss://example.invalid/game", "room.planes.direct": true}\n' > "$dir/configuration/renderer-config.json.example.json"
     printf '{"pets": []}\n' > "$dir/configuration/pets.json"
     printf 'builder\n' > "$dir/plugins/room-builder.js"
-    (cd "$dir" && python3 -m zipfile -c "$RELEASES/$1/volt-client.zip" index.html assets configuration plugins)
+    (cd "$dir" && python3 -m zipfile -c "$RELEASES/$1/volt-client.zip" index.html assets configuration plugins ${2:+habbicons})
 }
 
 # Each run gets its own process state; set -e is re-enabled because a negated subshell disables it.
@@ -397,5 +398,59 @@ grep -qx "CLIENT_VERSION='v1.0.0'" "$VERSIONS_FILE"
 : > "$TEST_DIR/terminal"
 run_update --yes
 grep -qi 'everything is up to date' "$TEST_DIR/terminal"
+
+# The stock habbicon set "default" lacks the zombie icons, so every run moves a hotel on it to the set its client ships.
+renderer=$client/configuration/renderer-config.json
+set_habbicons() { jq --arg set "$1" '."habbicons.asset.hash" = $set' "$renderer" > "$TEST_DIR/renderer" && cat "$TEST_DIR/renderer" > "$renderer"; }
+habbicons() { jq -r '."habbicons.asset.hash"' "$renderer"; }
+set_habbicons default
+chmod 644 "$renderer"
+# A client without the new set keeps the old one.
+run_update --yes
+[[ $(habbicons) == default ]]
+mkdir -p "$client/habbicons/habbo-225e1f8a"
+cp "$renderer" "$TEST_DIR/renderer-before"
+run_update --check
+cmp "$renderer" "$TEST_DIR/renderer-before"
+: > "$TEST_DIR/calls"
+: > "$TEST_DIR/terminal"
+run_update --yes
+[[ $(habbicons) == habbo-225e1f8a ]]
+[[ $(jq -r '."socket.url"' "$renderer") == wss://custom.example.com/game && $(jq -r '."my.setting"' "$renderer") == 1 ]]
+[[ $(stat -c %a "$renderer") == 644 ]]
+grep -Fq habbo-225e1f8a "$TEST_DIR/terminal"
+grep -qi 'everything is up to date' "$TEST_DIR/terminal"
+if grep -q 'systemctl' "$TEST_DIR/calls"; then exit 1; fi
+: > "$TEST_DIR/terminal"
+run_update --yes
+if grep -Fq habbo-225e1f8a "$TEST_DIR/terminal"; then exit 1; fi
+# A set the owner chose stays.
+set_habbicons my-icons
+run_update --yes
+run_update --assets
+[[ $(habbicons) == my-icons ]]
+# --assets moves the stock set too.
+set_habbicons default
+: > "$TEST_DIR/terminal"
+run_update --assets
+[[ $(habbicons) == habbo-225e1f8a ]]
+grep -Fq habbo-225e1f8a "$TEST_DIR/terminal"
+# A file that is not plain JSON is kept as it is, with a note.
+cp "$renderer" "$TEST_DIR/renderer-json"
+printf '{\n    // mine\n    "habbicons.asset.hash": "default"\n}\n' > "$renderer"
+cp "$renderer" "$TEST_DIR/renderer-before"
+: > "$TEST_DIR/terminal"
+run_update --yes
+cmp "$renderer" "$TEST_DIR/renderer-before"
+grep -Fq 'not plain JSON' "$TEST_DIR/terminal"
+# A client update gives the same result, also when the installed client lacks the new set.
+cp "$TEST_DIR/renderer-json" "$renderer"
+set_habbicons default
+rm -rf "$client/habbicons"
+make_client_release v1.1.0 habbo-225e1f8a
+LATEST_CLIENT=v1.1.0
+run_update --yes
+[[ $(< "$client/index.html") == 'client v1.1.0' && -f "$client/habbicons/habbo-225e1f8a/icons.png" ]]
+[[ $(habbicons) == habbo-225e1f8a && $(jq -r '."my.setting"' "$renderer") == 1 ]]
 
 printf 'Bash update checks passed\n' >&4
