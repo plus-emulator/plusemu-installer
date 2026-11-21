@@ -301,6 +301,9 @@ keep_unclear_site() { # keep_unclear_site <site>
 keep_unclear_site "$old_site"$'\n'"$old_site"
 keep_unclear_site "$(sed '/external_flash_texts|external_variables/,/^    }$/ {/^    }$/d}' <<< "$old_site")"
 keep_unclear_site $'server {\n    location = /api/client/air.json {\n        proxy_pass http://127.0.0.1:8080;'
+# Braces inside quotes or after a # in a value are not counted, so an old AIR block with them is left as it is.
+keep_unclear_site "$(sed '/external_flash_texts|external_variables/,/^    }$/ s/^    }$/        add_header X-A "{";\n\t}\n\tlocation \/mine\/ {\n\t\tadd_header X-B "}";\n\t\treturn 204;\n\t}/' <<< "$old_site")"
+keep_unclear_site "$(sed '/external_flash_texts|external_variables/,/^    }$/ s/^    }$/        if ($arg_old) { return 302 \/#\/home; }\n\t}\n\tlocation \/mine\/ {\n\t\treturn 204;\n\t} location \/x#y {\n\t\treturn 204;\n\t}/' <<< "$old_site")"
 # A site nginx rejects goes back to what it was.
 printf '%s\n' "$original" > "$site"
 nginx() { [ "$1" != -t ]; }
