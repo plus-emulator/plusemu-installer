@@ -1356,20 +1356,20 @@ EOF
 }
 
 add_air_route() { # adds the stock AIR client blocks to a site written by an older installer, or puts them in place of the old ones
-    # Changes the owner made inside the four AIR blocks are replaced. Every other line of the site stays.
+    # An old AIR block starts with the same line as the stock one and ends where its braces close. Changes inside it are replaced.
+    # The count does not read quotes, escapes or a # inside a value, so a block with them, or any other unclear block, leaves the site as it is.
     local site=$NGINX_DIR/sites-available/hotel.conf block previous updated
     [ -f "$site" ] || return 1
     block=$(air_locations)
     previous=$(cat "$site")
-    # An old AIR block starts with the same line as the stock one and ends where its braces close.
-    # A start line that occurs twice, a server-level line inside a block, or a block that does not close leaves the site as it is.
     updated=$(BLOCK=$block awk '
         function braces(line) { sub(/#.*/, "", line); return gsub(/\{/, "", line) - gsub(/\}/, "", line) }
         BEGIN { n = split(ENVIRON["BLOCK"], lines, "\n"); for (i = 1; i <= n; i++) if (lines[i] ~ /^    (# AIR client:|location )/) air[lines[i]] = 1 }
         ($0 in air) && seen[$0]++ { unclear = 1; exit }
         skip {
-            depth += braces($0)
-            if (depth < 0 || (depth > 0 && $0 ~ /^    [^ ]/) || (depth == 0 && $0 !~ /^[ \t]*\}[ \t]*(#.*)?$/)) { unclear = 1; exit }
+            code = $0; sub(/#.*/, "", code)
+            depth += braces(code)
+            if ($0 ~ /[^ \t]#/ || code ~ /["\047\\]/ || depth < 0 || (depth > 0 && $0 ~ /^    [^ ]/) || (depth == 0 && $0 !~ /^[ \t]*\}[ \t]*(#.*)?$/)) { unclear = 1; exit }
             skip = depth > 0
             next
         }
