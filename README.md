@@ -54,6 +54,8 @@ The installer asks these questions. Press Enter to accept a suggested answer:
 
 After you confirm, the installer runs on its own in about 10 minutes. A [local install](#local-install) asks only questions 3 to 5.
 
+To let players also use Habbo's AIR desktop client, add `--with-air` (Linux) or `-WithAir` (Windows). See [Habbo AIR client](#habbo-air-client).
+
 ## Local install
 
 A local install puts the whole hotel on your own PC, to try PlusEMU or to develop on it. The hotel runs at `http://localhost`, and only this PC can open it. **It is not for a public hotel:** it has no HTTPS, no Cloudflare and no server protection.
@@ -406,6 +408,65 @@ To stop managing CrowdSec, run the installer again with `PLUSEMU_CROWDSEC=0`. fa
 
 **Windows:** the Windows installer does not install CrowdSec. CrowdSec reads the visitor's address from the web server log, and IIS logs the address that connects to it, which is always Cloudflare's. CrowdSec on Windows would ban Cloudflare instead of attackers, or with Cloudflare on its whitelist, it could never ban a website visitor.
 
+## Habbo AIR client
+
+With this option, players can play the hotel with Habbo's AIR desktop client through [HabboCustomLauncher](https://github.com/DennisObject/HabboCustomLauncher/releases). Volt keeps working as before. Without the option, the installer changes nothing about the AIR client.
+
+**New hotel or rerun:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash -s -- --with-air
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.ps1))) -WithAir
+```
+
+**Installed hotel:**
+
+```bash
+sudo plusemu-update --with-air
+```
+
+```powershell
+plusemu-update -WithAir
+```
+
+`PLUSEMU_AIR=1` does the same as the option. The choice is saved (`AIR='yes'` in `/etc/plusemu/hotel.env`, `"Air": true` in `C:\ProgramData\PlusEMU\hotel.json`), so every later rerun and `plusemu-update` keeps the AIR client on and installs the newest AIR client version with each new emulator.
+
+**What it sets up**
+- Downloads the AIR client list from `https://assets.plusemu.dev/air/latest.json`, then Habbo's AIR texts. It checks their SHA-256 and saves them in the emulator's `Config/air/` folder. When a download fails, a new setup stops; a hotel that already has the texts keeps them.
+- Creates the emulator's handshake key `Config/rsa-private.pem` once, with `"Plus Emulator" --generate-rsa-key`. It never replaces an existing key: players' clients carry its public part.
+- Sets `Flash` to `0.0.0.0:30000`, `Encryption.RsaPrivateKeyFile`, and the `AirClient` settings in `Config/config.json`: the website address, the texts, the hotel's `ExternalTexts.json` and `ProductData.json`, badge and catalogue images from `/hotel-files/c_images/`, the game address and port, and the client download. Your other settings stay.
+- Game address: with a Cloudflare token, the installer adds a DNS-only (not proxied) record `game.<domain>`, because Cloudflare's proxy does not carry the client's game connection. Without a token, the client connects to the server's IPv4 address. Add the name later with `sudo PLUSEMU_CLOUDFLARE_TOKEN=<token> plusemu-update --with-air` (Windows: `$env:PLUSEMU_CLOUDFLARE_TOKEN = '<token>'; plusemu-update -WithAir`).
+- Opens TCP port 30000 to every address (ufw on Linux, the `plusemu-air-30000` rule on Windows). The website itself still accepts HTTPS from Cloudflare only.
+- Passes `/api/client/air.json`, `/api/client/air-ticket`, `/api/client/air-launcher-token`, `/gamedata/hashes` and the four `/gamedata/<file>/<hash>` paths to the emulator (nginx `location` blocks, or the IIS rule `PlusEMU AIR client`).
+- Sets `AIR_CLIENT_ENABLED=true` for Atom CMS and refreshes its caches, so the website shows the **Open AIR client** button.
+- Checks that `air.json`, `/gamedata/hashes` and port 30000 answer, and adds these checks to the [health check](#health-check-and-discord-alerts).
+
+A [local install](#local-install) uses `127.0.0.1` for the game port and changes no firewall or DNS.
+
+**What players do**
+1. Install HabboCustomLauncher from https://github.com/DennisObject/HabboCustomLauncher/releases.
+2. Open the hotel's website, sign in and press **Open AIR client**. Or type the hotel's domain as the hotel domain in the launcher.
+
+### A new Habbo AIR client (maintainers)
+
+When Habbo releases a new AIR client, build the patched client and publish it with [`tools/patch-air-client.py`](tools/patch-air-client.py). Hotels get it with their next `plusemu-update`.
+
+```bash
+python3 tools/patch-air-client.py build --out dist
+CLOUDFLARE_API_TOKEN=... python3 tools/patch-air-client.py publish dist
+```
+
+Habbo blocks many data center addresses. When `build` fails with HTTP 403 or 463, download `HabboWin.zip` and the two text files yourself, and pass them in:
+
+```bash
+python3 tools/patch-air-client.py build --zip HabboWin.zip --habbo-version 38 --texts <folder with external_variables.txt and external_flash_texts.txt> --out dist
+```
+
+`python3 tools/patch-air-client.py check` tells whether the published client is Habbo's newest.
+
 ## One-command updates
 
 Hotels set up with this installer update the emulator, the client and the hotel files in place, on Linux and on Windows.
@@ -437,12 +498,14 @@ plusemu-update
 - Installs the newest hotel files pack (furniture, clothing, effects, badges, texts, icons, sounds, about 550 MB) whenever it changed, so the hotel never misses stock content. Files you added to `hotel-files` stay. The emulator's clothing data (`Config/figuredata.xml`) is replaced by the release's one that matches the pack.
 - Keeps your `Config/` and `configuration/` files and anything you added. New settings are added, your own values stay.
 - Sets up the camera when the new emulator release has it (see [Camera on an installed hotel](#camera-on-an-installed-hotel)).
+- With the [AIR client](#habbo-air-client) on: installs the newest AIR texts and client version, and keeps the handshake key.
 - Restores the backup automatically if any step fails.
 
 **Options** (Linux `--check`, Windows `-Check`, and so on)
 - `check`: show available updates, change nothing.
 - `yes`: update without the "Update now?" question.
 - `install-camera`: set up the camera only, without updating anything (see [Camera on an installed hotel](#camera-on-an-installed-hotel)).
+- `with-air`: turn on the AIR client, without updating anything. Later updates keep it on (see [Habbo AIR client](#habbo-air-client)).
 - `rollback`: restore the last backup. The database goes back too, so progress since then is lost.
 - `assets`: hotel files only, without stopping the emulator. Adds every stock file the hotel lacks and leaves the files it already has as they are. Only the `gamedata` index (clothing, effects, products, texts) is replaced; the previous one is kept in the backups folder as `gamedata-<version>`. Run the full update afterwards when new clothing does not show: the emulator's clothing data comes with it.
 
@@ -562,6 +625,7 @@ To install without questions, set the answers in environment variables:
 | `PLUSEMU_ADMIN_USER` | Admin username (default `admin`) |
 | `PLUSEMU_ADMIN_EMAIL` | Admin email (default `admin@<domain>`, or `admin@localhost.test` for a local install) |
 | `PLUSEMU_YES=1` | Skip the confirmation question |
+| `PLUSEMU_AIR=1` | Set up the [Habbo AIR client](#habbo-air-client) (the same as `--with-air` or `-WithAir`). Once on, it stays on. |
 | `PLUSEMU_CLOUDFLARE_TOKEN` | Cloudflare API token for [Connect Cloudflare automatically](#connect-cloudflare-automatically). It is used once and never saved. Without it, `PLUSEMU_YES=1` skips that step. |
 
 ```bash
