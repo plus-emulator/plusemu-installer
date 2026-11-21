@@ -270,11 +270,37 @@ server {
     # my note after the hotel files
 }
 EOF
+old_site=$(cat "$site")
 : > "$TEST_DIR/calls"
 add_air_route
 grep -qxF '    # my note after the hotel files' "$site"
 [ "$(grep -vxF '    # my note after the hotel files' "$site")" = "$routed" ]
 grep -q 'systemctl reload nginx' "$TEST_DIR/calls"
+# An old AIR block ends where its braces close, so the owner's lines after it stay.
+replace_old_air() { # replace_old_air <site>: the AIR blocks become the stock ones and the rest stays
+    printf '%s\n' "$1" > "$site"
+    : > "$TEST_DIR/calls"
+    add_air_route
+    grep -qxF '    location /hotel-files/ {' "$site"
+    grep -qxF '    # my note after the hotel files' "$site"
+    [ "$(grep -cxF '        proxy_set_header X-Real-IP $remote_addr;' "$site")" = 4 ]
+    [ "$(grep -vxF '    # my note after the hotel files' "$site")" = "$routed" ]
+    grep -q 'systemctl reload nginx' "$TEST_DIR/calls"
+}
+replace_old_air "$(sed '/external_flash_texts|external_variables/,/^    }$/ s/^    }$/    } # mine/' <<< "$old_site")"
+replace_old_air "$(sed '/# AIR client:/,/# Furniture/ s/^    }$/    } /' <<< "$old_site")"
+replace_old_air "$(sed 's/^        limit_except GET HEAD { deny all; }$/&\n        # an old note with a {/' <<< "$old_site")"
+# A site whose old AIR blocks cannot be told apart from the rest is left as it is.
+keep_unclear_site() { # keep_unclear_site <site>
+    printf '%s\n' "$1" > "$site"
+    : > "$TEST_DIR/calls"
+    if add_air_route; then echo 'an unclear site was changed'; exit 1; fi
+    [ "$(cat "$site")" = "$1" ]
+    if grep -q 'systemctl reload nginx' "$TEST_DIR/calls"; then echo 'nginx reloaded an unclear site'; exit 1; fi
+}
+keep_unclear_site "$old_site"$'\n'"$old_site"
+keep_unclear_site "$(sed '/external_flash_texts|external_variables/,/^    }$/ {/^    }$/d}' <<< "$old_site")"
+keep_unclear_site $'server {\n    location = /api/client/air.json {\n        proxy_pass http://127.0.0.1:8080;'
 # A site nginx rejects goes back to what it was.
 printf '%s\n' "$original" > "$site"
 nginx() { [ "$1" != -t ]; }
