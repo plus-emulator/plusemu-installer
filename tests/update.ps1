@@ -509,6 +509,58 @@ try {
     Invoke-TestUpdate -Yes
     Assert ((Get-Text (Join-Path $client 'index.html')) -eq 'client v1.1.0') 'The client with the new habbicon set was not installed'
     Assert ((Get-Habbicons) -eq 'habbo-225e1f8a' -and (Get-Json $rendererFile).'my.setting' -eq 1) 'A client update kept the stock habbicon set or lost a setting'
+
+    # A hotel with the AIR client keeps it on: an update brings the newest AIR texts and client, and keeps the handshake key.
+    $AirManifestUrl = 'https://assets.test/air/latest.json'
+    $AirPort = 30000
+    $script:ServerIp = '192.0.2.10'
+    $airFiles = Join-Path $testDir 'air'
+    New-Item -ItemType Directory -Force $airFiles | Out-Null
+    Set-Content (Join-Path $airFiles 'external_variables.txt') 'flash.client.url=40-1'
+    Set-Content (Join-Path $airFiles 'external_flash_texts.txt') 'texts=40-1'
+    function Get-Sha($Name) { return (Get-FileHash (Join-Path $airFiles $Name) -Algorithm SHA256).Hash.ToLower() }
+    Write-Utf8 (Join-Path $airFiles 'latest.json') (@{
+        version = '40-1'; client = @{ url = 'https://assets.test/air/client/40-1/HabboWin.zip' }
+        externalVariables = @{ url = 'https://assets.test/air/external_variables.txt'; sha256 = Get-Sha 'external_variables.txt' }
+        externalFlashTexts = @{ url = 'https://assets.test/air/external_flash_texts.txt'; sha256 = Get-Sha 'external_flash_texts.txt' }
+    } | ConvertTo-Json -Depth 5)
+    $releaseCurl = (Get-Item function:Invoke-Curl).ScriptBlock
+    function Invoke-Curl([string[]]$Arguments) {
+        $url = $Arguments | Where-Object { $_ -like 'https://assets.test/air/*' } | Select-Object -First 1
+        if (-not $url) { return & $releaseCurl $Arguments }
+        $file = Join-Path $airFiles ($url -replace '^.*/', '')
+        if (-not (Test-Path $file)) { return @{ Code = 22; Output = '' } }
+        Copy-Item $file $Arguments[[Array]::IndexOf($Arguments, '-o') + 1] -Force
+        return @{ Code = 0; Output = '' }
+    }
+    function Set-AirServer { $Calls.Add('air server') }
+    function Test-AirClient { $Calls.Add('air check'); return $null }
+    $saved = Get-Json $StateFile
+    $saved | Add-Member -NotePropertyName Air -NotePropertyValue $true -Force
+    $saved | Add-Member -NotePropertyName AirGameHost -NotePropertyValue 'game.example.com' -Force
+    $saved | ConvertTo-Json | Set-Content $StateFile
+    $installedConfig = Join-Path $emulator 'Config'
+    New-Item -ItemType Directory -Force (Join-Path $installedConfig 'air') | Out-Null
+    Set-Content (Join-Path (Join-Path $installedConfig 'air') 'external_variables.txt') 'old'
+    Set-Content (Join-Path (Join-Path $installedConfig 'air') 'external_flash_texts.txt') 'old'
+    Set-Content (Join-Path $installedConfig 'rsa-private.pem') 'the hotel key'
+    New-EmulatorRelease 'v3.0.0'
+    $build = Join-Path (Join-Path $testDir 'build') 'v3.0.0'
+    Write-Bom (Join-Path (Join-Path $build 'Config') 'config.json') '{"Database": {"Password": ""}, "Flash": {"Hostname": "127.0.0.1", "Port": 1232}, "Encryption": {"RsaPrivateKeyFile": ""}, "AirClient": {"GameHost": "", "GamePorts": "30000"}}'
+    Compress-Archive -Path (Join-Path $build '*') -DestinationPath (Join-Path (Join-Path $Releases 'v3.0.0') 'plusemu-win-x64.zip') -Force
+    Write-Sums (Join-Path $Releases 'v3.0.0') 'plusemu-win-x64.zip'
+    $script:LatestEmulator = 'v3.0.0'
+    $Calls.Clear()
+    Invoke-TestUpdate -Yes
+    $updated = Get-Json (Join-Path $installedConfig 'config.json')
+    Assert ((Get-Text (Join-Path $emulator 'Plus Emulator.exe')) -eq 'emulator v3.0.0') 'The AIR hotel was not updated'
+    Assert ((Get-Text (Join-Path $installedConfig 'rsa-private.pem')) -eq 'the hotel key') 'The update replaced the handshake key'
+    Assert ((Get-Text (Join-Path (Join-Path $installedConfig 'air') 'external_flash_texts.txt')) -eq 'texts=40-1') 'The update kept old AIR texts'
+    Assert ($updated.Flash.Hostname -eq '0.0.0.0' -and $updated.Flash.Port -eq 30000) "Flash: $($updated.Flash | ConvertTo-Json -Compress)"
+    Assert ($updated.AirClient.GameHost -eq 'game.example.com' -and $updated.AirClient.ClientVersion -eq '40-1') "AirClient: $($updated.AirClient | ConvertTo-Json -Compress)"
+    Assert ($updated.Database.Password -eq 'database-secret') 'The update lost the database password'
+    Assert ($Calls -contains 'air server' -and $Calls -contains 'air check') "Calls: $($Calls -join '; ')"
+    Assert ((Get-Json $StateFile).Air -eq $true) 'The update turned the AIR client off'
     Write-Host 'PowerShell update checks passed'
 } catch {
     Write-Host "Failed: $_" -ForegroundColor Red

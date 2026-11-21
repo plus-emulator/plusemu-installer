@@ -58,6 +58,9 @@ curl() {
             if [[ " $* " == *' -w '* ]]; then printf 200; fi ;;
         http://127.0.0.1:8080/*)
             if [[ " $* " == *' -w '* ]]; then printf 200; fi ;;
+        https://assets.test/air/*)
+            [ -f "$RELEASES/air/${url##*/}" ] || return 22
+            cp "$RELEASES/air/${url##*/}" "$out" ;;
         *) return 7 ;;
     esac
 }
@@ -470,5 +473,59 @@ LATEST_CLIENT=v1.1.0
 run_update --yes
 [[ $(< "$client/index.html") == 'client v1.1.0' && -f "$client/habbicons/habbo-225e1f8a/icons.png" ]]
 [[ $(habbicons) == habbo-225e1f8a && $(jq -r '."my.setting"' "$renderer") == 1 ]]
+
+# A hotel with the AIR client keeps it on: an update brings the newest AIR texts and client, and keeps the handshake key.
+AIR_MANIFEST_URL=https://assets.test/air/latest.json
+publish_air() { # publish_air <version>
+    mkdir -p "$RELEASES/air"
+    printf 'flash.client.url=%s\n' "$1" > "$RELEASES/air/external_variables.txt"
+    printf 'texts=%s\n' "$1" > "$RELEASES/air/external_flash_texts.txt"
+    jq -n --arg version "$1" --arg variables "$(sha256sum "$RELEASES/air/external_variables.txt" | cut -d' ' -f1)" \
+        --arg texts "$(sha256sum "$RELEASES/air/external_flash_texts.txt" | cut -d' ' -f1)" '{
+        version: $version, client: {url: "https://assets.test/air/client/\($version)/HabboWin.zip"},
+        externalVariables: {url: "https://assets.test/air/external_variables.txt", sha256: $variables},
+        externalFlashTexts: {url: "https://assets.test/air/external_flash_texts.txt", sha256: $texts}}' > "$RELEASES/air/latest.json"
+}
+make_air_emulator_release() { # make_air_emulator_release <tag>: a release whose defaults have the AirClient settings
+    make_emulator_release "$1"
+    printf '{"Database": {"Password": ""}, "Flash": {"Hostname": "127.0.0.1", "Port": 1232}, "Encryption": {"RsaPrivateKeyFile": ""}, "AirClient": {"GameHost": "", "GamePorts": "30000"}}\n' \
+        > "$TEST_DIR/build/$1/Config/config.json"
+    tar -C "$TEST_DIR/build/$1" -czf "$RELEASES/$1/plusemu-linux-x64.tar.gz" .
+    (cd "$RELEASES/$1" && sha256sum plusemu-linux-x64.tar.gz > SHA256SUMS)
+}
+for name in add_air_route air_firewall air_website; do eval "$name() { echo '$name' >> \"\$TEST_DIR/calls\"; }"; done
+air_check() { echo air_check >> "$TEST_DIR/calls"; }
+SERVER_IP=192.0.2.10
+printf "AIR='yes'\nAIR_GAME_HOST='game.example.com'\n" >> "$STATE_FILE"
+mkdir -p "$emulator/Config/air"
+printf 'old texts\n' > "$emulator/Config/air/external_variables.txt"
+printf 'old texts\n' > "$emulator/Config/air/external_flash_texts.txt"
+printf 'the hotel key\n' > "$emulator/Config/rsa-private.pem"
+jq '.Encryption.RsaPrivateKeyFile = "rsa-private.pem"' "$emulator/Config/config.json" > "$TEST_DIR/config" && cat "$TEST_DIR/config" > "$emulator/Config/config.json"
+publish_air 38-1
+make_air_emulator_release v3.0.0
+LATEST_EMULATOR=v3.0.0
+: > "$TEST_DIR/calls"
+run_update --yes
+config=$emulator/Config/config.json
+[[ $(< "$emulator/Plus Emulator") == 'emulator v3.0.0' ]]
+[[ $(< "$emulator/Config/rsa-private.pem") == 'the hotel key' ]]
+[[ $(< "$emulator/Config/air/external_flash_texts.txt") == 'texts=38-1' ]]
+[[ $(jq -r .Flash.Hostname "$config") == 0.0.0.0 && $(jq -r .Flash.Port "$config") == 30000 ]]
+[[ $(jq -r .AirClient.GameHost "$config") == game.example.com && $(jq -r .AirClient.ClientVersion "$config") == 38-1 ]]
+[[ $(jq -r .AirClient.UrlPrefix "$config") == https://example.com && $(jq -r .Encryption.RsaPrivateKeyFile "$config") == rsa-private.pem ]]
+[[ $(jq -r .Custom "$config") == kept && $(jq -r .Database.Password "$config") == database-secret ]]
+grep -qx add_air_route "$TEST_DIR/calls" && grep -qx air_firewall "$TEST_DIR/calls" && grep -qx air_website "$TEST_DIR/calls" && grep -qx air_check "$TEST_DIR/calls"
+grep -qx "AIR='yes'" "$STATE_FILE"
+# When the AIR files cannot be downloaded, the update still works and the hotel keeps the AIR texts and client it had.
+rm "$RELEASES/air/latest.json"
+make_air_emulator_release v3.1.0
+LATEST_EMULATOR=v3.1.0
+: > "$TEST_DIR/terminal"
+run_update --yes
+[[ $(< "$emulator/Plus Emulator") == 'emulator v3.1.0' ]]
+[[ $(< "$emulator/Config/air/external_flash_texts.txt") == 'texts=38-1' && $(jq -r .AirClient.ClientVersion "$config") == 38-1 ]]
+[[ $(< "$emulator/Config/rsa-private.pem") == 'the hotel key' ]]
+grep -q 'keeps the texts it had' "$TEST_DIR/terminal"
 
 printf 'Bash update checks passed\n' >&4

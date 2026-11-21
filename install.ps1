@@ -23,8 +23,10 @@
 #   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.ps1))) -Update
 # -WithAssets is accepted for older instructions and ignored: the hotel files are always part of an update.
 # Set up the camera on a hotel that is already installed: plusemu-update -InstallCamera
+# -WithAir (or PLUSEMU_AIR=1) sets up the Habbo AIR client for players who use HabboCustomLauncher. Updates keep it on.
+# Turn it on for a hotel that is already installed: plusemu-update -WithAir
 
-param([string]$GuideMode, [switch]$Local, [switch]$Update, [switch]$Check, [switch]$Yes, [switch]$Rollback, [switch]$Assets, [switch]$WithAssets, [switch]$InstallCamera)
+param([string]$GuideMode, [switch]$Local, [switch]$Update, [switch]$Check, [switch]$Yes, [switch]$Rollback, [switch]$Assets, [switch]$WithAssets, [switch]$InstallCamera, [switch]$WithAir)
 
 function Get-Setting($Name, $Default) {
     $value = [Environment]::GetEnvironmentVariable($Name)
@@ -81,6 +83,10 @@ $script:Log        = "$StateDir\install.log"
 $PhpDir     = 'C:\PHP'
 $NodeMajor  = 22
 $MariaDbSeries = '11.4'
+# The patched AIR client and Habbo's AIR texts, published by tools/patch-air-client.py.
+$AirManifestUrl = Get-Setting 'AIR_MANIFEST_URL' 'https://assets.plusemu.dev/air/latest.json'
+# The AIR client's game port: the emulator's Flash listener, open to every address.
+$AirPort = 30000
 $script:TotalSteps = 13
 $script:Step = 0
 
@@ -487,9 +493,13 @@ function Read-Answers {
         $script:state = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
         $isLocal = Resolve-Local ([bool]$state.Local)
         $selectedMode = Resolve-GuideMode $state.GuideMode
+        $air = Resolve-Air ([bool]$state.Air)
+        $airChanged = $air -ne [bool]$state.Air
+        $state | Add-Member -MemberType NoteProperty -Name Air -Value $air -Force
         if ($isLocal) {
             Say 'Found the settings of an earlier run on this PC (http://localhost); continuing that installation.'
             $script:DiscordWebhookNew = $false
+            if ($airChanged) { $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8 }
             return
         }
         Say "Found the settings of an earlier run for $($state.Domain); continuing that installation."
@@ -534,12 +544,14 @@ function Read-Answers {
     }
     $webhook = if ($isLocal) { '' } else { Select-DiscordWebhook '' $false }
     $script:DiscordWebhookNew = [bool]$webhook
+    $air = Resolve-Air $false
 
     Write-Host ''
     Write-Host "  Website:    $(if ($isLocal) { 'http://localhost' } else { "https://$domain" })"
     Write-Host "  WebSocket:  $ws"
     Write-Host "  Hotel name: $name"
     Write-Host "  Admin:      $user ($mail)"
+    if ($air) { Write-Host '  AIR client: on (players can also use HabboCustomLauncher)' }
     if ($isLocal) {
         Write-Host '  Local install: only this PC can open the hotel. There is no HTTPS and no Cloudflare.'
         Write-Host '  The firewall, Windows Update and the account settings of this PC stay as they are.'
@@ -555,7 +567,7 @@ function Read-Answers {
 
     $script:state = [pscustomobject]@{
         Domain = $domain; WsUrl = $ws; HotelName = $name; AdminUser = $user; AdminEmail = $mail
-        GuideMode = $selectedMode; DiscordWebhook = $webhook; Local = $isLocal
+        GuideMode = $selectedMode; DiscordWebhook = $webhook; Local = $isLocal; Air = $air; AirGameHost = ''
         AdminPassword = New-AdminPassword; DbPassword = New-Secret 32; DbRootPassword = New-Secret 32
     }
     $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
@@ -867,6 +879,7 @@ function Start-Emulator {
     $json.Rcon.Hostname = '127.0.0.1'; $json.Rcon.Port = 30001; $json.Rcon.AllowedAddresses = @('127.0.0.1', 'localhost')
     if ($state.Local) { Disable-EmulatorLimits $json }
     Set-CameraSettings $json
+    if ($script:AirReady) { Set-AirSettings $json }
     Write-Utf8 $config ($json | ConvertTo-Json -Depth 20)
     # Every packet is logged at Trace level by default, which floods the log.
     $nlog = "$out\Config\nlog.config"
@@ -1061,6 +1074,7 @@ function Install-Cms {
         RCON_HOST = '127.0.0.1'; RCON_PORT = '30001'; FORCE_HTTPS = $https; SESSION_SECURE_COOKIE = $https
         TRUSTED_PROXIES = ($proxies -join ',')
     }
+    if ($script:AirReady) { $settings.AIR_CLIENT_ENABLED = 'true' }
     foreach ($key in $settings.Keys) { Set-EnvValue $envFile $key $settings[$key] }
 
     $env:COMPOSER_ALLOW_SUPERUSER = '1'; $env:COMPOSER_NO_INTERACTION = '1'
@@ -1253,6 +1267,7 @@ function Set-IisSite {
     $action = "$rules/rule[@name='PlusEMU endpoints']/action"
     Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'type' -Value 'Rewrite'
     Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'url' -Value 'http://127.0.0.1:8080/api/{R:1}'
+    if ($script:AirReady) { Set-AirWebsite }
 
     # IIS needs to read the website, and write Atom's storage and cache.
     Run icacls.exe "$HotelRoot\cms" /grant 'IIS_IUSRS:(OI)(CI)RX' 'IUSR:(OI)(CI)RX' /Q
@@ -1273,6 +1288,10 @@ function Set-IisSite {
         }
     }
     Ok 'Firewall allows HTTP and HTTPS (the database and emulator stay private)'
+    if ($script:AirReady) {
+        Set-AirFirewall
+        Ok "Firewall allows the AIR client's game port $AirPort from every address (rule plusemu-air-$AirPort)"
+    }
     Write-CloudflareCommand
     # The health check reads the result from the Cloudflare log.
     $installLog = $script:Log
@@ -1509,10 +1528,353 @@ function Protect-Server {
     Write-HealthCommand
 }
 
+# ---------------------------------------------------------------- AIR client
+
+# Once on, the AIR client stays on: players' launchers keep the hotel's game address and handshake key.
+function Resolve-Air($Saved) { return [bool]($WithAir -or (Get-Setting 'PLUSEMU_AIR' '') -eq '1' -or $Saved) }
+
+# The release has the AirClient settings, so it serves the AIR client.
+function Test-AirSupport($Emulator) {
+    try { $json = Get-Content (Join-Path (Join-Path $Emulator 'Config') 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $false }
+    return [bool]($json -and $json.PSObject.Properties['AirClient'])
+}
+
+function Test-AirFiles($ConfigDir) {
+    foreach ($name in 'external_variables.txt', 'external_flash_texts.txt') {
+        $file = Join-Path (Join-Path $ConfigDir 'air') $name
+        if (-not (Test-Path $file) -or (Get-Item $file).Length -eq 0) { return $false }
+    }
+    return $true
+}
+
+# Downloads Habbo's AIR texts from the published list into <ConfigDir>\air. Returns $false, with the reason in
+# $script:AirError, when a download fails or does not match its checksum; the old files then stay.
+function Get-AirFiles($ConfigDir) {
+    $tmp = Join-Path $Downloads "air-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    try {
+        $list = Join-Path $tmp 'latest.json'
+        $manifest = $null
+        if ((Invoke-Curl @('-fsSL', '--retry', '3', '--max-time', '60', '-o', $list, $AirManifestUrl)).Code -eq 0) {
+            try { $manifest = Get-Content $list -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+        }
+        $entries = @(@{ Key = 'externalVariables'; Name = 'external_variables.txt' }, @{ Key = 'externalFlashTexts'; Name = 'external_flash_texts.txt' })
+        $valid = [bool]($manifest -and "$($manifest.version)" -and "$($manifest.client.url)".StartsWith('https://'))
+        foreach ($entry in $entries) {
+            $item = if ($manifest) { $manifest.($entry.Key) }
+            if (-not $item -or -not "$($item.url)".StartsWith('https://') -or "$($item.sha256)" -cnotmatch '^[0-9a-f]{64}$') { $valid = $false }
+        }
+        if (-not $valid) { $script:AirError = "Could not read the AIR client list at $AirManifestUrl."; return $false }
+        foreach ($entry in $entries) {
+            $item = $manifest.($entry.Key)
+            $file = Join-Path $tmp $entry.Name
+            if ((Invoke-Curl @('-fsSL', '--retry', '3', '--max-time', '300', '-o', $file, $item.url)).Code -ne 0 -or
+                -not (Test-Path $file) -or (Get-FileHash $file -Algorithm SHA256).Hash -ne $item.sha256.ToUpper()) {
+                $script:AirError = "The download of $($entry.Name) for the AIR client failed, or it does not match its published checksum."
+                return $false
+            }
+        }
+        $air = Join-Path $ConfigDir 'air'
+        New-Item -ItemType Directory -Force -Path $air | Out-Null
+        foreach ($entry in $entries) { Move-Item (Join-Path $tmp $entry.Name) (Join-Path $air $entry.Name) -Force }
+        $script:AirVersion = "$($manifest.version)"
+        $script:AirClientUrl = "$($manifest.client.url)"
+        return $true
+    } finally {
+        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Habbo's AIR texts. A new setup stops without them; one that has them keeps them; an update goes on without the AIR client.
+# Returns $true when the AIR client has its texts.
+function Get-AirTexts($Emulator, [switch]$Update) {
+    $configDir = Join-Path $Emulator 'Config'
+    if (Get-AirFiles $configDir) { Ok "AIR client $($script:AirVersion): Habbo's AIR texts downloaded and checked"; return $true }
+    if (Test-AirFiles $configDir) { Say "      $script:AirError The AIR client keeps the texts it had. Try again later: plusemu-update -WithAir" 'Yellow'; return $true }
+    if ($Update) { Say "      $script:AirError The AIR client was not set up. Try again later: plusemu-update -WithAir" 'Yellow'; return $false }
+    throw "$script:AirError Check the server's internet connection, then run the installer again."
+}
+
+# The handshake key, made once. An existing key is never replaced, because players' clients carry its modulus.
+function New-AirKey($Emulator) {
+    $configDir = Join-Path $Emulator 'Config'
+    $json = Get-Content (Join-Path $configDir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    $name = if ($json.PSObject.Properties['Encryption']) { "$($json.Encryption.RsaPrivateKeyFile)" } else { '' }
+    if (-not $name) { $name = 'rsa-private.pem' }
+    $file = if ([IO.Path]::IsPathRooted($name)) { $name } else { Join-Path $configDir $name }
+    if ((Test-Path $file) -and (Get-Item $file).Length -gt 0) { return }
+    Run (Join-Path $Emulator 'Plus Emulator.exe') --generate-rsa-key $file
+    if (-not (Test-Path $file)) { throw "Could not create the AIR client's handshake key in $file. See $script:Log" }
+}
+
+# The address the AIR client connects to: game.<domain> once Cloudflare has its DNS-only record, otherwise the server's IPv4 address.
+function Get-AirGameHost {
+    if ($state.Local) { return '127.0.0.1' }
+    if ("$($state.AirGameHost)") { return "$($state.AirGameHost)" }
+    return $ServerIp
+}
+
+# The Flash listener, the handshake key and the AirClient section. Every other setting stays.
+function Set-AirSettings($Json) {
+    $site = Get-SiteUrl
+    $gamedata = Join-Path (Join-Path $HotelRoot 'hotel-files') 'gamedata'
+    foreach ($section in 'Flash', 'Encryption', 'AirClient') {
+        if (-not $Json.PSObject.Properties[$section]) { $Json | Add-Member -MemberType NoteProperty -Name $section -Value ([pscustomobject]@{}) }
+    }
+    # A local hotel is for this PC only, so its game port stays private too.
+    $listen = if ($state.Local) { '127.0.0.1' } else { '0.0.0.0' }
+    $Json.Flash | Add-Member -NotePropertyName Hostname -NotePropertyValue $listen -Force
+    $Json.Flash | Add-Member -NotePropertyName Port -NotePropertyValue $AirPort -Force
+    if (-not "$($Json.Encryption.RsaPrivateKeyFile)") { $Json.Encryption | Add-Member -NotePropertyName RsaPrivateKeyFile -NotePropertyValue 'rsa-private.pem' -Force }
+    $air = $Json.AirClient
+    $variables = if ($air.Variables -is [Management.Automation.PSCustomObject]) { $air.Variables } else { [pscustomobject]@{} }
+    $ours = [ordered]@{
+        'external.texts.txt' = "$site/gamedata/external_flash_texts/1"
+        'external.override.texts.txt' = "$site/gamedata/external_flash_texts/1"
+        'badge.image.path' = "$site/hotel-files/c_images/album1584"
+        'image.library.catalogue.url' = "$site/hotel-files/c_images/catalogue/"
+    }
+    foreach ($key in $ours.Keys) { $variables | Add-Member -NotePropertyName $key -NotePropertyValue $ours[$key] -Force }
+    $variablesFiles = @('air/external_variables.txt')
+    $textsFiles = @('air/external_flash_texts.txt', (Join-Path $gamedata 'ExternalTexts.json'))
+    # Add-Member -Force moves a setting to the end, so every run sets the same settings in the same order.
+    $values = [ordered]@{
+        UrlPrefix = $site
+        ExternalVariablesFiles = @($variablesFiles + @($air.ExternalVariablesFiles | Where-Object { $_ -and $_ -notin $variablesFiles }))
+        ExternalTextsFiles = @($textsFiles + @($air.ExternalTextsFiles | Where-Object { $_ -and $_ -notin $textsFiles }))
+        ProductDataFile = Join-Path $gamedata 'ProductData.json'
+        Variables = $variables
+        GameHost = Get-AirGameHost
+        GamePorts = "$AirPort"
+        ClientUrl = if ($script:AirClientUrl) { $script:AirClientUrl } else { "$($air.ClientUrl)" }
+        ClientVersion = if ($script:AirClientUrl) { $script:AirVersion } else { "$($air.ClientVersion)" }
+    }
+    foreach ($key in $values.Keys) { $air | Add-Member -NotePropertyName $key -NotePropertyValue $values[$key] -Force }
+}
+
+# A global rule, like the installer's other rules: Atom's own web.config is reset on every run.
+# It hands the AIR client's launcher settings, login tickets and game data to the emulator.
+function Set-AirWebsite {
+    Import-Module WebAdministration
+    $apphost = 'MACHINE/WEBROOT/APPHOST'
+    $rules = 'system.webServer/rewrite/globalRules'
+    $name = 'PlusEMU AIR client'
+    if (Get-WebConfiguration -PSPath $apphost -Filter "$rules/rule[@name='$name']") { Clear-WebConfiguration -PSPath $apphost -Filter "$rules/rule[@name='$name']" }
+    $variables = 'system.webServer/rewrite/allowedServerVariables'
+    if (-not (Get-WebConfiguration -PSPath $apphost -Filter "$variables/add[@name='HTTP_X_FORWARDED_PROTO']")) {
+        Add-WebConfigurationProperty -PSPath $apphost -Filter $variables -Name '.' -Value @{ name = 'HTTP_X_FORWARDED_PROTO' }
+    }
+    Add-WebConfigurationProperty -PSPath $apphost -Filter $rules -Name '.' -Value @{ name = $name; stopProcessing = 'True' }
+    Set-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='$name']/match" -Name 'url' -Value '^(api/client/(air\.json|air-ticket|air-launcher-token)|gamedata/(hashes|(external_flash_texts|external_variables|furnidata_xml|productdata)/[^/]+))$'
+    Add-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='$name']/conditions" -Name '.' -Value @{ input = '{HTTP_HOST}'; pattern = "^$([regex]::Escape($state.Domain))$" }
+    $proto = if ($state.Local) { 'http' } else { 'https' }
+    Add-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='$name']/serverVariables" -Name '.' -Value @{ name = 'HTTP_X_FORWARDED_PROTO'; value = $proto }
+    $action = "$rules/rule[@name='$name']/action"
+    Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'type' -Value 'Rewrite'
+    Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'url' -Value 'http://127.0.0.1:8080/{R:1}'
+}
+
+function Test-AirFirewallRule {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'   # native stderr is not an error by itself
+    & netsh.exe advfirewall firewall show rule "name=plusemu-air-$AirPort" *> $null
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $previous
+    return $code -eq 0
+}
+
+# The game port is open to every address, because the AIR client connects directly, not through Cloudflare.
+# netsh works where New-NetFirewallRule fails, for example on a renamed administrator account.
+function Set-AirFirewall {
+    if (Test-AirFirewallRule) { return }
+    Run netsh.exe advfirewall firewall add rule "name=plusemu-air-$AirPort" dir=in action=allow protocol=TCP "localport=$AirPort"
+}
+
+# The website's "Open AIR client" button.
+function Set-AirCms {
+    $cms = Join-Path $HotelRoot 'cms'
+    $envFile = Join-Path $cms '.env'
+    if (@(Get-Content $envFile) -contains 'AIR_CLIENT_ENABLED="true"') { return }
+    Set-EnvValue $envFile 'AIR_CLIENT_ENABLED' 'true'
+    Push-Location $cms
+    try {
+        Run "$PhpDir\php.exe" artisan optimize:clear
+        Run "$PhpDir\php.exe" artisan optimize
+    } finally {
+        Pop-Location
+    }
+}
+
+# On an installed hotel: the web route, the firewall and the website button.
+function Set-AirServer {
+    Set-AirWebsite
+    Ok 'IIS passes the AIR client''s launcher and game data requests to the emulator'
+    if (-not $state.Local) {
+        Set-AirFirewall
+        Ok "Firewall: port $AirPort is open for the AIR client's game connection (rule plusemu-air-$AirPort)"
+    }
+    Set-AirCms
+    Ok 'The website shows the "Open AIR client" button (AIR_CLIENT_ENABLED=true)'
+}
+
+# Returns $null when the launcher settings, the game data and the game port answer, or what does not.
+function Test-AirClient {
+    $problems = @()
+    for ($i = 0; $i -lt 15; $i++) {
+        $problems = @(foreach ($name in 'AirLauncher', 'AirGamedata', 'AirPort') { & "Test-Health$name" }) | Where-Object { $_ }
+        if (-not $problems) { return $null }
+        Start-Sleep 2
+    }
+    return ($problems -join ' ')
+}
+
+# The AIR client's game connection is plain TCP, which Cloudflare's proxy does not carry, so this record is DNS only.
+function Set-CloudflareGameDns {
+    $name = "game.$($state.Domain)"
+    $records = @((Invoke-Cloudflare GET "/zones/$CloudflareZone/dns_records?name=$name&per_page=100").result | Where-Object { $_ })
+    if ($records | Where-Object { $_.type -eq 'CNAME' }) { Stop-Cloudflare "$name has a CNAME record. Delete it in Cloudflare (DNS > Records) and run the installer again." }
+    $a = @($records | Where-Object { $_.type -eq 'A' })
+    if ($a.Count -eq 0) {
+        $null = Invoke-Cloudflare POST "/zones/$CloudflareZone/dns_records" @{ type = 'A'; name = $name; content = $ServerIp; proxied = $false; ttl = 1 }
+    } elseif ($a.Count -gt 1) {
+        Stop-Cloudflare "$name has more than one A record. Keep only one in Cloudflare (DNS > Records) and run the installer again."
+    } elseif ($a[0].content -ne $ServerIp -or $a[0].proxied) {
+        $null = Invoke-Cloudflare PATCH "/zones/$CloudflareZone/dns_records/$($a[0].id)" @{ content = $ServerIp; proxied = $false }
+    }
+    $state | Add-Member -MemberType NoteProperty -Name AirGameHost -Value $name -Force
+    $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
+    Ok "DNS: $name points to $ServerIp without Cloudflare's proxy (the AIR client's game port)"
+}
+
+# With $env:PLUSEMU_CLOUDFLARE_TOKEN on an installed hotel: the game.<domain> DNS record. Without it, players use the server's IP address.
+function Set-AirCloudflare {
+    $script:CloudflareToken = ConvertTo-SecureString $env:PLUSEMU_CLOUDFLARE_TOKEN -AsPlainText -Force
+    Remove-Item Env:\PLUSEMU_CLOUDFLARE_TOKEN -ErrorAction SilentlyContinue
+    try {
+        $zones = @((Invoke-Cloudflare GET "/zones?name=$($state.Domain)").result | Where-Object { $_ })
+        if (-not $zones) { throw "no site $($state.Domain) for this token" }
+        $script:CloudflareZone = $zones[0].id
+        Set-CloudflareGameDns
+    } catch {
+        Say "      Could not add game.$($state.Domain) in Cloudflare ($_). Players connect to $ServerIp instead." 'Yellow'
+    } finally {
+        $script:CloudflareToken = $null
+    }
+}
+
+function Initialize-AirClient {
+    Step 'Preparing the AIR client'
+    $emulator = Join-Path $HotelRoot 'emulator'
+    $script:AirReady = $false
+    if (-not (Test-AirSupport $emulator)) {
+        Say '      This PlusEMU version has no AIR client yet, so it was skipped. Run plusemu-update: it installs the newest PlusEMU and sets up the AIR client.' 'Yellow'
+        return
+    }
+    $null = Get-AirTexts $emulator
+    New-AirKey $emulator
+    $script:AirReady = $true
+    Ok 'Handshake key ready (an existing key is never replaced)'
+}
+
+# The last install step: the game address Cloudflare may have just given, and a check from this server.
+function Complete-AirClient {
+    Step 'Checking the AIR client'
+    if (-not $script:AirReady) { Ok 'Skipped: this PlusEMU version has no AIR client yet. Get it with: plusemu-update'; return }
+    $emulator = Join-Path $HotelRoot 'emulator'
+    $config = Join-Path (Join-Path $emulator 'Config') 'config.json'
+    $json = Get-Content $config -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ("$($json.AirClient.GameHost)" -ne (Get-AirGameHost)) {
+        Set-AirSettings $json
+        Write-Utf8 $config ($json | ConvertTo-Json -Depth 20)
+        Restart-Service PlusEMU
+        if (-not (Wait-Emulator)) { throw "The emulator didn't start. See $(Join-Path (Join-Path $emulator 'service') 'shawl_for_PlusEMU_rCURRENT.log')" }
+        Ok "The AIR client now connects to $(Get-AirGameHost)"
+    }
+    $problem = Test-AirClient
+    if ($problem) { Say "      The AIR client does not work yet: $problem" 'Yellow' } else { Ok "air.json, the game data and port $AirPort answer" }
+}
+
+# On an update: the newest AIR texts and client in the staged emulator. Sets $script:AirReady when it serves the AIR client.
+function Update-AirSettings($Emulator) {
+    $script:AirReady = $false
+    if (-not (Test-AirSupport $Emulator)) { Say '      This PlusEMU version has no AIR client yet, so the AIR client stays off.' 'Yellow'; return }
+    if (-not $script:ServerIp) { Get-Derived }
+    if (-not (Get-AirTexts $Emulator -Update)) { return }
+    New-AirKey $Emulator
+    $config = Join-Path (Join-Path $Emulator 'Config') 'config.json'
+    $json = Get-Content $config -Raw -Encoding UTF8 | ConvertFrom-Json
+    Set-AirSettings $json
+    Write-Utf8 $config ($json | ConvertTo-Json -Depth 20)
+    $script:AirReady = $true
+}
+
+function Write-AirSummary {
+    $version = try { "$((Get-Content (Join-Path (Join-Path (Join-Path $HotelRoot 'emulator') 'Config') 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json).AirClient.ClientVersion)" } catch { '' }
+    if (-not $version) { $version = 'unknown' }
+    Write-Host ''
+    Write-Host "  The AIR client is on (client version $version, game address $(Get-AirGameHost):$AirPort). What players do:"
+    Write-Host '      1. Install HabboCustomLauncher: https://github.com/DennisObject/HabboCustomLauncher/releases'
+    Write-Host "      2. Open $(Get-SiteUrl), sign in and press `"Open AIR client`" (or type $($state.Domain) as the hotel domain in the launcher)."
+    if (-not $state.Local -and -not "$($state.AirGameHost)") {
+        Write-Host "  The AIR client connects to the server's IP address. To give it the name game.$($state.Domain) in Cloudflare instead, run in Administrator PowerShell:"
+        Write-Host '      $env:PLUSEMU_CLOUDFLARE_TOKEN = ''<your token>''; plusemu-update -WithAir'
+    }
+}
+
+# plusemu-update -WithAir: turn on the AIR client on a hotel that is already installed. Later updates keep it on.
+function Invoke-InstallAir {
+    Assert-Administrator
+    $emulator = Join-Path $HotelRoot 'emulator'
+    if (-not (Test-Path $StateFile) -or -not (Test-Path (Join-Path $emulator 'Plus Emulator.exe'))) {
+        throw 'No hotel from the PlusEMU installer was found on this server. Install one first.'
+    }
+    New-Item -ItemType Directory -Force -Path $StateDir, $Downloads | Out-Null
+    try { $lock = [IO.File]::Open($LockFile, 'OpenOrCreate', 'ReadWrite', 'None') }
+    catch { throw 'An update or a backup is running. Try again in a few minutes.' }
+    try {
+        $script:state = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $state | Add-Member -MemberType NoteProperty -Name Air -Value $true -Force
+        $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
+        if (-not (Test-AirSupport $emulator)) {
+            throw 'Your PlusEMU version has no AIR client yet. The AIR client is now saved as on: run plusemu-update, which installs the newest PlusEMU and sets up the AIR client.'
+        }
+        Get-Derived
+        $script:TotalSteps = 3
+        $script:Step = 0
+        Step 'Setting up the AIR client'
+        $null = Get-AirTexts $emulator
+        New-AirKey $emulator
+        Ok 'Handshake key ready (an existing key is never replaced)'
+        if (-not $state.Local -and $env:PLUSEMU_CLOUDFLARE_TOKEN) { Set-AirCloudflare }
+        $config = Join-Path (Join-Path $emulator 'Config') 'config.json'
+        $json = Get-Content $config -Raw -Encoding UTF8 | ConvertFrom-Json
+        $before = $json | ConvertTo-Json -Depth 20
+        Set-AirSettings $json
+        if (($json | ConvertTo-Json -Depth 20) -ne $before) {
+            Write-Utf8 $config ($json | ConvertTo-Json -Depth 20)
+            # The emulator reads these settings when it starts.
+            Restart-Service PlusEMU
+            if (-not (Wait-Emulator)) { throw "The emulator didn't start. See $(Join-Path (Join-Path $emulator 'service') 'shawl_for_PlusEMU_rCURRENT.log')" }
+            Ok 'The emulator restarted with the AIR client settings (players were disconnected)'
+        }
+        Step 'Opening the AIR client to players'
+        Set-AirServer
+        Write-HealthCommand
+        Step 'Checking the AIR client'
+        $problem = Test-AirClient
+        if ($problem) { throw "The AIR client does not work yet: $problem" }
+        Ok "air.json, the game data and port $AirPort answer"
+        Write-AirSummary
+        Write-Host ''
+    } finally {
+        $lock.Dispose()
+    }
+}
+
 # ---------------------------------------------------------------- health check
 
 # Each check: its name (the function Test-Health<Name>), what it checks, the command that shows more,
-# and Server when only a server install has the thing it checks.
+# and Server when only a server install has the thing it checks, or Air when only a hotel with the AIR client has it.
 function Get-HealthChecks {
     return @(
         @{ Name = 'Emulator'; Label = 'The emulator service'; Look = "Get-Content $HotelRoot\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 100" }
@@ -1525,7 +1887,10 @@ function Get-HealthChecks {
         @{ Name = 'Backup'; Label = 'The nightly backup'; Look = "Get-Content $BackupLog -Tail 20" }
         @{ Name = 'Certificate'; Label = 'The HTTPS certificate'; Look = "Get-ChildItem Cert:\LocalMachine\My | Select-Object Subject, NotAfter"; Server = $true }
         @{ Name = 'Cloudflare'; Label = 'The Cloudflare address refresh'; Look = "Get-Content $CloudflareLog -Tail 20"; Server = $true }
-    ) | Where-Object { -not ($state.Local -and $_.Server) }
+        @{ Name = 'AirLauncher'; Label = 'The AIR client settings (air.json)'; Look = "Get-Content $HotelRoot\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 100"; Air = $true }
+        @{ Name = 'AirGamedata'; Label = 'The AIR client game data'; Look = "Get-Content $HotelRoot\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 100"; Air = $true }
+        @{ Name = 'AirPort'; Label = 'The AIR client game port (30000)'; Look = "Get-Content $HotelRoot\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 100"; Air = $true }
+    ) | Where-Object { -not ($state.Local -and $_.Server) -and -not ($_.Air -and -not $state.Air) }
 }
 
 # Runs curl.exe without logging and returns its exit code and output.
@@ -1592,6 +1957,22 @@ function Test-HealthCloudflare {
     if ("$line" -notmatch "The website accepts only Cloudflare's") { return "The last refresh did not work: $line" }
     if ((Get-Item $CloudflareLog).LastWriteTime -lt (Get-Date).AddDays(-8)) { return 'The last refresh that worked is older than 8 days.' }
 }
+
+function Test-HealthAirLauncher {
+    $domain = $state.Domain
+    $result = Get-ProbeResult @('-s', '--max-time', '10', '--resolve', "$($domain):80:127.0.0.1", "http://$domain/api/client/air.json")
+    $contract = try { $result.Output | ConvertFrom-Json } catch { $null }
+    if ($contract -and "$($contract.game.host)" -and "$($contract.rsa.modulus)" -and "$($contract.client.url)") { return }
+    return "$(Get-SiteUrl)/api/client/air.json does not give the game address, handshake key and client."
+}
+
+function Test-HealthAirGamedata {
+    $domain = $state.Domain
+    $code = (Get-ProbeResult @('-s', '-o', 'NUL', '-w', '%{http_code}', '--max-time', '10', '--resolve', "$($domain):80:127.0.0.1", "http://$domain/gamedata/hashes")).Output
+    if ($code -ne '200') { return "$(Get-SiteUrl)/gamedata/hashes answers with HTTP $code." }
+}
+
+function Test-HealthAirPort { if (-not (Test-PortAnswers 30000)) { return 'Nothing answers on port 30000.' } }
 
 # Returns $null when Discord took the message, or the reason when it did not.
 function Send-Discord($Webhook, $Text) {
@@ -1746,6 +2127,7 @@ function Set-CloudflareDns {
         }
     }
     Ok "DNS: $($names -join ' ') point to $ServerIp through Cloudflare (proxied)"
+    if ($script:AirReady) { Set-CloudflareGameDns }
 }
 
 # Cloudflare's Origin CA root, which signs every origin certificate.
@@ -2163,6 +2545,7 @@ function Complete-Install {
     Write-Host "  Nightly backups of the database and your settings: $NightlyRoot"
     Write-Host "  Check the hotel now (Administrator PowerShell): & '$HealthScript' (it runs every 5 minutes; log: $HealthLog)"
     if ($state.Local) { Write-Host '  This hotel works on this PC only. For a public hotel, run the installer without -Local on a server.' }
+    if ($script:AirReady) { Write-AirSummary }
     Write-Host '  Store passwords somewhere safe. Change the initial admin password after logging in;'
     Write-Host '  the saved file retains the initial password. Keep passwords out of shared logs and screenshots.'
     Write-Host ''
@@ -2568,6 +2951,7 @@ function Update-Hotel([switch]$Check) {
         $releaseFiguredata = Join-Path $script:Work 'figuredata.xml'
         if ($updateAssets) { Copy-Item $figuredata $releaseFiguredata }
         Copy-EmulatorSettings $emulator $newEmulator
+        if ($state.Air) { Update-AirSettings $newEmulator }
         if ($updateAssets) { Move-Item $releaseFiguredata $figuredata -Force }
         Ok "PlusEMU $latestEmulator (your settings and added files are kept)"
     }
@@ -2631,6 +3015,17 @@ function Update-Hotel([switch]$Check) {
     }
     if (-not $updateClient) { Use-CurrentHabbicons $client }
     $script:RestoreFrom = $null
+    # The update is done here, so a problem with the AIR client warns and never restores the previous version.
+    if ($script:AirReady) {
+        try {
+            Set-AirServer
+            $problem = Test-AirClient
+            if ($problem) { Say "      The AIR client does not work yet: $problem" 'Yellow' } else { Ok 'The AIR client works' }
+        } catch {
+            Write-Log "AIR client setup failed: $_"
+            Say "      The AIR client could not be set up: $_ See $script:Log" 'Yellow'
+        }
+    }
     $script:Versions.EmulatorVersion = $latestEmulator
     $script:Versions.ClientVersion = $latestClient
     if ($updateAssets) { $script:Versions.AssetsVersion = $latestAssets }
@@ -2736,6 +3131,7 @@ function Install-Hotel {
             throw
         }
     }
+    if ($state.Air) { $script:TotalSteps += 2 }
     Say "  Admin and database passwords are saved in $StateFile. Retrieve them in Administrator PowerShell: Get-Content $StateFile"
     Get-EmulatorRelease
     Get-Derived
@@ -2745,6 +3141,7 @@ function Install-Hotel {
     Get-Releases
     Initialize-HotelDatabase
     Get-HotelFiles
+    if ($state.Air) { Initialize-AirClient }
     Start-Emulator
     Write-ClientConfig
     Install-Camera
@@ -2754,12 +3151,15 @@ function Install-Hotel {
     Write-Guide
     Write-UpdateCommand
     if ($state.Local) { Open-LocalGuide } else { Connect-Cloudflare }
+    if ($state.Air) { Complete-AirClient }
     Complete-Install
 }
 
 try {
     if ($InstallCamera) {
         Invoke-InstallCamera
+    } elseif ($Update -and $WithAir) {
+        Invoke-InstallAir
     } elseif ($Update) {
         Invoke-Update -Check:$Check -Yes:$Yes -Rollback:$Rollback -Assets:$Assets
     } else {
