@@ -220,12 +220,61 @@ grep -qxF '    location ~ ^/api/client/(air-ticket|air-launcher-token)$ {' "$sit
 grep -qxF '    location = /gamedata/hashes {' "$site"
 grep -qxF '    location ~ ^/gamedata/(external_flash_texts|external_variables|furnidata_xml|productdata)/[^/]+$ {' "$site"
 [ "$(grep -c 'proxy_set_header X-Forwarded-Proto https;' "$site")" = 4 ]
+# The emulator limits failed logins per visitor, so nginx replaces any X-Real-IP the visitor sends.
+[ "$(grep -cxF '        proxy_set_header X-Real-IP $remote_addr;' "$site")" = 4 ]
+[ "$(grep -cxF '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' "$site")" = 4 ]
 [ "$(grep -n 'air.json' "$site" | cut -d: -f1)" -lt "$(grep -n 'Furniture, clothes' "$site" | cut -d: -f1)" ]
 grep -q 'systemctl reload nginx' "$TEST_DIR/calls"
-# A second run adds nothing.
+# A second run changes nothing and does not reload nginx.
 routed=$(cat "$site")
+: > "$TEST_DIR/calls"
 add_air_route
 [ "$(cat "$site")" = "$routed" ]
+if grep -q 'systemctl reload nginx' "$TEST_DIR/calls"; then echo 'nginx reloaded without a change'; exit 1; fi
+# The AIR blocks of an older installer pass the visitor's own X-Real-IP, so they are replaced in place.
+cat > "$site" <<'EOF'
+server {
+    # my own note
+    location = /api/badges/leaderboard { proxy_pass http://127.0.0.1:8080; }
+
+    # AIR client: launcher settings, login tickets and game data, answered by the emulator.
+    location = /api/client/air.json {
+        limit_except GET HEAD { deny all; }
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+    location ~ ^/api/client/(air-ticket|air-launcher-token)$ {
+        client_max_body_size 4k;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+    location = /gamedata/hashes {
+        limit_except GET HEAD { deny all; }
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+    location ~ ^/gamedata/(external_flash_texts|external_variables|furnidata_xml|productdata)/[^/]+$ {
+        limit_except GET HEAD { deny all; }
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
+    # Furniture, clothes, badges and texts.
+    location /hotel-files/ {
+        expires 7d;
+    }
+    # my note after the hotel files
+}
+EOF
+: > "$TEST_DIR/calls"
+add_air_route
+grep -qxF '    # my note after the hotel files' "$site"
+[ "$(grep -vxF '    # my note after the hotel files' "$site")" = "$routed" ]
+grep -q 'systemctl reload nginx' "$TEST_DIR/calls"
 # A site nginx rejects goes back to what it was.
 printf '%s\n' "$original" > "$site"
 nginx() { [ "$1" != -t ]; }
