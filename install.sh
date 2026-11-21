@@ -1325,38 +1325,51 @@ air_locations() { # the nginx blocks that pass the AIR client's launcher and gam
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Proto $proto;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
     location ~ ^/api/client/(air-ticket|air-launcher-token)\$ {
         client_max_body_size 4k;
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Proto $proto;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
     location = /gamedata/hashes {
         limit_except GET HEAD { deny all; }
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Proto $proto;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
     location ~ ^/gamedata/(external_flash_texts|external_variables|furnidata_xml|productdata)/[^/]+\$ {
         limit_except GET HEAD { deny all; }
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Proto $proto;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
 EOF
 }
 
-add_air_route() { # adds the AIR client blocks to a site written by an older installer; keeps the owner's own changes
-    local site=$NGINX_DIR/sites-available/hotel.conf block previous
+add_air_route() { # adds or refreshes the AIR client blocks in a site written by an older installer; keeps the owner's other changes
+    local site=$NGINX_DIR/sites-available/hotel.conf block previous updated
     [ -f "$site" ] || return 1
-    if grep -q '^    location = /api/client/air.json ' "$site"; then return 0; fi
     block=$(air_locations)
     previous=$(cat "$site")
-    BLOCK=$block awk '
+    # The AIR blocks an older installer wrote start with the same lines, so they are replaced where they are.
+    updated=$(BLOCK=$block awk '
+        BEGIN { n = split(ENVIRON["BLOCK"], lines, "\n"); for (i = 1; i <= n; i++) if (lines[i] ~ /^    (# AIR client:|location )/) air[lines[i]] = 1 }
+        skip { if ($0 == "    }") skip = 0; next }
+        $0 in air { if (!done) { print ENVIRON["BLOCK"]; done = 1 }; if ($0 ~ /\{$/) skip = 1; next }
         !done && ($0 == "    # Furniture, clothes, badges and texts." || $0 ~ /^    location \/hotel-files\/ \{/) { print ENVIRON["BLOCK"]; print ""; done = 1 }
         { print }
-        END { exit !done }' <<< "$previous" > "$site" || { printf '%s\n' "$previous" > "$site"; return 1; }
+        END { exit !done }' <<< "$previous") || return 1
+    if [ "$updated" = "$previous" ]; then return 0; fi
+    printf '%s\n' "$updated" > "$site"
     if ! nginx -t; then
         printf '%s\n' "$previous" > "$site"
         return 1
