@@ -418,6 +418,25 @@ grep -q 'PLUSEMU_CLOUDFLARE_TOKEN=<your token> plusemu-update --with-air' "$TEST
 if grep -q 'systemctl restart plusemu$' "$TEST_DIR/calls"; then echo 'the emulator restarted without a change'; exit 1; fi
 [ "$(grep -c 'location = /api/client/air.json' "$site")" = 1 ]
 [ "$(grep -c "^allow $AIR_PORT/tcp\$" "$FAKE_DIR/rules")" = 1 ]
+# Old AIR blocks edited by hand stay as they are, the owner is told what to add, and the rest of the setup goes on.
+edited_site=$(sed '/external_flash_texts|external_variables/,/^    }$/ s/^    }$/        add_header X-A "{";\n    }/' <<< "$old_site")
+printf '%s\n' "$edited_site" > "$site"
+printf 'APP_URL="https://example.com"\nAIR_CLIENT_ENABLED=false\n' > "$HOTEL_ROOT/cms/.env"
+: > "$FAKE_DIR/rules"
+: > "$TEST_DIR/terminal"
+(main update --with-air) || { echo 'hand-edited AIR blocks stopped the setup'; exit 1; }
+[ "$(cat "$site")" = "$edited_site" ]
+grep -q 'were edited by hand' "$TEST_DIR/terminal"
+grep -qF 'proxy_set_header X-Real-IP $remote_addr;' "$TEST_DIR/terminal"
+grep -qF 'proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' "$TEST_DIR/terminal"
+[ "$(grep -c "^allow $AIR_PORT/tcp\$" "$FAKE_DIR/rules")" = 1 ]
+grep -qx 'AIR_CLIENT_ENABLED="true"' "$HOTEL_ROOT/cms/.env"
+# A site without AIR blocks that cannot take them stops the setup.
+printf 'server {\n}\n' > "$site"
+: > "$TEST_DIR/terminal"
+(main update --with-air) && exit 1
+grep -q 'Could not add the AIR client routes' "$TEST_DIR/terminal"
+printf '%s\n' "$routed" > "$site"
 # A check that fails stops with the reason.
 health_air_port() { echo "Nothing answers on port 30000."; return 1; }
 (main update --with-air) && exit 1
