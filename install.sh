@@ -1355,19 +1355,28 @@ air_locations() { # the nginx blocks that pass the AIR client's launcher and gam
 EOF
 }
 
-add_air_route() { # adds or refreshes the AIR client blocks in a site written by an older installer; keeps the owner's other changes
+add_air_route() { # adds the stock AIR client blocks to a site written by an older installer, or puts them in place of the old ones
+    # Changes the owner made inside the four AIR blocks are replaced. Every other line of the site stays.
     local site=$NGINX_DIR/sites-available/hotel.conf block previous updated
     [ -f "$site" ] || return 1
     block=$(air_locations)
     previous=$(cat "$site")
-    # The AIR blocks an older installer wrote start with the same lines, so they are replaced where they are.
+    # An old AIR block starts with the same line as the stock one and ends where its braces close.
+    # A start line that occurs twice, a server-level line inside a block, or a block that does not close leaves the site as it is.
     updated=$(BLOCK=$block awk '
+        function braces(line) { sub(/#.*/, "", line); return gsub(/\{/, "", line) - gsub(/\}/, "", line) }
         BEGIN { n = split(ENVIRON["BLOCK"], lines, "\n"); for (i = 1; i <= n; i++) if (lines[i] ~ /^    (# AIR client:|location )/) air[lines[i]] = 1 }
-        skip { if ($0 == "    }") skip = 0; next }
-        $0 in air { if (!done) { print ENVIRON["BLOCK"]; done = 1 }; if ($0 ~ /\{$/) skip = 1; next }
+        ($0 in air) && seen[$0]++ { unclear = 1; exit }
+        skip {
+            depth += braces($0)
+            if (depth < 0 || (depth > 0 && $0 ~ /^    [^ ]/) || (depth == 0 && $0 !~ /^[ \t]*\}[ \t]*(#.*)?$/)) { unclear = 1; exit }
+            skip = depth > 0
+            next
+        }
+        $0 in air { if (!done) { print ENVIRON["BLOCK"]; done = 1 }; depth = braces($0); skip = depth > 0; next }
         !done && ($0 == "    # Furniture, clothes, badges and texts." || $0 ~ /^    location \/hotel-files\/ \{/) { print ENVIRON["BLOCK"]; print ""; done = 1 }
         { print }
-        END { exit !done }' <<< "$previous") || return 1
+        END { exit (unclear || !done || skip) }' <<< "$previous") || return 1
     if [ "$updated" = "$previous" ]; then return 0; fi
     printf '%s\n' "$updated" > "$site"
     if ! nginx -t; then
