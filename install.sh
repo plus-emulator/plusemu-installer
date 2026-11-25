@@ -1343,38 +1343,60 @@ air_locations() { # the nginx blocks that pass the AIR client's launcher and gam
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Proto $proto;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
     location ~ ^/api/client/(air-ticket|air-launcher-token)\$ {
         client_max_body_size 4k;
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Proto $proto;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
     location = /gamedata/hashes {
         limit_except GET HEAD { deny all; }
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Proto $proto;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
     location ~ ^/gamedata/(external_flash_texts|external_variables|furnidata_xml|productdata)/[^/]+\$ {
         limit_except GET HEAD { deny all; }
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Proto $proto;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
 EOF
 }
 
-add_air_route() { # adds the AIR client blocks to a site written by an older installer; keeps the owner's own changes
-    local site=$NGINX_DIR/sites-available/hotel.conf block previous
+add_air_route() { # adds the stock AIR client blocks to a site written by an older installer, or puts them in place of the old ones
+    # An old AIR block starts with the same line as the stock one and ends where its braces close. Changes inside it are replaced.
+    # The count does not read quotes, escapes or a # inside a value. A block with them, or any other unclear block, leaves the site as it is and returns 3.
+    local site=$NGINX_DIR/sites-available/hotel.conf block previous updated
     [ -f "$site" ] || return 1
-    if grep -q '^    location = /api/client/air.json ' "$site"; then return 0; fi
     block=$(air_locations)
     previous=$(cat "$site")
-    BLOCK=$block awk '
+    updated=$(BLOCK=$block awk '
+        function braces(line) { sub(/#.*/, "", line); return gsub(/\{/, "", line) - gsub(/\}/, "", line) }
+        BEGIN { n = split(ENVIRON["BLOCK"], lines, "\n"); for (i = 1; i <= n; i++) if (lines[i] ~ /^    (# AIR client:|location )/) air[lines[i]] = 1 }
+        ($0 in air) && seen[$0]++ { unclear = 1; exit }
+        skip {
+            code = $0; sub(/#.*/, "", code)
+            depth += braces(code)
+            if ($0 ~ /[^ \t]#/ || code ~ /["\047\\]/ || depth < 0 || (depth > 0 && $0 ~ /^    [^ ]/) || (depth == 0 && $0 !~ /^[ \t]*\}[ \t]*(#.*)?$/)) { unclear = 1; exit }
+            skip = depth > 0
+            next
+        }
+        $0 in air { if (!done) { print ENVIRON["BLOCK"]; done = 1 }; depth = braces($0); skip = depth > 0; next }
         !done && ($0 == "    # Furniture, clothes, badges and texts." || $0 ~ /^    location \/hotel-files\/ \{/) { print ENVIRON["BLOCK"]; print ""; done = 1 }
         { print }
-        END { exit !done }' <<< "$previous" > "$site" || { printf '%s\n' "$previous" > "$site"; return 1; }
+        END { exit (unclear || skip ? 3 : !done) }' <<< "$previous") || return
+    if [ "$updated" = "$previous" ]; then return 0; fi
+    printf '%s\n' "$updated" > "$site"
     if ! nginx -t; then
         printf '%s\n' "$previous" > "$site"
         return 1
@@ -2242,11 +2264,20 @@ air_website() { # the website's "Open AIR client" button
 }
 
 air_server() { # on an installed hotel: the web routes, the firewall and the website button; AIR_ERROR says what failed
-    if ! add_air_route; then
-        AIR_ERROR="Could not add the AIR client routes to $NGINX_DIR/sites-available/hotel.conf. Nothing was changed there. See $LOG"
+    local site=$NGINX_DIR/sites-available/hotel.conf route=0
+    add_air_route || route=$?
+    if [ "$route" = 3 ]; then
+        say "      ${yellow}The AIR client blocks in $site were edited by hand, so they were left as they are.${reset}"
+        say "      ${yellow}Add these two lines yourself to each location block for /api/client/ and /gamedata/:${reset}"
+        say "      ${yellow}    proxy_set_header X-Real-IP \$remote_addr;${reset}"
+        say "      ${yellow}    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;${reset}"
+        say "      ${yellow}Then reload nginx: sudo nginx -t && sudo systemctl reload nginx${reset}"
+    elif [ "$route" != 0 ]; then
+        AIR_ERROR="Could not add the AIR client routes to $site. Nothing was changed there. See $LOG"
         return 1
+    else
+        ok "nginx passes the AIR client's launcher and game data requests to the emulator"
     fi
-    ok "nginx passes the AIR client's launcher and game data requests to the emulator"
     if ! is_local; then
         air_firewall
         ok "Firewall: port $AIR_PORT is open for the AIR client's game connection"

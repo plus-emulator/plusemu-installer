@@ -172,12 +172,21 @@ try {
     $rule = "system.webServer/rewrite/globalRules/rule[@name='PlusEMU AIR client']"
     Assert ($script:IisConfig -contains "$rule/match|url|^(api/client/(air\.json|air-ticket|air-launcher-token)|gamedata/(hashes|(external_flash_texts|external_variables|furnidata_xml|productdata)/[^/]+))$") "Config: $($script:IisConfig -join "`n")"
     Assert ($script:IisConfig -contains "$rule/serverVariables|name=HTTP_X_FORWARDED_PROTO;value=https") 'X-Forwarded-Proto is not https'
+    # The emulator limits failed logins per visitor, so IIS replaces any X-Real-IP the visitor sends.
+    Assert (@($script:ServerVariables | Where-Object { $_ -eq 'HTTP_X_REAL_IP' }).Count -eq 1) "Server variables: $($script:ServerVariables -join ', ')"
+    Assert ($script:IisConfig -contains "$rule/serverVariables|name=HTTP_X_REAL_IP;value={HTTP_CF_CONNECTING_IP}") 'X-Real-IP is not the visitor Cloudflare names'
     Assert ($script:IisConfig -contains "$rule/conditions|input={HTTP_HOST};pattern=^example\.com$") 'The rule is not limited to the hotel domain'
     Assert ($script:IisConfig -contains "$rule/action|url|http://127.0.0.1:8080/{R:1}") 'The rule does not go to the emulator'
     foreach ($path in 'api/client/air.json', 'api/client/air-ticket', 'api/client/air-launcher-token', 'gamedata/hashes', 'gamedata/productdata/abc', 'gamedata/external_flash_texts/1') {
         Assert ($path -match '^(api/client/(air\.json|air-ticket|air-launcher-token)|gamedata/(hashes|(external_flash_texts|external_variables|furnidata_xml|productdata)/[^/]+))$') "Not routed: $path"
     }
     Assert ('api/client/other' -notmatch '^(api/client/(air\.json|air-ticket|air-launcher-token)|gamedata/(hashes|(external_flash_texts|external_variables|furnidata_xml|productdata)/[^/]+))$') 'Other paths are routed'
+    # A local hotel has no Cloudflare, so the visitor is the address IIS sees.
+    $script:IisConfig.Clear()
+    $state.Local = $true
+    Set-AirWebsite
+    $state.Local = $false
+    Assert ($script:IisConfig -contains "$rule/serverVariables|name=HTTP_X_REAL_IP;value={REMOTE_ADDR}") 'A local X-Real-IP is not the address IIS sees'
 
     # The firewall rule is added once, with netsh.
     $script:Calls.Clear()

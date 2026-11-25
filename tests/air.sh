@@ -220,12 +220,90 @@ grep -qxF '    location ~ ^/api/client/(air-ticket|air-launcher-token)$ {' "$sit
 grep -qxF '    location = /gamedata/hashes {' "$site"
 grep -qxF '    location ~ ^/gamedata/(external_flash_texts|external_variables|furnidata_xml|productdata)/[^/]+$ {' "$site"
 [ "$(grep -c 'proxy_set_header X-Forwarded-Proto https;' "$site")" = 4 ]
+# The emulator limits failed logins per visitor, so nginx replaces any X-Real-IP the visitor sends.
+[ "$(grep -cxF '        proxy_set_header X-Real-IP $remote_addr;' "$site")" = 4 ]
+[ "$(grep -cxF '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' "$site")" = 4 ]
 [ "$(grep -n 'air.json' "$site" | cut -d: -f1)" -lt "$(grep -n 'Furniture, clothes' "$site" | cut -d: -f1)" ]
 grep -q 'systemctl reload nginx' "$TEST_DIR/calls"
-# A second run adds nothing.
+# A second run changes nothing and does not reload nginx.
 routed=$(cat "$site")
+: > "$TEST_DIR/calls"
 add_air_route
 [ "$(cat "$site")" = "$routed" ]
+if grep -q 'systemctl reload nginx' "$TEST_DIR/calls"; then echo 'nginx reloaded without a change'; exit 1; fi
+# The AIR blocks of an older installer pass the visitor's own X-Real-IP, so they are replaced in place.
+cat > "$site" <<'EOF'
+server {
+    # my own note
+    location = /api/badges/leaderboard { proxy_pass http://127.0.0.1:8080; }
+
+    # AIR client: launcher settings, login tickets and game data, answered by the emulator.
+    location = /api/client/air.json {
+        limit_except GET HEAD { deny all; }
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+    location ~ ^/api/client/(air-ticket|air-launcher-token)$ {
+        client_max_body_size 4k;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+    location = /gamedata/hashes {
+        limit_except GET HEAD { deny all; }
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+    location ~ ^/gamedata/(external_flash_texts|external_variables|furnidata_xml|productdata)/[^/]+$ {
+        limit_except GET HEAD { deny all; }
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
+    # Furniture, clothes, badges and texts.
+    location /hotel-files/ {
+        expires 7d;
+    }
+    # my note after the hotel files
+}
+EOF
+old_site=$(cat "$site")
+: > "$TEST_DIR/calls"
+add_air_route
+grep -qxF '    # my note after the hotel files' "$site"
+[ "$(grep -vxF '    # my note after the hotel files' "$site")" = "$routed" ]
+grep -q 'systemctl reload nginx' "$TEST_DIR/calls"
+# An old AIR block ends where its braces close, so the owner's lines after it stay.
+replace_old_air() { # replace_old_air <site>: the AIR blocks become the stock ones and the rest stays
+    printf '%s\n' "$1" > "$site"
+    : > "$TEST_DIR/calls"
+    add_air_route
+    grep -qxF '    location /hotel-files/ {' "$site"
+    grep -qxF '    # my note after the hotel files' "$site"
+    [ "$(grep -cxF '        proxy_set_header X-Real-IP $remote_addr;' "$site")" = 4 ]
+    [ "$(grep -vxF '    # my note after the hotel files' "$site")" = "$routed" ]
+    grep -q 'systemctl reload nginx' "$TEST_DIR/calls"
+}
+replace_old_air "$(sed '/external_flash_texts|external_variables/,/^    }$/ s/^    }$/    } # mine/' <<< "$old_site")"
+replace_old_air "$(sed '/# AIR client:/,/# Furniture/ s/^    }$/    } /' <<< "$old_site")"
+replace_old_air "$(sed 's/^        limit_except GET HEAD { deny all; }$/&\n        # an old note with a {/' <<< "$old_site")"
+# A site whose old AIR blocks cannot be told apart from the rest is left as it is.
+keep_unclear_site() { # keep_unclear_site <site>
+    printf '%s\n' "$1" > "$site"
+    : > "$TEST_DIR/calls"
+    if add_air_route; then echo 'an unclear site was changed'; exit 1; fi
+    [ "$(cat "$site")" = "$1" ]
+    if grep -q 'systemctl reload nginx' "$TEST_DIR/calls"; then echo 'nginx reloaded an unclear site'; exit 1; fi
+}
+keep_unclear_site "$old_site"$'\n'"$old_site"
+keep_unclear_site "$(sed '/external_flash_texts|external_variables/,/^    }$/ {/^    }$/d}' <<< "$old_site")"
+keep_unclear_site $'server {\n    location = /api/client/air.json {\n        proxy_pass http://127.0.0.1:8080;'
+# Braces inside quotes or after a # in a value are not counted, so an old AIR block with them is left as it is.
+keep_unclear_site "$(sed '/external_flash_texts|external_variables/,/^    }$/ s/^    }$/        add_header X-A "{";\n\t}\n\tlocation \/mine\/ {\n\t\tadd_header X-B "}";\n\t\treturn 204;\n\t}/' <<< "$old_site")"
+keep_unclear_site "$(sed '/external_flash_texts|external_variables/,/^    }$/ s/^    }$/        if ($arg_old) { return 302 \/#\/home; }\n\t}\n\tlocation \/mine\/ {\n\t\treturn 204;\n\t} location \/x#y {\n\t\treturn 204;\n\t}/' <<< "$old_site")"
 # A site nginx rejects goes back to what it was.
 printf '%s\n' "$original" > "$site"
 nginx() { [ "$1" != -t ]; }
@@ -340,6 +418,25 @@ grep -q 'PLUSEMU_CLOUDFLARE_TOKEN=<your token> plusemu-update --with-air' "$TEST
 if grep -q 'systemctl restart plusemu$' "$TEST_DIR/calls"; then echo 'the emulator restarted without a change'; exit 1; fi
 [ "$(grep -c 'location = /api/client/air.json' "$site")" = 1 ]
 [ "$(grep -c "^allow $AIR_PORT/tcp\$" "$FAKE_DIR/rules")" = 1 ]
+# Old AIR blocks edited by hand stay as they are, the owner is told what to add, and the rest of the setup goes on.
+edited_site=$(sed '/external_flash_texts|external_variables/,/^    }$/ s/^    }$/        add_header X-A "{";\n    }/' <<< "$old_site")
+printf '%s\n' "$edited_site" > "$site"
+printf 'APP_URL="https://example.com"\nAIR_CLIENT_ENABLED=false\n' > "$HOTEL_ROOT/cms/.env"
+: > "$FAKE_DIR/rules"
+: > "$TEST_DIR/terminal"
+(main update --with-air) || { echo 'hand-edited AIR blocks stopped the setup'; exit 1; }
+[ "$(cat "$site")" = "$edited_site" ]
+grep -q 'were edited by hand' "$TEST_DIR/terminal"
+grep -qF 'proxy_set_header X-Real-IP $remote_addr;' "$TEST_DIR/terminal"
+grep -qF 'proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' "$TEST_DIR/terminal"
+[ "$(grep -c "^allow $AIR_PORT/tcp\$" "$FAKE_DIR/rules")" = 1 ]
+grep -qx 'AIR_CLIENT_ENABLED="true"' "$HOTEL_ROOT/cms/.env"
+# A site without AIR blocks that cannot take them stops the setup.
+printf 'server {\n}\n' > "$site"
+: > "$TEST_DIR/terminal"
+(main update --with-air) && exit 1
+grep -q 'Could not add the AIR client routes' "$TEST_DIR/terminal"
+printf '%s\n' "$routed" > "$site"
 # A check that fails stops with the reason.
 health_air_port() { echo "Nothing answers on port 30000."; return 1; }
 (main update --with-air) && exit 1

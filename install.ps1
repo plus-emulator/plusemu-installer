@@ -1671,14 +1671,19 @@ function Set-AirWebsite {
     $name = 'PlusEMU AIR client'
     if (Get-WebConfiguration -PSPath $apphost -Filter "$rules/rule[@name='$name']") { Clear-WebConfiguration -PSPath $apphost -Filter "$rules/rule[@name='$name']" }
     $variables = 'system.webServer/rewrite/allowedServerVariables'
-    if (-not (Get-WebConfiguration -PSPath $apphost -Filter "$variables/add[@name='HTTP_X_FORWARDED_PROTO']")) {
-        Add-WebConfigurationProperty -PSPath $apphost -Filter $variables -Name '.' -Value @{ name = 'HTTP_X_FORWARDED_PROTO' }
+    foreach ($variable in 'HTTP_X_FORWARDED_PROTO', 'HTTP_X_REAL_IP') {
+        if (-not (Get-WebConfiguration -PSPath $apphost -Filter "$variables/add[@name='$variable']")) {
+            Add-WebConfigurationProperty -PSPath $apphost -Filter $variables -Name '.' -Value @{ name = $variable }
+        }
     }
     Add-WebConfigurationProperty -PSPath $apphost -Filter $rules -Name '.' -Value @{ name = $name; stopProcessing = 'True' }
     Set-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='$name']/match" -Name 'url' -Value '^(api/client/(air\.json|air-ticket|air-launcher-token)|gamedata/(hashes|(external_flash_texts|external_variables|furnidata_xml|productdata)/[^/]+))$'
     Add-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='$name']/conditions" -Name '.' -Value @{ input = '{HTTP_HOST}'; pattern = "^$([regex]::Escape($state.Domain))$" }
     $proto = if ($state.Local) { 'http' } else { 'https' }
     Add-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='$name']/serverVariables" -Name '.' -Value @{ name = 'HTTP_X_FORWARDED_PROTO'; value = $proto }
+    # The same visitor address as the game connection, so a visitor cannot pick their own for the login limits.
+    $visitor = if ($state.Local) { '{REMOTE_ADDR}' } else { '{HTTP_CF_CONNECTING_IP}' }
+    Add-WebConfigurationProperty -PSPath $apphost -Filter "$rules/rule[@name='$name']/serverVariables" -Name '.' -Value @{ name = 'HTTP_X_REAL_IP'; value = $visitor }
     $action = "$rules/rule[@name='$name']/action"
     Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'type' -Value 'Rewrite'
     Set-WebConfigurationProperty -PSPath $apphost -Filter $action -Name 'url' -Value 'http://127.0.0.1:8080/{R:1}'
