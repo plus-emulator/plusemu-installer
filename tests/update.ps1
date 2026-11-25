@@ -538,7 +538,10 @@ try {
     $saved = Get-Json $StateFile
     $saved | Add-Member -NotePropertyName Air -NotePropertyValue $true -Force
     $saved | Add-Member -NotePropertyName AirGameHost -NotePropertyValue 'game.example.com' -Force
+    # A hotel in another language gets its newest language pack after the update.
+    $saved | Add-Member -NotePropertyName Language -NotePropertyValue 'de' -Force
     $saved | ConvertTo-Json | Set-Content $StateFile
+    function Set-HotelLanguage([switch]$Restart) { $Calls.Add("language $(Get-HotelLanguage) $Restart") }
     $installedConfig = Join-Path $emulator 'Config'
     New-Item -ItemType Directory -Force (Join-Path $installedConfig 'air') | Out-Null
     Set-Content (Join-Path (Join-Path $installedConfig 'air') 'external_variables.txt') 'old'
@@ -561,6 +564,7 @@ try {
     Assert ($updated.Database.Password -eq 'database-secret') 'The update lost the database password'
     Assert ($Calls -contains 'air server' -and $Calls -contains 'air check') "Calls: $($Calls -join '; ')"
     Assert ((Get-Json $StateFile).Air -eq $true) 'The update turned the AIR client off'
+    Assert ($Calls -contains 'language de True') "Calls: $($Calls -join '; ')"
     Write-Host 'PowerShell update checks passed'
 } catch {
     Write-Host "Failed: $_" -ForegroundColor Red

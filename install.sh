@@ -24,6 +24,8 @@
 # PLUSEMU_SSH_KEY gives the public key to an unattended run.
 # --with-air (or PLUSEMU_AIR=1) sets up the Habbo AIR client for players who use HabboCustomLauncher. Updates keep it on.
 # On an installed hotel, turn it on with: sudo plusemu-update --with-air
+# --language <code> (or PLUSEMU_LANGUAGE) shows the client texts, furniture names and website in that language:
+# en, de, nl, fr, es, it, fi, tr or br. Updates keep it. On an installed hotel: sudo plusemu-update --language de
 set -Eeuo pipefail
 shopt -u patsub_replacement 2> /dev/null || true # bash 5.2 would expand "&" in template values
 
@@ -93,6 +95,9 @@ CROWDSEC_LAPI=127.0.0.1:8085
 AIR_MANIFEST_URL=${AIR_MANIFEST_URL:-https://assets.plusemu.dev/air/latest.json}
 # The AIR client's game port: the emulator's Flash listener, open to every address.
 AIR_PORT=30000
+# The language packs (<code>.json manifests), published by tools/language-pack.py. English is the stock hotel files.
+LANGUAGE_MANIFEST_URL=${LANGUAGE_MANIFEST_URL:-https://assets.plusemu.dev/language}
+LANGUAGES='en de nl fr es it fi tr br'
 MODE=install
 PHP=8.5
 NODE_MAJOR=22
@@ -229,6 +234,8 @@ LOCAL='${LOCAL:-no}'
 REMOTE_DATABASE='${REMOTE_DATABASE:-}'
 AIR='${AIR:-}'
 AIR_GAME_HOST='${AIR_GAME_HOST:-}'
+HOTEL_LANGUAGE='${HOTEL_LANGUAGE:-en}'
+FURNI_LANGUAGE='${FURNI_LANGUAGE:-en}'
 EOF
     chmod 600 "$STATE_FILE"
     umask 022
@@ -457,6 +464,14 @@ select_air() { # select_air [saved choice]: sets AIR to yes with --with-air, PLU
 
 air_on() { [ "${AIR:-}" = yes ]; }
 
+select_language() { # select_language [saved choice]: sets HOTEL_LANGUAGE from --language, PLUSEMU_LANGUAGE or the saved choice, and en otherwise
+    HOTEL_LANGUAGE=${LANGUAGE_OPTION:-${PLUSEMU_LANGUAGE:-${1:-en}}}
+    case " $LANGUAGES " in
+        *" $HOTEL_LANGUAGE "*) ;;
+        *) die "Unknown language: $HOTEL_LANGUAGE. Choose one of: $LANGUAGES." ;;
+    esac
+}
+
 remote_database_list() { # remote_database_list <addresses>: each IPv4 address or network on a line, as ufw shows it; fails on anything else
     local entry ip bits part value=0 mask
     for entry in ${1//,/ }; do
@@ -569,14 +584,14 @@ choose_ssh_key() { # with --setup-ssh, the key is asked first, while the owner i
 ask_questions() {
     select_guide_mode
     unset DISCORD_WEBHOOK CROWDSEC
-    AIR='' AIR_GAME_HOST='' REMOTE_DATABASE=
+    AIR='' AIR_GAME_HOST='' REMOTE_DATABASE='' HOTEL_LANGUAGE='' FURNI_LANGUAGE=en
     say ""
     say "${bold}Welcome to the PlusEMU hotel installer!${reset}"
     say "This sets up your emulator, client and website on this server in about 10 minutes."
     say ""
 
     if [ -f "$STATE_FILE" ]; then
-        GUIDE_MODE=simple LOCAL=no AIR='' AIR_GAME_HOST='' REMOTE_DATABASE=
+        GUIDE_MODE=simple LOCAL=no AIR='' AIR_GAME_HOST='' REMOTE_DATABASE='' HOTEL_LANGUAGE='' FURNI_LANGUAGE=en
         # An older state file has no answer for these, so the questions are asked once.
         local trace=${-//[^x]/}
         { set +x; } 2> /dev/null
@@ -586,6 +601,7 @@ ask_questions() {
         select_local "$LOCAL"
         select_remote_database "$REMOTE_DATABASE"
         select_air "$AIR"
+        select_language "$HOTEL_LANGUAGE"
         choose_ssh_key
         select_guide_mode "$GUIDE_MODE"
         if [ -z "${GUIDE_TOKEN:-}" ]; then GUIDE_TOKEN=$(random_secret 12); fi
@@ -607,6 +623,7 @@ ask_questions() {
     select_local
     select_remote_database
     select_air
+    select_language
     choose_ssh_key
     if is_local; then
         # The game connects through the same nginx as the website, so the browser sees one origin.
@@ -1098,6 +1115,7 @@ install_cms() {
     set_env "$env" SESSION_SECURE_COOKIE "$https"
     set_env "$env" TRUSTED_PROXIES 127.0.0.1
     if [ "${AIR_READY:-0}" = 1 ]; then set_env "$env" AIR_CLIENT_ENABLED true; fi
+    set_env "$env" APP_LOCALE "${HOTEL_LANGUAGE:-en}"
     chmod 640 "$env"
 
     composer install --no-dev --optimize-autoloader
@@ -2167,6 +2185,7 @@ air_settings() { # air_settings <config.json>: the Flash listener, the handshake
     # Writing over the file keeps its owner and permissions.
     cat "$1.new" > "$1"
     rm -f "$1.new"
+    language_emulator_config "$1"
 }
 
 air_texts() { # air_texts <emulator dir> <new|update>: Habbo's AIR texts; a new setup stops without them, an update keeps the old ones
@@ -2297,6 +2316,216 @@ air_cloudflare() { # with PLUSEMU_CLOUDFLARE_TOKEN on an installed hotel: the ga
     fi
     unset CLOUDFLARE_TOKEN
     if [ -n "$trace" ]; then set -x; fi
+}
+
+# ---------------------------------------------------------------- language
+
+language_name() { # language_name <code>
+    case $1 in
+        de) printf German ;;
+        nl) printf Dutch ;;
+        fr) printf French ;;
+        es) printf Spanish ;;
+        it) printf Italian ;;
+        fi) printf Finnish ;;
+        tr) printf Turkish ;;
+        br) printf 'Brazilian Portuguese' ;;
+        *) printf English ;;
+    esac
+}
+
+language_dir() { printf '%s/hotel-files/language' "$HOTEL_ROOT"; }
+
+language_active() { # the language the client shows: the chosen one once its pack is in place, English until then
+    local marker
+    marker=$(language_dir)/.language
+    if [ "${HOTEL_LANGUAGE:-en}" != en ] && [ "$(cat "$marker" 2> /dev/null)" = "$HOTEL_LANGUAGE" ]; then
+        printf '%s' "$HOTEL_LANGUAGE"
+    else
+        printf en
+    fi
+}
+
+fetch_language_pack() { # the chosen language's pack into hotel-files/language; on failure LANGUAGE_ERROR says why and the old files stay
+    local dir tmp url sum
+    dir=$(language_dir)
+    mkdir -p "$HOTEL_ROOT/hotel-files"
+    tmp=$(mktemp -d "$HOTEL_ROOT/hotel-files/.language.XXXXXX")
+    if ! curl -fsSL --retry 3 --max-time 60 "$LANGUAGE_MANIFEST_URL/$HOTEL_LANGUAGE.json" -o "$tmp/manifest.json" ||
+        ! jq -e --arg code "$HOTEL_LANGUAGE" '.language == $code and (.url | type == "string" and startswith("https://"))
+            and (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))' "$tmp/manifest.json" > /dev/null 2>&1; then
+        rm -rf "$tmp"
+        LANGUAGE_ERROR="Could not read the $(language_name "$HOTEL_LANGUAGE") language pack at $LANGUAGE_MANIFEST_URL/$HOTEL_LANGUAGE.json."
+        return 1
+    fi
+    url=$(jq -r .url "$tmp/manifest.json")
+    sum=$(jq -r .sha256 "$tmp/manifest.json")
+    mkdir "$tmp/pack"
+    if ! curl -fsSL --retry 3 --max-time 300 "$url" -o "$tmp/pack.tar.gz" || [ "$(sha256sum "$tmp/pack.tar.gz" | cut -d' ' -f1)" != "$sum" ] ||
+        ! tar xzf "$tmp/pack.tar.gz" --no-same-owner -C "$tmp/pack" ||
+        ! jq -e 'type == "object"' "$tmp/pack/ExternalTexts.json" "$tmp/pack/furni-names.json" "$tmp/pack/product-names.json" > /dev/null 2>&1; then
+        rm -rf "$tmp"
+        LANGUAGE_ERROR="The download of the $(language_name "$HOTEL_LANGUAGE") language pack failed, or it does not match its published checksum."
+        return 1
+    fi
+    printf '%s\n' "$HOTEL_LANGUAGE" > "$tmp/pack/.language"
+    rm -rf "$dir"
+    mv "$tmp/pack" "$dir"
+    rm -rf "$tmp"
+}
+
+language_product_data() { # hotel-files/language/ProductData.json: the stock products with the pack's names
+    local dir stock
+    dir=$(language_dir) stock=$HOTEL_ROOT/hotel-files/gamedata/ProductData.json
+    rm -f "$dir/ProductData.json"
+    [ -f "$stock" ] || return 0
+    if jq -c --slurpfile names "$dir/product-names.json" '.productdata.product |= map(. + ($names[0][.code | tostring] // {}))' "$stock" > "$dir/ProductData.json.new"; then
+        mv "$dir/ProductData.json.new" "$dir/ProductData.json"
+    else
+        rm -f "$dir/ProductData.json.new"
+    fi
+}
+
+language_client_config() { # language_client_config <renderer-config.json>: the client loads the active language's texts after the stock ones
+    local file=$1 dir on='' ui=false products=false
+    [ -f "$file" ] || return 0
+    dir=$(language_dir)
+    if [ "$(language_active)" != en ]; then on=1; fi
+    if [ -f "$dir/UITexts.jsonc" ]; then ui=true; fi
+    if [ -f "$dir/ProductData.json" ]; then products=true; fi
+    if ! jq --arg base "$(site_url)/hotel-files/language" --arg on "$on" --argjson ui "$ui" --argjson products "$products" '
+        def ours: test("/hotel-files/language/");
+        def after($pattern; $add): (reduce .[] as $url ([]; . + [$url] + (if ($url | test($pattern)) then $add else [] end))) as $list
+            | if ($list | length) == length then $list + $add else $list end;
+        .["external.texts.url"] |= ((. // []) | map(select(ours | not))
+            | if $on == "1" then after("/ExternalTexts[.]json"; ["\($base)/ExternalTexts.json?t=%timestamp%"])
+                | after("/UITexts[.]jsonc"; if $ui then ["\($base)/UITexts.jsonc?t=%timestamp%"] else [] end) else . end)
+        | .["productdata.url"] |= (if $on == "1" and $products then "\($base)/ProductData.json?t=%timestamp%"
+            elif (. // "" | ours) then "${gamedata.url}/ProductData.json?t=%timestamp%" else . end)' "$file" > "$file.new" 2> /dev/null; then
+        rm -f "$file.new"
+        say "      ${yellow}Kept configuration/renderer-config.json as it is: it is not plain JSON, so the client language was not set in it.${reset}"
+        return 0
+    fi
+    if [ "$(jq -S . "$file.new")" != "$(jq -S . "$file")" ]; then
+        # Writing over the file keeps its owner and permissions.
+        cat "$file.new" > "$file"
+    fi
+    rm -f "$file.new"
+}
+
+language_emulator_config() { # language_emulator_config <config.json>: the AIR client's texts and products in the active language
+    local file=$1 dir on='' products=false
+    sed '1s/^\xEF\xBB\xBF//' "$file" | jq -e 'has("AirClient")' > /dev/null 2>&1 || return 0
+    dir=$(language_dir)
+    if [ "$(language_active)" != en ]; then on=1; fi
+    if [ -f "$dir/ProductData.json" ]; then products=true; fi
+    sed '1s/^\xEF\xBB\xBF//' "$file" | jq --arg dir "$dir" --arg stock "$HOTEL_ROOT/hotel-files/gamedata/ProductData.json" \
+        --arg on "$on" --argjson products "$products" '
+        def ours: type == "string" and startswith($dir + "/");
+        .AirClient.ExternalTextsFiles = (((.AirClient.ExternalTextsFiles // []) | map(select(ours | not)))
+            + (if $on == "1" then [$dir + "/ExternalTexts.json"] else [] end))
+        | if $on == "1" and $products then .AirClient.ProductDataFile = $dir + "/ProductData.json"
+          elif (.AirClient.ProductDataFile | ours) then .AirClient.ProductDataFile = $stock else . end' > "$file.new"
+    cat "$file.new" > "$file"
+    rm -f "$file.new"
+}
+
+language_furni_names() { # the furniture table's names in the active language, only when it changed, so names the owner edited stay; sets NAMES_CHANGED=1
+    local active source filter statements
+    NAMES_CHANGED=0
+    active=$(language_active)
+    [ "${FURNI_LANGUAGE:-en}" != "$active" ] || return 0
+    if [ "$active" = en ]; then
+        source=$HOTEL_ROOT/hotel-files/gamedata/FurnitureData.json
+        filter='[.roomitemtypes.furnitype[]?, .wallitemtypes.furnitype[]?] | map(select(.classname | type == "string")
+            | {key: .classname, value: {name: (.name // ""), description: (.description // "")}}) | from_entries'
+    else
+        source=$(language_dir)/furni-names.json filter=.
+    fi
+    [ -f "$source" ] || return 0
+    statements=$(mktemp)
+    {
+        echo 'CREATE TEMPORARY TABLE language_furni_names (classname VARCHAR(255) NOT NULL PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL) CHARACTER SET utf8mb4;'
+        jq -r --arg q "'" "$filter"' | def sql: $q + (tostring | gsub("\\\\"; "\\\\") | gsub($q; $q + $q)) + $q;
+            to_entries | _nwise(500) | "INSERT IGNORE INTO language_furni_names VALUES "
+            + (map("(" + (.key | sql) + ", " + (.value.name | sql) + ", " + (.value.description | sql) + ")") | join(", ")) + ";"' "$source"
+        echo 'UPDATE furniture f INNER JOIN language_furni_names n ON n.classname = f.item_name SET f.name = LEFT(n.name, 255), f.description = LEFT(n.description, 1024);'
+    } > "$statements"
+    sql plus < "$statements"
+    rm -f "$statements"
+    FURNI_LANGUAGE=$active NAMES_CHANGED=1
+    save_state
+}
+
+language_website() { # the website's default language; a visitor still gets their browser's language when the website has it
+    local env=$HOTEL_ROOT/cms/.env
+    [ -f "$env" ] || return 0
+    if grep -qxF "APP_LOCALE=\"$HOTEL_LANGUAGE\"" "$env"; then return 0; fi
+    set_env "$env" APP_LOCALE "$HOTEL_LANGUAGE"
+    (cd "$HOTEL_ROOT/cms" && php artisan optimize:clear && php artisan optimize) || say "      ${yellow}The website reads its new language after: cd $HOTEL_ROOT/cms && sudo php artisan optimize${reset}"
+}
+
+language_apply() { # language_apply <restart>: the hotel in the chosen language; with restart=1 a running emulator restarts when its settings or names changed
+    local config=$HOTEL_ROOT/emulator/Config/config.json before changed=0 name
+    name=$(language_name "${HOTEL_LANGUAGE:-en}")
+    if [ "${HOTEL_LANGUAGE:-en}" = en ]; then
+        rm -rf "$(language_dir)"
+    elif fetch_language_pack; then
+        ok "$name language pack downloaded and checked"
+    elif [ "$(language_active)" = "$HOTEL_LANGUAGE" ]; then
+        say "      ${yellow}$LANGUAGE_ERROR The hotel keeps the $name texts it had. Try again later: sudo plusemu-update --language $HOTEL_LANGUAGE${reset}"
+    else
+        say "      ${yellow}$LANGUAGE_ERROR The client stays English for now. Try again later: sudo plusemu-update --language $HOTEL_LANGUAGE${reset}"
+    fi
+    if [ "$(language_active)" != en ]; then language_product_data; fi
+    language_client_config "$HOTEL_ROOT/client/configuration/renderer-config.json"
+    language_website
+    if [ -f "$config" ]; then
+        before=$(cat "$config")
+        language_emulator_config "$config"
+        if [ "$(cat "$config")" != "$before" ]; then changed=1; fi
+    fi
+    language_furni_names
+    if [ "$NAMES_CHANGED" = 1 ]; then
+        changed=1
+        ok "Furniture names are now $(language_name "$FURNI_LANGUAGE") (names you edited were replaced)"
+    fi
+    if [ "$1" = 1 ] && [ "$changed" = 1 ] && systemctl is-active --quiet plusemu; then
+        # The emulator reads these settings and builds the furniture data when it starts.
+        systemctl restart plusemu
+        wait_for_emulator || die "The emulator didn't start. See: journalctl -u plusemu -n 100"
+        ok "The emulator restarted with the new language (players were disconnected)"
+    fi
+}
+
+language_main() { # --language <code> on an installed hotel: switch its language and keep it in later updates
+    MODE=update
+    trap 'on_error $LINENO' ERR
+    preflight 1
+    if [ ! -f "$STATE_FILE" ] || [ ! -x "$HOTEL_ROOT/emulator/Plus Emulator" ]; then
+        die "No hotel from the PlusEMU installer was found on this server. Install one first."
+    fi
+    exec 9> "$LOCK_FILE"
+    flock -n 9 || die "An update or a backup is running. Try again in a few minutes."
+    exec >> "$LOG" 2>&1
+    local trace=${-//[^x]/}
+    { set +x; } 2> /dev/null
+    LOCAL=no AIR='' AIR_GAME_HOST='' REMOTE_DATABASE='' HOTEL_LANGUAGE='' FURNI_LANGUAGE=en
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+    if [ -n "$trace" ]; then set -x; fi
+    select_language "$HOTEL_LANGUAGE"
+    save_state
+    TOTAL_STEPS=1
+    step "Switching the hotel to $(language_name "$HOTEL_LANGUAGE")"
+    language_apply 1
+    say ""
+    if [ "$(language_active)" = "$HOTEL_LANGUAGE" ]; then
+        say "${green}${bold}✓ Your hotel is now $(language_name "$HOTEL_LANGUAGE").${reset} Players see it when they reload the hotel page."
+    else
+        say "${yellow}${bold}The language is saved as $(language_name "$HOTEL_LANGUAGE"), but the client texts are not in place yet.${reset}"
+    fi
+    say "  Updates keep this language. Catalogue pages and emulator messages stay as they are."
 }
 
 air_main() { # --with-air on an installed hotel: turn on the AIR client and keep it on in later updates
@@ -3348,7 +3577,9 @@ rollback_update() {
 update_main() {
     local check=0 rollback=0 assets_only=0 arg latest_emulator latest_client latest_assets
     local update_emulator=0 update_client=0 update_assets=0
-    for arg in "$@"; do
+    while [ "$#" -gt 0 ]; do
+        arg=$1
+        shift
         case "$arg" in
             --check) check=1 ;;
             --yes) PLUSEMU_YES=1 ;;
@@ -3363,7 +3594,15 @@ update_main() {
                 air_main
                 return
                 ;;
-            *) die "Unknown option: $arg. Usage: plusemu-update [--check] [--yes] [--assets] [--rollback] [--install-camera] [--with-air]" ;;
+            --language=* | --language)
+                LANGUAGE_OPTION=${arg#--language}
+                LANGUAGE_OPTION=${LANGUAGE_OPTION#=}
+                if [ "$arg" = --language ]; then LANGUAGE_OPTION=${1:-}; fi
+                if [ -z "$LANGUAGE_OPTION" ]; then die "Usage: plusemu-update --language <code>, with code one of: $LANGUAGES"; fi
+                language_main
+                return
+                ;;
+            *) die "Unknown option: $arg. Usage: plusemu-update [--check] [--yes] [--assets] [--rollback] [--install-camera] [--with-air] [--language <code>]" ;;
         esac
     done
     MODE=update
@@ -3378,6 +3617,7 @@ update_main() {
     : > "$LOG"
     chmod 600 "$LOG"
     exec >> "$LOG" 2>&1
+    HOTEL_LANGUAGE=en FURNI_LANGUAGE=en
     # shellcheck disable=SC1090
     . "$STATE_FILE"
     EMULATOR_VERSION=unknown CLIENT_VERSION=unknown ASSETS_VERSION=unknown
@@ -3395,7 +3635,10 @@ update_main() {
     fi
     if [ "$assets_only" = 1 ]; then
         add_hotel_files "$check"
-        if [ "$check" = 0 ]; then use_current_habbicons "$HOTEL_ROOT/client"; fi
+        if [ "$check" = 0 ]; then
+            use_current_habbicons "$HOTEL_ROOT/client"
+            if [ "$HOTEL_LANGUAGE" != en ] || [ "$FURNI_LANGUAGE" != en ]; then language_apply 1; fi
+        fi
         return
     fi
 
@@ -3520,6 +3763,8 @@ update_main() {
     fi
     if [ "$update_client" = 0 ]; then use_current_habbicons "$HOTEL_ROOT/client"; fi
     RESTORE_FROM=
+    # The update is done here, so a problem with the language pack never restores the previous version.
+    if [ "$HOTEL_LANGUAGE" != en ] || [ "$FURNI_LANGUAGE" != en ]; then language_apply 1; fi
     # The update is done here, so a problem with the AIR client warns and never restores the previous version.
     if [ "${AIR_READY:-0}" = 1 ]; then
         if ! air_server; then say "      ${yellow}$AIR_ERROR${reset}"; fi
@@ -3551,7 +3796,7 @@ main() {
         case "$1" in
             --guide-mode)
                 if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
-                    die "Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off] [--setup-ssh] [--install-camera] [--with-air]"
+                    die "Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off] [--setup-ssh] [--install-camera] [--with-air] [--language <code>]"
                 fi
                 GUIDE_MODE_OPTION=$2
                 shift 2
@@ -3568,6 +3813,15 @@ main() {
                 AIR_OPTION=1
                 shift
                 ;;
+            --language=*)
+                LANGUAGE_OPTION=${1#*=}
+                shift
+                ;;
+            --language)
+                if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then die "Usage: install.sh --language <code>, with code one of: $LANGUAGES"; fi
+                LANGUAGE_OPTION=$2
+                shift 2
+                ;;
             --install-camera)
                 camera_main
                 return
@@ -3579,7 +3833,7 @@ main() {
                 REMOTE_DATABASE_OPTION=$2
                 shift 2
                 ;;
-            *) die "Unknown option: $1. Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off] [--setup-ssh] [--install-camera] [--with-air]" ;;
+            *) die "Unknown option: $1. Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off] [--setup-ssh] [--install-camera] [--with-air] [--language <code>]" ;;
         esac
     done
     if [ -n "${REMOTE_DATABASE_OPTION:-}" ] && [ -f "$STATE_FILE" ]; then
@@ -3625,6 +3879,7 @@ main() {
     write_client_config
     install_camera
     install_cms
+    language_apply 1
     configure_web
     secure_server
     write_guide

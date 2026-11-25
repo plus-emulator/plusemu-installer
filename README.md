@@ -467,6 +467,73 @@ python3 tools/patch-air-client.py build --zip HabboWin.zip --habbo-version 38 --
 
 `python3 tools/patch-air-client.py check` tells whether the published client is Habbo's newest.
 
+## Hotel language
+
+The hotel is English by default. With `--language <code>`, the client texts, the furniture and product names and the website's default language come from that Habbo hotel instead.
+
+| Code | Language | Texts from |
+|---|---|---|
+| `en` | English (default) | the stock hotel files |
+| `de` | German | habbo.de |
+| `nl` | Dutch | habbo.nl |
+| `fr` | French | habbo.fr |
+| `es` | Spanish | habbo.es |
+| `it` | Italian | habbo.it |
+| `fi` | Finnish | habbo.fi |
+| `tr` | Turkish | habbo.com.tr |
+| `br` | Brazilian Portuguese | habbo.com.br |
+
+**New hotel or rerun:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash -s -- --language de
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.ps1))) -Language de
+```
+
+**Installed hotel:**
+
+```bash
+sudo plusemu-update --language de
+```
+
+```powershell
+plusemu-update -Language de
+```
+
+`PLUSEMU_LANGUAGE=de` does the same as the option on an install. The choice is saved (`HOTEL_LANGUAGE='de'` in `/etc/plusemu/hotel.env`, `"Language": "de"` in `C:\ProgramData\PlusEMU\hotel.json`), so reruns and `plusemu-update` keep it and download the newest pack. Go back to English with `--language en`.
+
+**What it sets up**
+- Downloads the language pack list from `https://assets.plusemu.dev/language/<code>.json`, then the pack. It checks the pack's SHA-256 and unpacks it into `hotel-files/language/`. When a download fails, a hotel that already has the pack keeps it; otherwise the client stays English until the next try.
+- Volt loads the pack's `ExternalTexts.json` right after the stock one, and its `UITexts.jsonc` right after the stock one, in `configuration/renderer-config.json`. The hotel's own text files (for example `hotel-texts.json`) still load later, so they still win. Volt has its own interface texts for `de`, `nl`, `fr`, `es` and `it`; the other languages keep Volt's English interface texts.
+- Builds `hotel-files/language/ProductData.json`: every stock product, with the name and description from the pack. Volt and the AIR client load this file.
+- The AIR client (with `--with-air`) gets the pack's texts after its other texts in `Config/config.json`.
+- Writes the furniture names and descriptions from the pack into the `furniture` table (`name` and `description`, matched by `item_name`). This only happens when the language changes, and it replaces names you edited. Going back to English writes the names from the stock `FurnitureData.json`.
+- Sets `APP_LOCALE` for Atom CMS. A visitor still gets their browser's language when the website has it.
+- Restarts the emulator when its settings or the furniture names changed (players are disconnected).
+
+**What stays as it is**
+- Catalogue page titles and texts: they live in the database, and Habbo does not publish them.
+- Emulator messages, such as command replies and alerts.
+- Badge names on the website.
+
+### Language packs (maintainers)
+
+Build and publish the packs with [`tools/language-pack.py`](tools/language-pack.py). It downloads each hotel's `external_flash_texts`, `furnidata_json` and `productdata_json`, and Volt's `UITexts_<code>.jsonc.example` when Volt has one. Hotels get a new pack with their next `plusemu-update`.
+
+```bash
+python3 tools/language-pack.py build --all --out dist
+CLOUDFLARE_API_TOKEN=... python3 tools/language-pack.py publish dist
+```
+
+Habbo blocks many data center addresses. When `build` fails with HTTP 403 or 463, run it from a home connection, or save the three files from a browser and pass them in:
+
+```bash
+python3 tools/language-pack.py build --language de --source <folder with external_flash_texts.txt, furnidata.json and productdata.json> --out dist
+```
+
 ## One-command updates
 
 Hotels set up with this installer update the emulator, the client and the hotel files in place, on Linux and on Windows.
@@ -499,6 +566,7 @@ plusemu-update
 - Keeps your `Config/` and `configuration/` files and anything you added. New settings are added, your own values stay.
 - Sets up the camera when the new emulator release has it (see [Camera on an installed hotel](#camera-on-an-installed-hotel)).
 - With the [AIR client](#habbo-air-client) on: installs the newest AIR texts and client version, and keeps the handshake key.
+- With a [hotel language](#hotel-language) other than English: installs the newest language pack and keeps the hotel in that language.
 - Restores the backup automatically if any step fails.
 
 **Options** (Linux `--check`, Windows `-Check`, and so on)
@@ -506,6 +574,7 @@ plusemu-update
 - `yes`: update without the "Update now?" question.
 - `install-camera`: set up the camera only, without updating anything (see [Camera on an installed hotel](#camera-on-an-installed-hotel)).
 - `with-air`: turn on the AIR client, without updating anything. Later updates keep it on (see [Habbo AIR client](#habbo-air-client)).
+- `language <code>`: switch the hotel's language, without updating anything. Later updates keep it (see [Hotel language](#hotel-language)).
 - `rollback`: restore the last backup. The database goes back too, so progress since then is lost.
 - `assets`: hotel files only, without stopping the emulator. Adds every stock file the hotel lacks and leaves the files it already has as they are. Only the `gamedata` index (clothing, effects, products, texts) is replaced; the previous one is kept in the backups folder as `gamedata-<version>`. Run the full update afterwards when new clothing does not show: the emulator's clothing data comes with it.
 
@@ -626,6 +695,7 @@ To install without questions, set the answers in environment variables:
 | `PLUSEMU_ADMIN_EMAIL` | Admin email (default `admin@<domain>`, or `admin@localhost.test` for a local install) |
 | `PLUSEMU_YES=1` | Skip the confirmation question |
 | `PLUSEMU_AIR=1` | Set up the [Habbo AIR client](#habbo-air-client) (the same as `--with-air` or `-WithAir`). Once on, it stays on. |
+| `PLUSEMU_LANGUAGE=<code>` | The [hotel language](#hotel-language) (the same as `--language` or `-Language`): `en`, `de`, `nl`, `fr`, `es`, `it`, `fi`, `tr` or `br`. |
 | `PLUSEMU_CLOUDFLARE_TOKEN` | Cloudflare API token for [Connect Cloudflare automatically](#connect-cloudflare-automatically). It is used once and never saved. Without it, `PLUSEMU_YES=1` skips that step. |
 
 ```bash
@@ -636,7 +706,7 @@ curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/mai
 Advanced overrides:
 
 - `INSTALLER_REF` installs from another branch or tag of this repository.
-- `EMULATOR_URL`, `CLIENT_URL`, `ASSET_PACK_URL`, `ATOM_REPO` and `ATOM_REF` change where the components come from. A custom emulator or client URL is saved as version `custom`.
+- `EMULATOR_URL`, `CLIENT_URL`, `ASSET_PACK_URL`, `LANGUAGE_MANIFEST_URL`, `ATOM_REPO` and `ATOM_REF` change where the components come from. A custom emulator or client URL is saved as version `custom`.
 
 ## Troubleshooting
 
