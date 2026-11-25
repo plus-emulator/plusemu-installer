@@ -25,8 +25,10 @@
 # Set up the camera on a hotel that is already installed: plusemu-update -InstallCamera
 # -WithAir (or PLUSEMU_AIR=1) sets up the Habbo AIR client for players who use HabboCustomLauncher. Updates keep it on.
 # Turn it on for a hotel that is already installed: plusemu-update -WithAir
+# -Language <code> (or PLUSEMU_LANGUAGE) shows the client texts, furniture names and website in that language:
+# en, de, nl, fr, es, it, fi, tr or br. Updates keep it. On an installed hotel: plusemu-update -Language de
 
-param([string]$GuideMode, [switch]$Local, [switch]$Update, [switch]$Check, [switch]$Yes, [switch]$Rollback, [switch]$Assets, [switch]$WithAssets, [switch]$InstallCamera, [switch]$WithAir)
+param([string]$GuideMode, [switch]$Local, [switch]$Update, [switch]$Check, [switch]$Yes, [switch]$Rollback, [switch]$Assets, [switch]$WithAssets, [switch]$InstallCamera, [switch]$WithAir, [string]$Language)
 
 function Get-Setting($Name, $Default) {
     $value = [Environment]::GetEnvironmentVariable($Name)
@@ -85,6 +87,8 @@ $NodeMajor  = 22
 $MariaDbSeries = '11.4'
 # The patched AIR client and Habbo's AIR texts, published by tools/patch-air-client.py.
 $AirManifestUrl = Get-Setting 'AIR_MANIFEST_URL' 'https://assets.plusemu.dev/air/latest.json'
+# The language packs (<code>.json manifests), published by tools/language-pack.py. English is the stock hotel files.
+$LanguageManifestUrl = Get-Setting 'LANGUAGE_MANIFEST_URL' 'https://assets.plusemu.dev/language'
 # The AIR client's game port: the emulator's Flash listener, open to every address.
 $AirPort = 30000
 $script:TotalSteps = 13
@@ -370,6 +374,7 @@ function Write-UpdateCommand {
     Write-Utf8 $UpdateCommand @"
 # Installed by the PlusEMU installer. Updates PlusEMU, the Volt client and the hotel files with the newest installer:
 #   plusemu-update [-Check] [-Yes] [-Assets] [-Rollback]
+# Switch the hotel's language: plusemu-update -Language <code>
 # When this file is missing, run the update once from the installer itself (Administrator PowerShell):
 #   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.ps1))) -Update
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -494,8 +499,10 @@ function Read-Answers {
         $isLocal = Resolve-Local ([bool]$state.Local)
         $selectedMode = Resolve-GuideMode $state.GuideMode
         $air = Resolve-Air ([bool]$state.Air)
-        $airChanged = $air -ne [bool]$state.Air
+        $language = Resolve-Language "$($state.Language)"
+        $airChanged = $air -ne [bool]$state.Air -or $language -ne (Get-HotelLanguage)
         $state | Add-Member -MemberType NoteProperty -Name Air -Value $air -Force
+        $state | Add-Member -MemberType NoteProperty -Name Language -Value $language -Force
         if ($isLocal) {
             Say 'Found the settings of an earlier run on this PC (http://localhost); continuing that installation.'
             $script:DiscordWebhookNew = $false
@@ -568,6 +575,7 @@ function Read-Answers {
     $script:state = [pscustomobject]@{
         Domain = $domain; WsUrl = $ws; HotelName = $name; AdminUser = $user; AdminEmail = $mail
         GuideMode = $selectedMode; DiscordWebhook = $webhook; Local = $isLocal; Air = $air; AirGameHost = ''
+        Language = Resolve-Language; FurniLanguage = 'en'
         AdminPassword = New-AdminPassword; DbPassword = New-Secret 32; DbRootPassword = New-Secret 32
     }
     $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8
@@ -1075,6 +1083,7 @@ function Install-Cms {
         TRUSTED_PROXIES = ($proxies -join ',')
     }
     if ($script:AirReady) { $settings.AIR_CLIENT_ENABLED = 'true' }
+    $settings.APP_LOCALE = Get-HotelLanguage
     foreach ($key in $settings.Keys) { Set-EnvValue $envFile $key $settings[$key] }
 
     $env:COMPOSER_ALLOW_SUPERUSER = '1'; $env:COMPOSER_NO_INTERACTION = '1'
@@ -1650,6 +1659,7 @@ function Set-AirSettings($Json) {
         ClientVersion = if ($script:AirClientUrl) { $script:AirVersion } else { "$($air.ClientVersion)" }
     }
     foreach ($key in $values.Keys) { $air | Add-Member -NotePropertyName $key -NotePropertyValue $values[$key] -Force }
+    Set-LanguageAirSettings $Json
 }
 
 # A global rule, like the installer's other rules: Atom's own web.config is reset on every run.
@@ -1866,6 +1876,296 @@ function Invoke-InstallAir {
         Ok "air.json, the game data and port $AirPort answer"
         Write-AirSummary
         Write-Host ''
+    } finally {
+        $lock.Dispose()
+    }
+}
+
+# ---------------------------------------------------------------- language
+
+function Get-LanguageCodes { return @('en', 'de', 'nl', 'fr', 'es', 'it', 'fi', 'tr', 'br') }
+
+function Resolve-Language($Saved) {
+    $choice = if ($Language) { $Language } else { Get-Setting 'PLUSEMU_LANGUAGE' "$Saved" }
+    if (-not $choice) { $choice = 'en' }
+    $choice = "$choice".ToLowerInvariant()
+    if ($choice -notin (Get-LanguageCodes)) { throw "Unknown language: $choice. Choose one of: $((Get-LanguageCodes) -join ' ')." }
+    return $choice
+}
+
+function Get-LanguageName($Code) {
+    switch ($Code) {
+        'de' { 'German' } 'nl' { 'Dutch' } 'fr' { 'French' } 'es' { 'Spanish' } 'it' { 'Italian' }
+        'fi' { 'Finnish' } 'tr' { 'Turkish' } 'br' { 'Brazilian Portuguese' } default { 'English' }
+    }
+}
+
+function Get-HotelLanguage { if ("$($state.Language)") { return "$($state.Language)" } return 'en' }
+function Get-FurniLanguage { if ("$($state.FurniLanguage)") { return "$($state.FurniLanguage)" } return 'en' }
+function Get-LanguageDir { return Join-Path (Join-Path $HotelRoot 'hotel-files') 'language' }
+
+function Save-State { $state | ConvertTo-Json | Set-Content $StateFile -Encoding UTF8 }
+
+# The language the client shows: the chosen one once its pack is in place, English until then.
+function Get-ActiveLanguage {
+    $code = Get-HotelLanguage
+    $marker = Join-Path (Get-LanguageDir) '.language'
+    if ($code -ne 'en' -and (Test-Path $marker) -and "$(Get-Content $marker -Raw)".Trim() -eq $code) { return $code }
+    return 'en'
+}
+
+# Downloads the chosen language's pack into hotel-files\language. Returns $false, with the reason in
+# $script:LanguageError, when the download fails or does not match its checksum; the old files then stay.
+function Get-LanguagePack {
+    $code = Get-HotelLanguage
+    $name = Get-LanguageName $code
+    $tmp = Join-Path $Downloads "language-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    New-Item -ItemType Directory -Force -Path (Join-Path $tmp 'pack') | Out-Null
+    try {
+        $list = Join-Path $tmp 'manifest.json'
+        $manifest = $null
+        if ((Invoke-Curl @('-fsSL', '--retry', '3', '--max-time', '60', '-o', $list, "$LanguageManifestUrl/$code.json")).Code -eq 0) {
+            try { $manifest = Get-Content $list -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+        }
+        if (-not $manifest -or "$($manifest.language)" -cne $code -or -not "$($manifest.url)".StartsWith('https://') -or "$($manifest.sha256)" -cnotmatch '^[0-9a-f]{64}$') {
+            $script:LanguageError = "Could not read the $name language pack at $LanguageManifestUrl/$code.json."
+            return $false
+        }
+        $archive = Join-Path $tmp 'pack.tar.gz'
+        $pack = Join-Path $tmp 'pack'
+        $complete = (Invoke-Curl @('-fsSL', '--retry', '3', '--max-time', '300', '-o', $archive, $manifest.url)).Code -eq 0 -and
+            (Test-Path $archive) -and (Get-FileHash $archive -Algorithm SHA256).Hash -eq $manifest.sha256.ToUpper() -and
+            (Invoke-Tar @('-xzf', $archive, '-C', $pack)) -eq 0
+        foreach ($file in 'ExternalTexts.json', 'furni-names.json', 'product-names.json') {
+            if ($complete -and -not (Test-Path (Join-Path $pack $file))) { $complete = $false }
+        }
+        if (-not $complete) {
+            $script:LanguageError = "The download of the $name language pack failed, or it does not match its published checksum."
+            return $false
+        }
+        Write-Utf8 (Join-Path $pack '.language') "$code`n"
+        $dir = Get-LanguageDir
+        if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
+        Move-Item $pack $dir
+        return $true
+    } finally {
+        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Node.js reads the large gamedata files, which Windows PowerShell's ConvertFrom-Json cannot.
+function Invoke-LanguageNode([string[]]$Arguments) {
+    $node = Get-NodeExe
+    $result = @'
+const fs = require('node:fs');
+const [command, ...args] = process.argv.slice(2);
+const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, ''));
+const write = (file, value, indent) => fs.writeFileSync(file, JSON.stringify(value, null, indent) + (indent ? '\n' : ''));
+if (command === 'products') {
+    const [stock, names, out] = args;
+    const data = read(stock), translated = read(names);
+    data.productdata.product = data.productdata.product.map((product) => ({ ...product, ...(translated[product.code] || {}) }));
+    write(out, data, 0);
+} else if (command === 'renderer') {
+    const [file, base, on, ui, products] = args;
+    let settings;
+    try {
+        const text = new TextDecoder('utf-8', { fatal: true }).decode(fs.readFileSync(file));
+        settings = JSON.parse(text, (key, value, context) => typeof value === 'number' ? JSON.rawJSON(context.source) : value);
+    } catch (error) {
+        if (!(error instanceof SyntaxError) && error.code !== 'ERR_ENCODING_INVALID_ENCODED_DATA') throw error;
+        console.log('invalid');
+        process.exit(0);
+    }
+    const before = JSON.stringify(settings);
+    const ours = (url) => typeof url === 'string' && url.includes('/hotel-files/language/');
+    const after = (list, pattern, add) => {
+        const out = [];
+        for (const url of list) { out.push(url); if (pattern.test(url)) out.push(...add); }
+        return out.length === list.length ? out.concat(add) : out;
+    };
+    let texts = (settings['external.texts.url'] || []).filter((url) => !ours(url));
+    if (on === '1') {
+        texts = after(texts, /\/ExternalTexts\.json/, [`${base}/ExternalTexts.json?t=%timestamp%`]);
+        texts = after(texts, /\/UITexts\.jsonc/, ui === '1' ? [`${base}/UITexts.jsonc?t=%timestamp%`] : []);
+    }
+    settings['external.texts.url'] = texts;
+    if (on === '1' && products === '1') settings['productdata.url'] = `${base}/ProductData.json?t=%timestamp%`;
+    else if (ours(settings['productdata.url'])) settings['productdata.url'] = '${gamedata.url}/ProductData.json?t=%timestamp%';
+    if (JSON.stringify(settings) !== before) write(file, settings, 4);
+    console.log('ok');
+} else if (command === 'sql') {
+    const [source, kind, out] = args;
+    let names = read(source);
+    if (kind === 'stock') {
+        const entries = [...(names.roomitemtypes?.furnitype || []), ...(names.wallitemtypes?.furnitype || [])];
+        names = Object.fromEntries(entries.filter((entry) => typeof entry.classname === 'string')
+            .map((entry) => [entry.classname, { name: entry.name ?? '', description: entry.description ?? '' }]));
+    }
+    const sql = (value) => "'" + String(value ?? '').replace(/\\/g, '\\\\').replace(/'/g, "''") + "'";
+    const rows = Object.entries(names).map(([key, value]) => `(${sql(key)}, ${sql(value.name)}, ${sql(value.description)})`);
+    const lines = ['CREATE TEMPORARY TABLE language_furni_names (classname VARCHAR(255) NOT NULL PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL) CHARACTER SET utf8mb4;'];
+    for (let start = 0; start < rows.length; start += 500) lines.push(`INSERT IGNORE INTO language_furni_names VALUES ${rows.slice(start, start + 500).join(', ')};`);
+    lines.push('UPDATE furniture f INNER JOIN language_furni_names n ON n.classname = f.item_name SET f.name = LEFT(n.name, 255), f.description = LEFT(n.description, 1024);');
+    fs.writeFileSync(out, lines.join('\n') + '\n');
+}
+'@ | & $node - @Arguments
+    if ($LASTEXITCODE -ne 0) { throw "Could not prepare the language files. See $script:Log" }
+    return $result
+}
+
+# hotel-files\language\ProductData.json: the stock products with the pack's names.
+function Write-LanguageProductData {
+    $dir = Get-LanguageDir
+    $out = Join-Path $dir 'ProductData.json'
+    $stock = Join-Path (Join-Path (Join-Path $HotelRoot 'hotel-files') 'gamedata') 'ProductData.json'
+    Remove-Item $out -ErrorAction SilentlyContinue
+    if (-not (Test-Path $stock)) { return }
+    try { $null = Invoke-LanguageNode @('products', $stock, (Join-Path $dir 'product-names.json'), $out) }
+    catch { Remove-Item $out -ErrorAction SilentlyContinue }
+}
+
+# The client loads the active language's texts after the stock ones, so the hotel's own texts still win.
+function Set-LanguageClientConfig($File) {
+    if (-not (Test-Path $File)) { return }
+    $dir = Get-LanguageDir
+    $on = if ((Get-ActiveLanguage) -ne 'en') { '1' } else { '' }
+    $ui = if (Test-Path (Join-Path $dir 'UITexts.jsonc')) { '1' } else { '' }
+    $products = if (Test-Path (Join-Path $dir 'ProductData.json')) { '1' } else { '' }
+    $result = Invoke-LanguageNode @('renderer', $File, "$(Get-SiteUrl)/hotel-files/language", $on, $ui, $products)
+    if ("$result" -eq 'invalid') {
+        Say '      Kept configuration/renderer-config.json as it is: it is not plain JSON, so the client language was not set in it.' 'Yellow'
+    }
+}
+
+# Changes a setting where it is, so an unchanged run writes the same file.
+function Set-JsonValue($Object, $Name, $Value) {
+    if ($Object.PSObject.Properties[$Name]) { $Object.$Name = $Value } else { $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value }
+}
+
+# The AIR client's texts and products in the active language. Every other setting stays.
+function Set-LanguageAirSettings($Json) {
+    if (-not $Json.PSObject.Properties['AirClient']) { return }
+    $air = $Json.AirClient
+    $dir = Get-LanguageDir
+    $ours = { param($path) "$path".StartsWith("$dir$([IO.Path]::DirectorySeparatorChar)") }
+    $on = (Get-ActiveLanguage) -ne 'en'
+    $texts = @($air.ExternalTextsFiles | Where-Object { $_ -and -not (& $ours $_) })
+    if ($on) { $texts += Join-Path $dir 'ExternalTexts.json' }
+    Set-JsonValue $air ExternalTextsFiles @($texts)
+    $products = Join-Path $dir 'ProductData.json'
+    if ($on -and (Test-Path $products)) {
+        Set-JsonValue $air ProductDataFile $products
+    } elseif (& $ours $air.ProductDataFile) {
+        Set-JsonValue $air ProductDataFile (Join-Path (Join-Path (Join-Path $HotelRoot 'hotel-files') 'gamedata') 'ProductData.json')
+    }
+}
+
+# The furniture table's names in the active language, only when it changed, so names the owner edited stay.
+# Returns $true when the names were written.
+function Set-LanguageFurniNames {
+    $active = Get-ActiveLanguage
+    if ((Get-FurniLanguage) -eq $active) { return $false }
+    if ($active -eq 'en') {
+        $source = Join-Path (Join-Path (Join-Path $HotelRoot 'hotel-files') 'gamedata') 'FurnitureData.json'; $kind = 'stock'
+    } else {
+        $source = Join-Path (Get-LanguageDir) 'furni-names.json'; $kind = 'pack'
+    }
+    if (-not (Test-Path $source)) { return $false }
+    $statements = Join-Path $Downloads "furni-names-$([guid]::NewGuid().ToString('N').Substring(0, 8)).sql"
+    try {
+        $null = Invoke-LanguageNode @('sql', $source, $kind, $statements)
+        Import-Database $statements
+    } finally {
+        Remove-Item $statements -ErrorAction SilentlyContinue
+    }
+    $state | Add-Member -MemberType NoteProperty -Name FurniLanguage -Value $active -Force
+    Save-State
+    return $true
+}
+
+# The website's default language. A visitor still gets their browser's language when the website has it.
+function Set-LanguageWebsite {
+    $cms = Join-Path $HotelRoot 'cms'
+    $envFile = Join-Path $cms '.env'
+    if (-not (Test-Path $envFile)) { return }
+    $code = Get-HotelLanguage
+    if (@(Get-Content $envFile) -contains "APP_LOCALE=`"$code`"") { return }
+    Set-EnvValue $envFile 'APP_LOCALE' $code
+    Push-Location $cms
+    try {
+        Run "$PhpDir\php.exe" artisan optimize:clear
+        Run "$PhpDir\php.exe" artisan optimize
+    } finally {
+        Pop-Location
+    }
+}
+
+# The hotel in the chosen language. With -Restart a running emulator restarts when its settings or names changed.
+function Set-HotelLanguage([switch]$Restart) {
+    $code = Get-HotelLanguage
+    $name = Get-LanguageName $code
+    if ($code -eq 'en') {
+        $dir = Get-LanguageDir
+        if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
+    } elseif (Get-LanguagePack) {
+        Ok "$name language pack downloaded and checked"
+    } elseif ((Get-ActiveLanguage) -eq $code) {
+        Say "      $script:LanguageError The hotel keeps the $name texts it had. Try again later: plusemu-update -Language $code" 'Yellow'
+    } else {
+        Say "      $script:LanguageError The client stays English for now. Try again later: plusemu-update -Language $code" 'Yellow'
+    }
+    if ((Get-ActiveLanguage) -ne 'en') { Write-LanguageProductData }
+    Set-LanguageClientConfig (Join-Path (Join-Path (Join-Path $HotelRoot 'client') 'configuration') 'renderer-config.json')
+    Set-LanguageWebsite
+    $changed = $false
+    $config = Join-Path (Join-Path (Join-Path $HotelRoot 'emulator') 'Config') 'config.json'
+    if (Test-Path $config) {
+        $json = Get-Content $config -Raw -Encoding UTF8 | ConvertFrom-Json
+        $before = $json | ConvertTo-Json -Depth 20
+        Set-LanguageAirSettings $json
+        if (($json | ConvertTo-Json -Depth 20) -ne $before) {
+            Write-Utf8 $config ($json | ConvertTo-Json -Depth 20)
+            $changed = $true
+        }
+    }
+    if (Set-LanguageFurniNames) {
+        $changed = $true
+        Ok "Furniture names are now $(Get-LanguageName (Get-FurniLanguage)) (names you edited were replaced)"
+    }
+    if ($Restart -and $changed -and (Get-Service PlusEMU -ErrorAction SilentlyContinue).Status -eq 'Running') {
+        # The emulator reads these settings and builds the furniture data when it starts.
+        Restart-Service PlusEMU
+        if (-not (Wait-Emulator)) { throw "The emulator didn't start. See $(Join-Path (Join-Path (Join-Path $HotelRoot 'emulator') 'service') 'shawl_for_PlusEMU_rCURRENT.log')" }
+        Ok 'The emulator restarted with the new language (players were disconnected)'
+    }
+}
+
+# plusemu-update -Language <code>: switch the language of a hotel that is already installed. Later updates keep it.
+function Invoke-SetLanguage {
+    Assert-Administrator
+    if (-not (Test-Path $StateFile) -or -not (Test-Path (Join-Path (Join-Path $HotelRoot 'emulator') 'Plus Emulator.exe'))) {
+        throw 'No hotel from the PlusEMU installer was found on this server. Install one first.'
+    }
+    New-Item -ItemType Directory -Force -Path $StateDir, $Downloads | Out-Null
+    try { $lock = [IO.File]::Open($LockFile, 'OpenOrCreate', 'ReadWrite', 'None') }
+    catch { throw 'An update or a backup is running. Try again in a few minutes.' }
+    try {
+        $script:state = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $state | Add-Member -MemberType NoteProperty -Name Language -Value (Resolve-Language (Get-HotelLanguage)) -Force
+        Save-State
+        $script:TotalSteps = 1
+        $script:Step = 0
+        Step "Switching the hotel to $(Get-LanguageName (Get-HotelLanguage))"
+        Set-HotelLanguage -Restart
+        Say ''
+        if ((Get-ActiveLanguage) -eq (Get-HotelLanguage)) {
+            Say "Your hotel is now $(Get-LanguageName (Get-HotelLanguage)). Players see it when they reload the hotel page." 'Green'
+        } else {
+            Say "The language is saved as $(Get-LanguageName (Get-HotelLanguage)), but the client texts are not in place yet." 'Yellow'
+        }
+        Say '  Updates keep this language. Catalogue pages and emulator messages stay as they are.'
+        Say ''
     } finally {
         $lock.Dispose()
     }
@@ -3015,6 +3315,8 @@ function Update-Hotel([switch]$Check) {
     }
     if (-not $updateClient) { Use-CurrentHabbicons $client }
     $script:RestoreFrom = $null
+    # The update is done here, so a problem with the language pack never restores the previous version.
+    if ((Get-HotelLanguage) -ne 'en' -or (Get-FurniLanguage) -ne 'en') { Set-HotelLanguage -Restart }
     # The update is done here, so a problem with the AIR client warns and never restores the previous version.
     if ($script:AirReady) {
         try {
@@ -3065,7 +3367,10 @@ function Invoke-Update([switch]$Check, [switch]$Yes, [switch]$Rollback, [switch]
             if ($Rollback) { Restore-LastBackup }
             elseif ($Assets) {
                 Update-HotelFiles -Check:$Check
-                if (-not $Check) { Use-CurrentHabbicons (Join-Path $HotelRoot 'client') }
+                if (-not $Check) {
+                    Use-CurrentHabbicons (Join-Path $HotelRoot 'client')
+                    if ((Get-HotelLanguage) -ne 'en' -or (Get-FurniLanguage) -ne 'en') { Set-HotelLanguage -Restart }
+                }
             }
             else { Update-Hotel -Check:$Check }
         } finally {
@@ -3146,6 +3451,7 @@ function Install-Hotel {
     Write-ClientConfig
     Install-Camera
     Install-Cms
+    Set-HotelLanguage -Restart
     Set-IisSite
     Protect-Server
     Write-Guide
@@ -3160,6 +3466,8 @@ try {
         Invoke-InstallCamera
     } elseif ($Update -and $WithAir) {
         Invoke-InstallAir
+    } elseif ($Update -and $Language) {
+        Invoke-SetLanguage
     } elseif ($Update) {
         Invoke-Update -Check:$Check -Yes:$Yes -Rollback:$Rollback -Assets:$Assets
     } else {

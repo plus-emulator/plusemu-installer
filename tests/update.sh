@@ -305,8 +305,14 @@ diff -r -x camera "$TEST_DIR/before-assets" "$HOTEL_ROOT"
 MIGRATION=ok
 
 # The update installs the stock pack over the hotel files and the emulator's matching clothing data.
+# A hotel in another language gets its newest language pack after the update.
+printf "HOTEL_LANGUAGE='de'\n" >> "$STATE_FILE"
+language_apply() { echo "language_apply $HOTEL_LANGUAGE $1" >> "$TEST_DIR/calls"; }
 : > "$TEST_DIR/terminal"
 run_update --yes
+grep -qx 'language_apply de 1' "$TEST_DIR/calls"
+sed -i '/^HOTEL_LANGUAGE=/d' "$STATE_FILE"
+unset -f language_apply
 [[ $(< "$hotel_files/gamedata/FigureData.json") == 'figuredata 2' ]]
 [[ -f "$hotel_files/assets/furni/stock_2.nitro" && -f "$hotel_files/assets/custom/my_furni.nitro" ]]
 [[ ! -e "$hotel_files/.complete" ]]
