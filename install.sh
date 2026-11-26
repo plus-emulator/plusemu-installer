@@ -972,21 +972,37 @@ avatar_secret() { # the secret the website signs avatar addresses with; made onc
 
 draws_avatars() { [ -f "$HOTEL_ROOT/emulator/CameraRenderer/avatar.mjs" ]; } # this emulator release draws avatar images
 
+website_imager() { sql -N plus -e "SELECT value FROM website_settings WHERE \`key\` = 'avatar_imager'"; }
+
+set_website_imager() { # the website keeps its settings in a cache, so the old value is dropped from it
+    sql plus -e "UPDATE website_settings SET value = '$1' WHERE \`key\` = 'avatar_imager'" || return 1
+    (cd "$HOTEL_ROOT/cms" && php artisan cache:forget website_settings)
+}
+
 website_avatars() { # the website uses the hotel's own avatar images only while the camera service can draw them
-    local cms=$HOTEL_ROOT/cms secret="" current
+    local cms=$HOTEL_ROOT/cms secret="" current imager official='https://www.habbo.com/habbo-imaging/avatarimage?figure=' route
+    route="$(site_url)/api/avatar-image?figure="
     [ -f "$cms/.env" ] || return 0
-    if draws_avatars && [ -f "$cms/app/Services/Avatar/AvatarImager.php" ]; then secret=$(avatar_secret) || return 1; fi
+    if draws_avatars && [ -f "$cms/app/Http/Controllers/Api/AvatarImageController.php" ]; then secret=$(avatar_secret) || return 1; fi
     if [ -n "$secret" ]; then
         printf '17 4 * * * plusemu find %s -type f -atime +60 -delete; find %s -mindepth 2 -type d -empty -delete\n' "$HOTEL_ROOT/avatars" "$HOTEL_ROOT/avatars" > "$AVATAR_CRON"
     else
         rm -f "$AVATAR_CRON"
     fi
     current=$(sed -n 's/^AVATAR_IMAGER_SECRET="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$cms/.env" | tail -n 1)
-    if [ "$current" = "$secret" ]; then return 0; fi
-    set_env "$cms/.env" AVATAR_IMAGER_SECRET "$secret"
-    # The website reads its settings from a cache.
-    if [ -f "$cms/bootstrap/cache/config.php" ]; then
-        (cd "$cms" && php artisan config:cache && chown -R www-data:www-data bootstrap/cache) || return 1
+    if [ "$current" != "$secret" ]; then
+        set_env "$cms/.env" AVATAR_IMAGER_SECRET "$secret"
+        # The website reads its settings from a cache.
+        if [ -f "$cms/bootstrap/cache/config.php" ]; then
+            (cd "$cms" && php artisan config:cache && chown -R www-data:www-data bootstrap/cache) || return 1
+        fi
+    fi
+    # An imager address the owner chose stays as it is.
+    imager=$(website_imager) || return 1
+    if [ -n "$secret" ] && [ "$imager" = "$official" ]; then
+        set_website_imager "$route"
+    elif [ -z "$secret" ] && [ "$imager" = "$route" ]; then
+        set_website_imager "$official"
     fi
 }
 

@@ -34,6 +34,12 @@ port_answers() { [ "$1" = 3921 ]; }
 eval "$(declare -f camera_service | sed "s#/etc/systemd/system/plusemu-camera.service#$TEST_DIR/unit#")"
 camera_value() { sed -n "s/^$1=//p" "$CAMERA_ENV"; }
 website_value() { sed -n "s/^$1=\"\(.*\)\"$/\1/p" "$cms/.env"; }
+official='https://www.habbo.com/habbo-imaging/avatarimage?figure='
+route='https://hotel.example/api/avatar-image?figure='
+DOMAIN=hotel.example LOCAL=no
+echo "$official" > "$TEST_DIR/imager"
+website_imager() { cat "$TEST_DIR/imager"; }
+set_website_imager() { echo "$1" > "$TEST_DIR/imager"; echo "imager $1" >> "$TEST_DIR/calls"; }
 echo '{"Camera":{"Bearer":"0123456789abcdef0123456789abcdef0123456789abcdef","OutputDirectory":"camera"}}' > "$HOTEL_ROOT/emulator/Config/config.json"
 touch "$renderer/server.mjs"
 printf 'APP_NAME="Hotel"\nAVATAR_IMAGER_SECRET=\n' > "$cms/.env"
@@ -50,6 +56,7 @@ camera_service
 website_avatars
 [ -z "$(website_value AVATAR_IMAGER_SECRET)" ]
 [ ! -e "$AVATAR_CRON" ]
+[ "$(website_imager)" = "$official" ]
 
 # A website that cannot sign addresses also keeps the official imager, even when the service could draw.
 touch "$renderer/avatar.mjs"
@@ -60,27 +67,36 @@ camera_service
 [ "$(stat -c %a "$CAMERA_ENV")" = 600 ]
 website_avatars
 [ -z "$(website_value AVATAR_IMAGER_SECRET)" ]
+[ "$(website_imager)" = "$official" ]
 
-# With both sides ready the website signs with the same secret, and old images are cleaned up every day.
-mkdir -p "$cms/app/Services/Avatar" && touch "$cms/app/Services/Avatar/AvatarImager.php"
+# With both sides ready the website signs with the same secret, draws avatars through its own route, and old images are cleaned up every day.
+mkdir -p "$cms/app/Http/Controllers/Api" && touch "$cms/app/Http/Controllers/Api/AvatarImageController.php"
 touch "$cms/bootstrap/cache/config.php" # the website has cached its settings
 : > "$TEST_DIR/calls"
 website_avatars
 [ "$(website_value AVATAR_IMAGER_SECRET)" = "$secret" ]
 grep -q 'php artisan config:cache' "$TEST_DIR/calls"
+[ "$(website_imager)" = "$route" ]
 grep -qF "find $HOTEL_ROOT/avatars -type f -atime +60 -delete" "$AVATAR_CRON"
 grep -qF "find $HOTEL_ROOT/avatars -mindepth 2 -type d -empty -delete" "$AVATAR_CRON"
 # A second run changes nothing and does not rebuild the website's settings.
 : > "$TEST_DIR/calls"
 website_avatars
 [ "$(website_value AVATAR_IMAGER_SECRET)" = "$secret" ]
-if grep -q 'php artisan' "$TEST_DIR/calls"; then echo 'the website settings were rebuilt without a change'; exit 1; fi
+if grep -qE 'php artisan|imager' "$TEST_DIR/calls"; then echo 'the website settings were rebuilt without a change'; exit 1; fi
+
+# An imager address the owner chose stays as it is.
+echo 'https://imager.example/?figure=' > "$TEST_DIR/imager"
+website_avatars
+[ "$(website_imager)" = 'https://imager.example/?figure=' ]
+echo "$route" > "$TEST_DIR/imager"
 
 # An emulator release that no longer draws avatars sends the website back to the official imager.
 rm "$renderer/avatar.mjs"
 website_avatars
 [ -z "$(website_value AVATAR_IMAGER_SECRET)" ]
 [ ! -e "$AVATAR_CRON" ]
+[ "$(website_imager)" = "$official" ]
 touch "$renderer/avatar.mjs"
 
 # nginx serves a stored image itself, asks the camera service for a missing one, and keeps other websites out.
