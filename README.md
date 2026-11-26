@@ -17,7 +17,7 @@ To try PlusEMU or to work on it on your own PC, use a [local install](#local-ins
 | | Linux | Windows |
 |---|---|---|
 | System | Debian 12/13 or Ubuntu 22.04/24.04/26.04 | Windows Server 2019/2022/2025 (Windows 10/11 for a [local install](#local-install)) |
-| Processor | 64-bit (x86_64 or arm64) | 64-bit |
+| Processor | 64-bit: arm64, or x86_64 at the x86-64-v2 level (SSE4.2 and POPCNT) | 64-bit at the x86-64-v2 level (SSE4.2 and POPCNT) |
 | Free disk space | 10 GB | 15 GB on `C:` |
 | Access | root (`sudo`) | PowerShell as Administrator |
 
@@ -53,6 +53,8 @@ The installer asks these questions. Press Enter to accept a suggested answer:
 7. Only with the advanced guide on Linux: whether to install CrowdSec (default no). See [CrowdSec](#crowdsec-advanced-guide-linux).
 
 After you confirm, the installer runs on its own in about 10 minutes. A [local install](#local-install) asks only questions 3 to 5.
+
+To let players also use Habbo's AIR desktop client, add `--with-air` (Linux) or `-WithAir` (Windows). See [Habbo AIR client](#habbo-air-client).
 
 ## Local install
 
@@ -282,13 +284,13 @@ Enter the database password at the prompt. On Windows, use `mariadb.exe` from yo
 
 ### Connect from your PC with HeidiSQL (Linux server)
 
-You can let your own PC reach the database directly. Find your PC's public IPv4 address, for example on <https://api.ipify.org>. Then run the installer on the server again with that address:
+You can let your own PC reach the database directly. Find your PC's public IPv4 address, for example on <https://api.ipify.org>. Then run the installer on the server with that address:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash -s -- --remote-database 203.0.113.7
 ```
 
-Replace `203.0.113.7` with your address. To allow more than one address, separate them with commas. A network such as `203.0.113.0/24` is allowed too, up to a `/8`. Only these addresses get through the firewall and have a database account. IPv6 addresses are not supported.
+Replace `203.0.113.7` with your address. On a hotel that is already installed, this changes only who can reach the database. The website, emulator and client stay as they are, so your own changes to them are kept. To allow more than one address, separate them with commas. A network such as `203.0.113.0/24` is allowed too, up to a `/8`. Only these addresses get through the firewall and have a database account. IPv6 addresses are not supported.
 
 In HeidiSQL, create a new session and fill in:
 
@@ -407,6 +409,132 @@ To stop managing CrowdSec, run the installer again with `PLUSEMU_CROWDSEC=0`. fa
 
 **Windows:** the Windows installer does not install CrowdSec. CrowdSec reads the visitor's address from the web server log, and IIS logs the address that connects to it, which is always Cloudflare's. CrowdSec on Windows would ban Cloudflare instead of attackers, or with Cloudflare on its whitelist, it could never ban a website visitor.
 
+## Habbo AIR client
+
+With this option, players can play the hotel with Habbo's AIR desktop client through [HabboCustomLauncher](https://github.com/DennisObject/HabboCustomLauncher/releases). Volt keeps working as before. Without the option, the installer changes nothing about the AIR client.
+
+**New hotel or rerun:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash -s -- --with-air
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.ps1))) -WithAir
+```
+
+**Installed hotel:**
+
+```bash
+sudo plusemu-update --with-air
+```
+
+```powershell
+plusemu-update -WithAir
+```
+
+`PLUSEMU_AIR=1` does the same as the option. The choice is saved (`AIR='yes'` in `/etc/plusemu/hotel.env`, `"Air": true` in `C:\ProgramData\PlusEMU\hotel.json`), so every later rerun and `plusemu-update` keeps the AIR client on and installs the newest AIR client version with each new emulator.
+
+**What it sets up**
+- Downloads the AIR client list from `https://assets.plusemu.dev/air/latest.json`, then Habbo's AIR texts. It checks their SHA-256 and saves them in the emulator's `Config/air/` folder. When a download fails, a new setup stops; a hotel that already has the texts keeps them.
+- Creates the emulator's handshake key `Config/rsa-private.pem` once, with `"Plus Emulator" --generate-rsa-key`. It never replaces an existing key: players' clients carry its public part.
+- Sets `Flash` to `0.0.0.0:30000`, `Encryption.RsaPrivateKeyFile`, and the `AirClient` settings in `Config/config.json`: the website address, the texts, the hotel's `ExternalTexts.json` and `ProductData.json`, badge and catalogue images from `/hotel-files/c_images/`, the game address and port, and the client download. Your other settings stay.
+- Game address: with a Cloudflare token, the installer adds a DNS-only (not proxied) record `game.<domain>`, because Cloudflare's proxy does not carry the client's game connection. Without a token, the client connects to the server's IPv4 address. Add the name later with `sudo PLUSEMU_CLOUDFLARE_TOKEN=<token> plusemu-update --with-air` (Windows: `$env:PLUSEMU_CLOUDFLARE_TOKEN = '<token>'; plusemu-update -WithAir`).
+- Opens TCP port 30000 to every address (ufw on Linux, the `plusemu-air-30000` rule on Windows). The website itself still accepts HTTPS from Cloudflare only.
+- Passes `/api/client/air.json`, `/api/client/air-ticket`, `/api/client/air-launcher-token`, `/gamedata/hashes` and the four `/gamedata/<file>/<hash>` paths to the emulator (nginx `location` blocks, or the IIS rule `PlusEMU AIR client`).
+- Sets `AIR_CLIENT_ENABLED=true` for Atom CMS and refreshes its caches, so the website shows the **Open AIR client** button.
+- Checks that `air.json`, `/gamedata/hashes` and port 30000 answer, and adds these checks to the [health check](#health-check-and-discord-alerts).
+
+A [local install](#local-install) uses `127.0.0.1` for the game port and changes no firewall or DNS.
+
+**What players do**
+1. Install HabboCustomLauncher from https://github.com/DennisObject/HabboCustomLauncher/releases.
+2. Open the hotel's website, sign in and press **Open AIR client**. Or type the hotel's domain as the hotel domain in the launcher.
+
+### A new Habbo AIR client (maintainers)
+
+When Habbo releases a new AIR client, build the patched client and publish it with [`tools/patch-air-client.py`](tools/patch-air-client.py). Hotels get it with their next `plusemu-update`.
+
+```bash
+python3 tools/patch-air-client.py build --out dist
+CLOUDFLARE_API_TOKEN=... python3 tools/patch-air-client.py publish dist
+```
+
+Habbo blocks many data center addresses. When `build` fails with HTTP 403 or 463, download `HabboWin.zip` and the two text files yourself, and pass them in:
+
+```bash
+python3 tools/patch-air-client.py build --zip HabboWin.zip --habbo-version 38 --texts <folder with external_variables.txt and external_flash_texts.txt> --out dist
+```
+
+`python3 tools/patch-air-client.py check` tells whether the published client is Habbo's newest.
+
+## Hotel language
+
+The hotel is English by default. With `--language <code>`, the client texts, the furniture and product names and the website's default language come from that Habbo hotel instead.
+
+| Code | Language | Texts from |
+|---|---|---|
+| `en` | English (default) | the stock hotel files |
+| `de` | German | habbo.de |
+| `nl` | Dutch | habbo.nl |
+| `fr` | French | habbo.fr |
+| `es` | Spanish | habbo.es |
+| `it` | Italian | habbo.it |
+| `fi` | Finnish | habbo.fi |
+| `tr` | Turkish | habbo.com.tr |
+| `br` | Brazilian Portuguese | habbo.com.br |
+
+**New hotel or rerun:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash -s -- --language de
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.ps1))) -Language de
+```
+
+**Installed hotel:**
+
+```bash
+sudo plusemu-update --language de
+```
+
+```powershell
+plusemu-update -Language de
+```
+
+`PLUSEMU_LANGUAGE=de` does the same as the option on an install. The choice is saved (`HOTEL_LANGUAGE='de'` in `/etc/plusemu/hotel.env`, `"Language": "de"` in `C:\ProgramData\PlusEMU\hotel.json`), so reruns and `plusemu-update` keep it and download the newest pack. Go back to English with `--language en`.
+
+**What it sets up**
+- Downloads the language pack list from `https://assets.plusemu.dev/language/<code>.json`, then the pack. It checks the pack's SHA-256 and unpacks it into `hotel-files/language/`. When a download fails, a hotel that already has the pack keeps it; otherwise the client stays English until the next try.
+- Volt loads the pack's `ExternalTexts.json` right after the stock one, and its `UITexts.jsonc` right after the stock one, in `configuration/renderer-config.json`. The hotel's own text files (for example `hotel-texts.json`) still load later, so they still win. Volt has its own interface texts for `de`, `nl`, `fr`, `es` and `it`; the other languages keep Volt's English interface texts.
+- Builds `hotel-files/language/ProductData.json`: every stock product, with the name and description from the pack. Volt and the AIR client load this file.
+- The AIR client (with `--with-air`) gets the pack's texts after its other texts in `Config/config.json`.
+- Writes the furniture names and descriptions from the pack into the `furniture` table (`name` and `description`, matched by `item_name`). This only happens when the language changes, and it replaces names you edited. Going back to English writes the names from the stock `FurnitureData.json`.
+- Sets `APP_LOCALE` for Atom CMS. A visitor still gets their browser's language when the website has it.
+- Restarts the emulator when its settings or the furniture names changed (players are disconnected).
+
+**What stays as it is**
+- Catalogue page titles and texts: they live in the database, and Habbo does not publish them.
+- Emulator messages, such as command replies and alerts.
+- Badge names on the website.
+
+### Language packs (maintainers)
+
+Build and publish the packs with [`tools/language-pack.py`](tools/language-pack.py). It downloads each hotel's `external_flash_texts`, `furnidata_json` and `productdata_json`, and Volt's `UITexts_<code>.jsonc.example` when Volt has one. Hotels get a new pack with their next `plusemu-update`.
+
+```bash
+python3 tools/language-pack.py build --all --out dist
+CLOUDFLARE_API_TOKEN=... python3 tools/language-pack.py publish dist
+```
+
+Habbo blocks many data center addresses. When `build` fails with HTTP 403 or 463, run it from a home connection, or save the three files from a browser and pass them in:
+
+```bash
+python3 tools/language-pack.py build --language de --source <folder with external_flash_texts.txt, furnidata.json and productdata.json> --out dist
+```
+
 ## One-command updates
 
 Hotels set up with this installer update the emulator, the client and the hotel files in place, on Linux and on Windows.
@@ -438,12 +566,16 @@ plusemu-update
 - Installs the newest hotel files pack (furniture, clothing, effects, badges, texts, icons, sounds, about 550 MB) whenever it changed, so the hotel never misses stock content. Files you added to `hotel-files` stay. The emulator's clothing data (`Config/figuredata.xml`) is replaced by the release's one that matches the pack.
 - Keeps your `Config/` and `configuration/` files and anything you added. New settings are added, your own values stay.
 - Sets up the camera when the new emulator release has it (see [Camera on an installed hotel](#camera-on-an-installed-hotel)).
+- With the [AIR client](#habbo-air-client) on: installs the newest AIR texts and client version, and keeps the handshake key.
+- With a [hotel language](#hotel-language) other than English: installs the newest language pack and keeps the hotel in that language.
 - Restores the backup automatically if any step fails.
 
 **Options** (Linux `--check`, Windows `-Check`, and so on)
 - `check`: show available updates, change nothing.
 - `yes`: update without the "Update now?" question.
 - `install-camera`: set up the camera only, without updating anything (see [Camera on an installed hotel](#camera-on-an-installed-hotel)).
+- `with-air`: turn on the AIR client, without updating anything. Later updates keep it on (see [Habbo AIR client](#habbo-air-client)).
+- `language <code>`: switch the hotel's language, without updating anything. Later updates keep it (see [Hotel language](#hotel-language)).
 - `rollback`: restore the last backup. The database goes back too, so progress since then is lost.
 - `assets`: hotel files only, without stopping the emulator. Adds every stock file the hotel lacks and leaves the files it already has as they are. Only the `gamedata` index (clothing, effects, products, texts) is replaced; the previous one is kept in the backups folder as `gamedata-<version>`. Run the full update afterwards when new clothing does not show: the emulator's clothing data comes with it.
 
@@ -555,7 +687,7 @@ To install without questions, set the answers in environment variables:
 |---|---|
 | `PLUSEMU_SETUP_SSH=1` | Adds your SSH key and turns SSH password login off (the same as `--setup-ssh`). See [SSH key login only](#ssh-key-login-only-linux-server). |
 | `PLUSEMU_SSH_KEY=<public key>` | The public key for `PLUSEMU_SETUP_SSH=1`, so the installer does not ask for it. |
-| `PLUSEMU_REMOTE_DATABASE=<addresses>` | Lets these IPv4 addresses reach the database on port 3306 (the same as `--remote-database`). `off` closes it again. See [Connect from your PC with HeidiSQL](#connect-from-your-pc-with-heidisql-linux-server). |
+| `PLUSEMU_REMOTE_DATABASE=<addresses>` | Lets these IPv4 addresses reach the database on port 3306 during a full install or rerun. `off` closes it again. To change only the database access of an installed hotel, use `--remote-database`. See [Connect from your PC with HeidiSQL](#connect-from-your-pc-with-heidisql-linux-server). |
 | `PLUSEMU_LOCAL=1` | [Local install](#local-install) on this PC at `http://localhost` (the same as `--local` or `-Local`). `PLUSEMU_LOCAL=0` asks for a server install. A saved install keeps its choice. |
 | `PLUSEMU_DOMAIN` | Hotel domain (required, except for a local install) |
 | `PLUSEMU_WS_URL` | WebSocket address (default `wss://<domain>/ws`) |
@@ -563,6 +695,8 @@ To install without questions, set the answers in environment variables:
 | `PLUSEMU_ADMIN_USER` | Admin username (default `admin`) |
 | `PLUSEMU_ADMIN_EMAIL` | Admin email (default `admin@<domain>`, or `admin@localhost.test` for a local install) |
 | `PLUSEMU_YES=1` | Skip the confirmation question |
+| `PLUSEMU_AIR=1` | Set up the [Habbo AIR client](#habbo-air-client) (the same as `--with-air` or `-WithAir`). Once on, it stays on. |
+| `PLUSEMU_LANGUAGE=<code>` | The [hotel language](#hotel-language) (the same as `--language` or `-Language`): `en`, `de`, `nl`, `fr`, `es`, `it`, `fi`, `tr` or `br`. |
 | `PLUSEMU_CLOUDFLARE_TOKEN` | Cloudflare API token for [Connect Cloudflare automatically](#connect-cloudflare-automatically). It is used once and never saved. Without it, `PLUSEMU_YES=1` skips that step. |
 
 ```bash
@@ -573,7 +707,7 @@ curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/mai
 Advanced overrides:
 
 - `INSTALLER_REF` installs from another branch or tag of this repository.
-- `EMULATOR_URL`, `CLIENT_URL`, `ASSET_PACK_URL`, `ATOM_REPO` and `ATOM_REF` change where the components come from. A custom emulator or client URL is saved as version `custom`.
+- `EMULATOR_URL`, `CLIENT_URL`, `ASSET_PACK_URL`, `LANGUAGE_MANIFEST_URL`, `ATOM_REPO` and `ATOM_REF` change where the components come from. A custom emulator or client URL is saved as version `custom`.
 
 ## Troubleshooting
 

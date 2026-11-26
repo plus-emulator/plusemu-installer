@@ -23,6 +23,9 @@ RELEASES=$TEST_DIR/releases
 MIGRATION=ok
 
 preflight() { ARCH=x64; }
+uname() { echo x86_64; }
+CPUINFO=$TEST_DIR/cpuinfo
+printf 'flags\t\t: fpu sse2 pni cx16 ssse3 sse4_1 sse4_2 popcnt\n' > "$CPUINFO"
 load_installer_files() { TEMPLATES=$ROOT/templates; }
 chown() { :; }
 systemctl() { printf 'systemctl %s\n' "$*" >> "$TEST_DIR/calls"; }
@@ -55,6 +58,9 @@ curl() {
             if [[ " $* " == *' -w '* ]]; then printf 200; fi ;;
         http://127.0.0.1:8080/*)
             if [[ " $* " == *' -w '* ]]; then printf 200; fi ;;
+        https://assets.test/air/*)
+            [ -f "$RELEASES/air/${url##*/}" ] || return 22
+            cp "$RELEASES/air/${url##*/}" "$out" ;;
         *) return 7 ;;
     esac
 }
@@ -73,9 +79,10 @@ make_emulator_release() { # make_emulator_release <tag>
     (cd "$RELEASES/$1" && sha256sum plusemu-linux-x64.tar.gz > SHA256SUMS)
 }
 
-make_client_release() { # make_client_release <tag>
+make_client_release() { # make_client_release <tag> [habbicon set the release ships]
     local dir=$TEST_DIR/build/$1
     mkdir -p "$dir/assets" "$dir/configuration" "$dir/plugins" "$RELEASES/$1"
+    if [ -n "${2:-}" ]; then mkdir -p "$dir/habbicons/$2" && printf 'icons\n' > "$dir/habbicons/$2/icons.png"; fi
     printf 'client %s\n' "$1" > "$dir/index.html"
     printf 'bundle\n' > "$dir/assets/index-$1.js"
     # The release ships its own default settings; the updater adds the ones a hotel lacks.
@@ -83,7 +90,7 @@ make_client_release() { # make_client_release <tag>
     printf '{"socket.url": "wss://example.invalid/game", "room.planes.direct": true}\n' > "$dir/configuration/renderer-config.json.example.json"
     printf '{"pets": []}\n' > "$dir/configuration/pets.json"
     printf 'builder\n' > "$dir/plugins/room-builder.js"
-    (cd "$dir" && python3 -m zipfile -c "$RELEASES/$1/volt-client.zip" index.html assets configuration plugins)
+    (cd "$dir" && python3 -m zipfile -c "$RELEASES/$1/volt-client.zip" index.html assets configuration plugins ${2:+habbicons})
 }
 
 # Each run gets its own process state; set -e is re-enabled because a negated subshell disables it.
@@ -132,7 +139,9 @@ printf 'plugin\n' > "$emulator/plugins/MyPlugin/MyPlugin.dll"
 printf 'dump\n' > "$emulator/backups/before-migration.sql"
 printf 'client old\n' > "$client/index.html"
 printf 'old bundle\n' > "$client/assets/index-old.js"
-printf '{"socket.url": "wss://custom.example.com/game", "my.setting": 1}\n' > "$client/configuration/renderer-config.json"
+mkdir -p "$client/habbicons/habbo-225e1f8a"
+touch "$client/habbicons/habbo-225e1f8a/icons.png"
+printf '{"habbicons.asset.hash": "default", "socket.url": "wss://custom.example.com/game", "my.setting": 1}\n' > "$client/configuration/renderer-config.json"
 printf '{"hotel.name": "Mine"}\n' > "$client/configuration/ui-config.json"
 printf '{"apiBaseUrl": "https://example.com"}\n' > "$client/configuration/client-mode.json"
 printf '{"text": "mine"}\n' > "$client/configuration/UITexts_en.jsonc"
@@ -163,6 +172,18 @@ diff -r -x camera "$TEST_DIR/original" "$HOTEL_ROOT"
 [[ $(snapshots) == 0 ]]
 if grep -q 'systemctl stop' "$TEST_DIR/calls" 2> /dev/null; then exit 1; fi
 printf '%s\n' "$good_sums" > "$RELEASES/v2.0.0/SHA256SUMS"
+
+# A processor that cannot run the new emulator stops the update before the hotel is touched; --check still reports.
+good_cpu=$(< "$CPUINFO")
+printf 'flags\t\t: fpu sse2 pni cx16\n' > "$CPUINFO"
+: > "$TEST_DIR/terminal"
+fails --yes
+grep -Fq 'popcnt ssse3 sse4_1 sse4_2' "$TEST_DIR/terminal"
+diff -r -x camera "$TEST_DIR/original" "$HOTEL_ROOT"
+[[ $(snapshots) == 0 ]]
+if grep -q 'systemctl stop' "$TEST_DIR/calls" 2> /dev/null; then exit 1; fi
+run_update --check
+printf '%s\n' "$good_cpu" > "$CPUINFO"
 
 # A failed migration restores the previous emulator, client and database.
 : > "$TEST_DIR/terminal"
@@ -284,8 +305,14 @@ diff -r -x camera "$TEST_DIR/before-assets" "$HOTEL_ROOT"
 MIGRATION=ok
 
 # The update installs the stock pack over the hotel files and the emulator's matching clothing data.
+# A hotel in another language gets its newest language pack after the update.
+printf "HOTEL_LANGUAGE='de'\n" >> "$STATE_FILE"
+language_apply() { echo "language_apply $HOTEL_LANGUAGE $1" >> "$TEST_DIR/calls"; }
 : > "$TEST_DIR/terminal"
 run_update --yes
+grep -qx 'language_apply de 1' "$TEST_DIR/calls"
+sed -i '/^HOTEL_LANGUAGE=/d' "$STATE_FILE"
+unset -f language_apply
 [[ $(< "$hotel_files/gamedata/FigureData.json") == 'figuredata 2' ]]
 [[ -f "$hotel_files/assets/furni/stock_2.nitro" && -f "$hotel_files/assets/custom/my_furni.nitro" ]]
 [[ ! -e "$hotel_files/.complete" ]]
@@ -382,5 +409,129 @@ grep -qx "CLIENT_VERSION='v1.0.0'" "$VERSIONS_FILE"
 : > "$TEST_DIR/terminal"
 run_update --yes
 grep -qi 'everything is up to date' "$TEST_DIR/terminal"
+
+# The stock habbicon set "default" lacks the zombie icons, so every run moves a hotel on it to the set its client ships.
+renderer=$client/configuration/renderer-config.json
+set_habbicons() { jq --arg set "$1" '."habbicons.asset.hash" = $set' "$renderer" > "$TEST_DIR/renderer" && cat "$TEST_DIR/renderer" > "$renderer"; }
+habbicons() { jq -r '."habbicons.asset.hash"' "$renderer"; }
+rm -rf "$client/habbicons"
+set_habbicons default
+chmod 640 "$renderer"
+metadata=$(stat -c %u:%g:%a "$renderer")
+# A client without the new set keeps the old one.
+run_update --yes
+[[ $(habbicons) == default ]]
+mkdir -p "$client/habbicons/habbo-225e1f8a"
+cp "$renderer" "$TEST_DIR/renderer-before"
+run_update --check
+cmp "$renderer" "$TEST_DIR/renderer-before"
+: > "$TEST_DIR/calls"
+: > "$TEST_DIR/terminal"
+run_update --yes
+[[ $(habbicons) == habbo-225e1f8a ]]
+[[ $(jq -r '."socket.url"' "$renderer") == wss://custom.example.com/game && $(jq -r '."my.setting"' "$renderer") == 1 ]]
+[[ $(stat -c %u:%g:%a "$renderer") == "$metadata" ]]
+grep -Fq habbo-225e1f8a "$TEST_DIR/terminal"
+grep -qi 'everything is up to date' "$TEST_DIR/terminal"
+if grep -q 'systemctl' "$TEST_DIR/calls"; then exit 1; fi
+: > "$TEST_DIR/terminal"
+run_update --yes
+if grep -Fq habbo-225e1f8a "$TEST_DIR/terminal"; then exit 1; fi
+# A set the owner chose stays.
+set_habbicons my-icons
+run_update --yes
+run_update --assets
+[[ $(habbicons) == my-icons ]]
+set_habbicons $'default\n'
+cp "$renderer" "$TEST_DIR/renderer-before"
+run_update --yes --with-assets
+cmp "$renderer" "$TEST_DIR/renderer-before"
+# --assets moves the stock set too.
+set_habbicons default
+: > "$TEST_DIR/terminal"
+run_update --assets
+[[ $(habbicons) == habbo-225e1f8a ]]
+grep -Fq habbo-225e1f8a "$TEST_DIR/terminal"
+# A file that is not plain JSON is kept as it is, with a note.
+cp "$renderer" "$TEST_DIR/renderer-json"
+printf '{\n    // mine\n    "habbicons.asset.hash": "default"\n}\n' > "$renderer"
+cp "$renderer" "$TEST_DIR/renderer-before"
+: > "$TEST_DIR/terminal"
+run_update --yes
+cmp "$renderer" "$TEST_DIR/renderer-before"
+grep -Fq 'not plain JSON' "$TEST_DIR/terminal"
+# Without a working Node.js the update still finishes and leaves the setting alone.
+cp "$TEST_DIR/renderer-json" "$renderer"
+set_habbicons default
+cp "$renderer" "$TEST_DIR/renderer-before"
+node() { return 127; }
+: > "$TEST_DIR/terminal"
+run_update --yes
+unset -f node
+cmp "$renderer" "$TEST_DIR/renderer-before"
+grep -qi 'everything is up to date' "$TEST_DIR/terminal"
+# A client update gives the same result, also when the installed client lacks the new set.
+cp "$TEST_DIR/renderer-json" "$renderer"
+set_habbicons default
+rm -rf "$client/habbicons"
+make_client_release v1.1.0 habbo-225e1f8a
+LATEST_CLIENT=v1.1.0
+run_update --yes
+[[ $(< "$client/index.html") == 'client v1.1.0' && -f "$client/habbicons/habbo-225e1f8a/icons.png" ]]
+[[ $(habbicons) == habbo-225e1f8a && $(jq -r '."my.setting"' "$renderer") == 1 ]]
+
+# A hotel with the AIR client keeps it on: an update brings the newest AIR texts and client, and keeps the handshake key.
+AIR_MANIFEST_URL=https://assets.test/air/latest.json
+publish_air() { # publish_air <version>
+    mkdir -p "$RELEASES/air"
+    printf 'flash.client.url=%s\n' "$1" > "$RELEASES/air/external_variables.txt"
+    printf 'texts=%s\n' "$1" > "$RELEASES/air/external_flash_texts.txt"
+    jq -n --arg version "$1" --arg variables "$(sha256sum "$RELEASES/air/external_variables.txt" | cut -d' ' -f1)" \
+        --arg texts "$(sha256sum "$RELEASES/air/external_flash_texts.txt" | cut -d' ' -f1)" '{
+        version: $version, client: {url: "https://assets.test/air/client/\($version)/HabboWin.zip"},
+        externalVariables: {url: "https://assets.test/air/external_variables.txt", sha256: $variables},
+        externalFlashTexts: {url: "https://assets.test/air/external_flash_texts.txt", sha256: $texts}}' > "$RELEASES/air/latest.json"
+}
+make_air_emulator_release() { # make_air_emulator_release <tag>: a release whose defaults have the AirClient settings
+    make_emulator_release "$1"
+    printf '{"Database": {"Password": ""}, "Flash": {"Hostname": "127.0.0.1", "Port": 1232}, "Encryption": {"RsaPrivateKeyFile": ""}, "AirClient": {"GameHost": "", "GamePorts": "30000"}}\n' \
+        > "$TEST_DIR/build/$1/Config/config.json"
+    tar -C "$TEST_DIR/build/$1" -czf "$RELEASES/$1/plusemu-linux-x64.tar.gz" .
+    (cd "$RELEASES/$1" && sha256sum plusemu-linux-x64.tar.gz > SHA256SUMS)
+}
+for name in add_air_route air_firewall air_website; do eval "$name() { echo '$name' >> \"\$TEST_DIR/calls\"; }"; done
+air_check() { echo air_check >> "$TEST_DIR/calls"; }
+SERVER_IP=192.0.2.10
+printf "AIR='yes'\nAIR_GAME_HOST='game.example.com'\n" >> "$STATE_FILE"
+mkdir -p "$emulator/Config/air"
+printf 'old texts\n' > "$emulator/Config/air/external_variables.txt"
+printf 'old texts\n' > "$emulator/Config/air/external_flash_texts.txt"
+printf 'the hotel key\n' > "$emulator/Config/rsa-private.pem"
+jq '.Encryption.RsaPrivateKeyFile = "rsa-private.pem"' "$emulator/Config/config.json" > "$TEST_DIR/config" && cat "$TEST_DIR/config" > "$emulator/Config/config.json"
+publish_air 38-1
+make_air_emulator_release v3.0.0
+LATEST_EMULATOR=v3.0.0
+: > "$TEST_DIR/calls"
+run_update --yes
+config=$emulator/Config/config.json
+[[ $(< "$emulator/Plus Emulator") == 'emulator v3.0.0' ]]
+[[ $(< "$emulator/Config/rsa-private.pem") == 'the hotel key' ]]
+[[ $(< "$emulator/Config/air/external_flash_texts.txt") == 'texts=38-1' ]]
+[[ $(jq -r .Flash.Hostname "$config") == 0.0.0.0 && $(jq -r .Flash.Port "$config") == 30000 ]]
+[[ $(jq -r .AirClient.GameHost "$config") == game.example.com && $(jq -r .AirClient.ClientVersion "$config") == 38-1 ]]
+[[ $(jq -r .AirClient.UrlPrefix "$config") == https://example.com && $(jq -r .Encryption.RsaPrivateKeyFile "$config") == rsa-private.pem ]]
+[[ $(jq -r .Custom "$config") == kept && $(jq -r .Database.Password "$config") == database-secret ]]
+grep -qx add_air_route "$TEST_DIR/calls" && grep -qx air_firewall "$TEST_DIR/calls" && grep -qx air_website "$TEST_DIR/calls" && grep -qx air_check "$TEST_DIR/calls"
+grep -qx "AIR='yes'" "$STATE_FILE"
+# When the AIR files cannot be downloaded, the update still works and the hotel keeps the AIR texts and client it had.
+rm "$RELEASES/air/latest.json"
+make_air_emulator_release v3.1.0
+LATEST_EMULATOR=v3.1.0
+: > "$TEST_DIR/terminal"
+run_update --yes
+[[ $(< "$emulator/Plus Emulator") == 'emulator v3.1.0' ]]
+[[ $(< "$emulator/Config/air/external_flash_texts.txt") == 'texts=38-1' && $(jq -r .AirClient.ClientVersion "$config") == 38-1 ]]
+[[ $(< "$emulator/Config/rsa-private.pem") == 'the hotel key' ]]
+grep -q 'keeps the texts it had' "$TEST_DIR/terminal"
 
 printf 'Bash update checks passed\n' >&4

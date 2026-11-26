@@ -19,8 +19,13 @@
 # PLUSEMU_CROWDSEC=1 installs CrowdSec with the advanced guide (0 keeps it off).
 # --remote-database <addresses> (or PLUSEMU_REMOTE_DATABASE) lets these IPv4 addresses or networks,
 # separated by commas, reach the database on port 3306, for example from HeidiSQL. "off" closes it again.
+# On an installed hotel, --remote-database changes only the database access and leaves the rest of the hotel alone.
 # --setup-ssh (or PLUSEMU_SETUP_SSH=1) asks for your SSH public key and then turns SSH password login off.
 # PLUSEMU_SSH_KEY gives the public key to an unattended run.
+# --with-air (or PLUSEMU_AIR=1) sets up the Habbo AIR client for players who use HabboCustomLauncher. Updates keep it on.
+# On an installed hotel, turn it on with: sudo plusemu-update --with-air
+# --language <code> (or PLUSEMU_LANGUAGE) shows the client texts, furniture names and website in that language:
+# en, de, nl, fr, es, it, fi, tr or br. Updates keep it. On an installed hotel: sudo plusemu-update --language de
 set -Eeuo pipefail
 shopt -u patsub_replacement 2> /dev/null || true # bash 5.2 would expand "&" in template values
 
@@ -57,6 +62,7 @@ SSHD_DROPIN=/etc/ssh/sshd_config.d/10-plusemu.conf
 NGINX_DIR=/etc/nginx
 REAL_IP_CONF=$NGINX_DIR/conf.d/cloudflare-real-ip.conf
 CLOUDFLARE_COMMAND=/usr/local/sbin/plusemu-cloudflare-ips
+CPUINFO=/proc/cpuinfo
 CLOUDFLARE_CRON=/etc/cron.d/plusemu-cloudflare-ips
 CLOUDFLARE_LOG=/var/log/plusemu-cloudflare-ips.log
 CLOUDFLARE_TAG=plusemu-cloudflare
@@ -87,6 +93,13 @@ CROWDSEC_WHITELIST=$CROWDSEC_DIR/parsers/s02-enrich/plusemu-whitelist.yaml
 CROWDSEC_NGINX_CONF=$NGINX_DIR/conf.d/crowdsec_nginx.conf
 # The emulator's API already uses 8080, CrowdSec's default port.
 CROWDSEC_LAPI=127.0.0.1:8085
+# The patched AIR client and Habbo's AIR texts, published by tools/patch-air-client.py.
+AIR_MANIFEST_URL=${AIR_MANIFEST_URL:-https://assets.plusemu.dev/air/latest.json}
+# The AIR client's game port: the emulator's Flash listener, open to every address.
+AIR_PORT=30000
+# The language packs (<code>.json manifests), published by tools/language-pack.py. English is the stock hotel files.
+LANGUAGE_MANIFEST_URL=${LANGUAGE_MANIFEST_URL:-https://assets.plusemu.dev/language}
+LANGUAGES='en de nl fr es it fi tr br'
 MODE=install
 PHP=8.5
 NODE_MAJOR=22
@@ -221,6 +234,10 @@ DISCORD_WEBHOOK='${DISCORD_WEBHOOK:-}'
 CROWDSEC='${CROWDSEC:-}'
 LOCAL='${LOCAL:-no}'
 REMOTE_DATABASE='${REMOTE_DATABASE:-}'
+AIR='${AIR:-}'
+AIR_GAME_HOST='${AIR_GAME_HOST:-}'
+HOTEL_LANGUAGE='${HOTEL_LANGUAGE:-en}'
+FURNI_LANGUAGE='${FURNI_LANGUAGE:-en}'
 EOF
     chmod 600 "$STATE_FILE"
     umask 022
@@ -388,6 +405,17 @@ preflight() { # preflight [free GB needed]
     require_free_space "${1:-10}"
 }
 
+require_processor() { # the emulator's .NET runtime needs these x86-64 instructions; old virtual processor types lack them
+    local flags flag missing=''
+    [ "$(uname -m)" = x86_64 ] || return 0
+    while IFS= read -r flags; do
+        for flag in cx16 popcnt pni ssse3 sse4_1 sse4_2; do
+            [[ " $flags " == *" $flag "* ]] || missing+=" $flag"
+        done
+        [ -z "$missing" ] || die "This server's processor cannot run PlusEMU: it lacks$missing. Nothing was changed. On a virtual server, ask your provider for a newer processor type (for example \"host\" or \"x86-64-v2\")."
+    done < <(sed -n 's/^flags[[:space:]]*:[[:space:]]*//p' "$CPUINFO" 2> /dev/null)
+}
+
 load_installer_files() {
     # Templates ship next to this script. When run through `curl | bash` there
     # is no script directory, so the matching installer release is downloaded.
@@ -427,6 +455,23 @@ select_local() { # select_local [saved choice]: sets LOCAL to yes or no
         die "This server has a hotel for $DOMAIN, and the installer cannot turn it into a local install. Nothing was changed. Run the installer with --local on another PC."
     fi
     LOCAL=$requested
+}
+
+# Once on, the AIR client stays on: players' launchers keep the hotel's game address and handshake key.
+select_air() { # select_air [saved choice]: sets AIR to yes with --with-air, PLUSEMU_AIR=1 or a saved yes, and to empty otherwise
+    AIR=${1:-}
+    if [ "${AIR_OPTION:-}" = 1 ] || [ "${PLUSEMU_AIR:-}" = 1 ]; then AIR=yes; fi
+    if [ "$AIR" != yes ]; then AIR=; fi
+}
+
+air_on() { [ "${AIR:-}" = yes ]; }
+
+select_language() { # select_language [saved choice]: sets HOTEL_LANGUAGE from --language, PLUSEMU_LANGUAGE or the saved choice, and en otherwise
+    HOTEL_LANGUAGE=${LANGUAGE_OPTION:-${PLUSEMU_LANGUAGE:-${1:-en}}}
+    case " $LANGUAGES " in
+        *" $HOTEL_LANGUAGE "*) ;;
+        *) die "Unknown language: $HOTEL_LANGUAGE. Choose one of: $LANGUAGES." ;;
+    esac
 }
 
 remote_database_list() { # remote_database_list <addresses>: each IPv4 address or network on a line, as ufw shows it; fails on anything else
@@ -541,14 +586,14 @@ choose_ssh_key() { # with --setup-ssh, the key is asked first, while the owner i
 ask_questions() {
     select_guide_mode
     unset DISCORD_WEBHOOK CROWDSEC
-    REMOTE_DATABASE=
+    AIR='' AIR_GAME_HOST='' REMOTE_DATABASE='' HOTEL_LANGUAGE='' FURNI_LANGUAGE=en
     say ""
     say "${bold}Welcome to the PlusEMU hotel installer!${reset}"
     say "This sets up your emulator, client and website on this server in about 10 minutes."
     say ""
 
     if [ -f "$STATE_FILE" ]; then
-        GUIDE_MODE=simple LOCAL=no REMOTE_DATABASE=
+        GUIDE_MODE=simple LOCAL=no AIR='' AIR_GAME_HOST='' REMOTE_DATABASE='' HOTEL_LANGUAGE='' FURNI_LANGUAGE=en
         # An older state file has no answer for these, so the questions are asked once.
         local trace=${-//[^x]/}
         { set +x; } 2> /dev/null
@@ -557,6 +602,8 @@ ask_questions() {
         if [ -n "$trace" ]; then set -x; fi
         select_local "$LOCAL"
         select_remote_database "$REMOTE_DATABASE"
+        select_air "$AIR"
+        select_language "$HOTEL_LANGUAGE"
         choose_ssh_key
         select_guide_mode "$GUIDE_MODE"
         if [ -z "${GUIDE_TOKEN:-}" ]; then GUIDE_TOKEN=$(random_secret 12); fi
@@ -577,6 +624,8 @@ ask_questions() {
 
     select_local
     select_remote_database
+    select_air
+    select_language
     choose_ssh_key
     if is_local; then
         # The game connects through the same nginx as the website, so the browser sees one origin.
@@ -614,6 +663,7 @@ ask_questions() {
     say "  WebSocket:  ${bold}$WS_URL${reset}"
     say "  Hotel name: ${bold}$HOTEL_NAME${reset}"
     say "  Admin:      ${bold}$ADMIN_USER${reset} ($ADMIN_EMAIL)"
+    if air_on; then say "  AIR client: on (players can also use HabboCustomLauncher)"; fi
     if is_local; then
         say "  Local install: only this PC can open the hotel. There is no HTTPS and no Cloudflare."
         say "  The firewall, SSH, system updates and network settings of this PC stay as they are."
@@ -846,6 +896,7 @@ write_emulator_config() { # write_emulator_config <config.json>: the emulator's 
         | $limits" "$1" > "$1.new"
     mv "$1.new" "$1"
     camera_settings "$1"
+    if [ "${AIR_READY:-0}" = 1 ]; then air_settings "$1"; fi
 }
 
 camera_settings() { # camera_settings <config.json>: a private camera service password and a photo folder that nginx serves
@@ -1102,6 +1153,8 @@ install_cms() {
     set_env "$env" FORCE_HTTPS "$https"
     set_env "$env" SESSION_SECURE_COOKIE "$https"
     set_env "$env" TRUSTED_PROXIES 127.0.0.1
+    if [ "${AIR_READY:-0}" = 1 ]; then set_env "$env" AIR_CLIENT_ENABLED true; fi
+    set_env "$env" APP_LOCALE "${HOTEL_LANGUAGE:-en}"
     chmod 640 "$env"
 
     composer install --no-dev --optimize-autoloader
@@ -1372,6 +1425,77 @@ add_avatar_route() { # adds the avatar block to a site written by an older insta
     systemctl reload nginx
 }
 
+air_locations() { # the nginx blocks that pass the AIR client's launcher and game data requests to the emulator
+    local proto=https
+    if is_local; then proto=http; fi
+    cat <<EOF
+    # AIR client: launcher settings, login tickets and game data, answered by the emulator.
+    location = /api/client/air.json {
+        limit_except GET HEAD { deny all; }
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto $proto;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+    location ~ ^/api/client/(air-ticket|air-launcher-token)\$ {
+        client_max_body_size 4k;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto $proto;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+    location = /gamedata/hashes {
+        limit_except GET HEAD { deny all; }
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto $proto;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+    location ~ ^/gamedata/(external_flash_texts|external_variables|furnidata_xml|productdata)/[^/]+\$ {
+        limit_except GET HEAD { deny all; }
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto $proto;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+EOF
+}
+
+add_air_route() { # adds the stock AIR client blocks to a site written by an older installer, or puts them in place of the old ones
+    # An old AIR block starts with the same line as the stock one and ends where its braces close. Changes inside it are replaced.
+    # The count does not read quotes, escapes or a # inside a value. A block with them, or any other unclear block, leaves the site as it is and returns 3.
+    local site=$NGINX_DIR/sites-available/hotel.conf block previous updated
+    [ -f "$site" ] || return 1
+    block=$(air_locations)
+    previous=$(cat "$site")
+    updated=$(BLOCK=$block awk '
+        function braces(line) { sub(/#.*/, "", line); return gsub(/\{/, "", line) - gsub(/\}/, "", line) }
+        BEGIN { n = split(ENVIRON["BLOCK"], lines, "\n"); for (i = 1; i <= n; i++) if (lines[i] ~ /^    (# AIR client:|location )/) air[lines[i]] = 1 }
+        ($0 in air) && seen[$0]++ { unclear = 1; exit }
+        skip {
+            code = $0; sub(/#.*/, "", code)
+            depth += braces(code)
+            if ($0 ~ /[^ \t]#/ || code ~ /["\047\\]/ || depth < 0 || (depth > 0 && $0 ~ /^    [^ ]/) || (depth == 0 && $0 !~ /^[ \t]*\}[ \t]*(#.*)?$/)) { unclear = 1; exit }
+            skip = depth > 0
+            next
+        }
+        $0 in air { if (!done) { print ENVIRON["BLOCK"]; done = 1 }; depth = braces($0); skip = depth > 0; next }
+        !done && ($0 == "    # Furniture, clothes, badges and texts." || $0 ~ /^    location \/hotel-files\/ \{/) { print ENVIRON["BLOCK"]; print ""; done = 1 }
+        { print }
+        END { exit (unclear || skip ? 3 : !done) }' <<< "$previous") || return
+    if [ "$updated" = "$previous" ]; then return 0; fi
+    printf '%s\n' "$updated" > "$site"
+    if ! nginx -t; then
+        printf '%s\n' "$previous" > "$site"
+        return 1
+    fi
+    systemctl reload nginx
+}
+
 ws_location() { # the nginx block that hands the game connection to the emulator
     local limit='limit_conn plusemu_ws 20;'
     if is_local; then limit=''; fi
@@ -1485,6 +1609,9 @@ EOF
 )
     fi
 
+    local air=''
+    if [ "${AIR_READY:-0}" = 1 ]; then air=$(air_locations); fi
+
     local ws_main="" ws_server=""
     if [ "$WS_HOST" = "$DOMAIN" ]; then
         ws_main=$(ws_location)
@@ -1548,6 +1675,7 @@ $ws_main
     location = /api/badges/leaderboard { proxy_pass http://127.0.0.1:8080; }
 
 $(camera_locations)
+$air
 
 $(avatar_locations)
 
@@ -1616,8 +1744,13 @@ configure_firewall() {
     ufw allow 80/tcp
     # HTTPS is open to everyone until plusemu-cloudflare-ips has limited it to Cloudflare.
     if ! ufw show added | grep -qF "comment '$CLOUDFLARE_TAG'"; then ufw allow 443/tcp; fi
+    if [ "${AIR_READY:-0}" = 1 ]; then air_firewall; fi
     ufw --force enable
-    ok "Firewall on: only SSH, HTTP and HTTPS are open (the database and emulator stay private)"
+    if [ "${AIR_READY:-0}" = 1 ]; then
+        ok "Firewall on: only SSH, HTTP, HTTPS and the AIR client's game port $AIR_PORT are open (the database stays private)"
+    else
+        ok "Firewall on: only SSH, HTTP and HTTPS are open (the database and emulator stay private)"
+    fi
     install_cloudflare_command
     # The health check reads the result from the log.
     if "$CLOUDFLARE_COMMAND" 2>&1 | tee -a "$CLOUDFLARE_LOG"; then
@@ -1666,6 +1799,46 @@ EOF
     if [ -n "$addresses" ]; then
         ok "The database accepts connections on port 3306 from ${addresses//,/, } only"
     fi
+}
+
+remote_database_summary() {
+    say ""
+    say "  Connect to the database from your PC (for example with HeidiSQL):"
+    say "      Network type: MariaDB or MySQL (TCP/IP)"
+    say "      Hostname / IP: $SERVER_IP    Port: 3306"
+    say "      User: hotel    Database: plus"
+    printf '      Password: %s\n' "$DB_PASSWORD" >&3
+    say "      Use the server's IP address, not your hotel's domain: Cloudflare does not pass database connections."
+    say "      Only ${REMOTE_DATABASE//,/, } can connect. When your PC's address changes, run the installer again with"
+    say "      --remote-database <new address>. Close the database again with --remote-database off."
+}
+
+remote_database_main() { # --remote-database on a hotel that is already installed: changes only who can reach the database
+    MODE=update
+    trap 'on_error $LINENO' ERR
+    preflight 1
+    exec 9> "$LOCK_FILE"
+    flock -n 9 || die "An update or a backup is running. Try again in a few minutes."
+    exec >> "$LOG" 2>&1
+    local trace=${-//[^x]/}
+    { set +x; } 2> /dev/null
+    LOCAL=no REMOTE_DATABASE=
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+    if [ -n "$trace" ]; then set -x; fi
+    select_remote_database "$REMOTE_DATABASE"
+    derive_settings
+    TOTAL_STEPS=1
+    step "Setting who can reach the database"
+    configure_remote_database
+    save_state
+    if [ -n "$REMOTE_DATABASE" ]; then
+        remote_database_summary
+    else
+        ok "The database is private again: only this server can reach it"
+    fi
+    say ""
+    say "  Only the database access changed. The website, emulator and client stay as they are."
 }
 
 # ---------------------------------------------------------------- server hardening
@@ -2046,10 +2219,497 @@ install_backup_command() {
     ok "Nightly backups at 04:00 in $NIGHTLY_ROOT (the newest $KEEP_NIGHTLY are kept)"
 }
 
+# ---------------------------------------------------------------- AIR client
+
+air_supported() { # air_supported <emulator dir>: the release has the AirClient settings, so it serves the AIR client
+    sed '1s/^\xEF\xBB\xBF//' "$1/Config/config.json" 2> /dev/null | jq -e 'has("AirClient")' > /dev/null 2>&1
+}
+
+air_files_present() { [ -s "$1/air/external_variables.txt" ] && [ -s "$1/air/external_flash_texts.txt" ]; }
+
+fetch_air_files() { # fetch_air_files <Config dir>: Habbo's AIR texts from the published list into <dir>/air; on failure AIR_ERROR says why and the old files stay
+    local dir=$1/air tmp entry url sum
+    tmp=$(mktemp -d)
+    if ! curl -fsSL --retry 3 --max-time 60 "$AIR_MANIFEST_URL" -o "$tmp/latest.json" ||
+        ! jq -e '(.version | type == "string" and length > 0) and (.client.url | type == "string" and startswith("https://"))
+            and all(.externalVariables, .externalFlashTexts; (.url | type == "string" and startswith("https://")) and (.sha256 | type == "string" and test("^[0-9a-f]{64}$")))' \
+            "$tmp/latest.json" > /dev/null 2>&1; then
+        rm -rf "$tmp"
+        AIR_ERROR="Could not read the AIR client list at $AIR_MANIFEST_URL."
+        return 1
+    fi
+    for entry in externalVariables:external_variables.txt externalFlashTexts:external_flash_texts.txt; do
+        url=$(jq -r ".${entry%%:*}.url" "$tmp/latest.json")
+        sum=$(jq -r ".${entry%%:*}.sha256" "$tmp/latest.json")
+        if ! curl -fsSL --retry 3 --max-time 300 "$url" -o "$tmp/${entry#*:}" || [ "$(sha256sum "$tmp/${entry#*:}" | cut -d' ' -f1)" != "$sum" ]; then
+            rm -rf "$tmp"
+            AIR_ERROR="The download of ${entry#*:} for the AIR client failed, or it does not match its published checksum."
+            return 1
+        fi
+    done
+    mkdir -p "$dir"
+    mv "$tmp/external_variables.txt" "$tmp/external_flash_texts.txt" "$dir/"
+    AIR_VERSION=$(jq -r .version "$tmp/latest.json")
+    AIR_CLIENT_URL=$(jq -r .client.url "$tmp/latest.json")
+    rm -rf "$tmp"
+}
+
+air_key() { # air_key <emulator dir>: the handshake key, made once; an existing key is never replaced, because players' clients carry its modulus
+    local name file
+    name=$(sed '1s/^\xEF\xBB\xBF//' "$1/Config/config.json" | jq -r '.Encryption.RsaPrivateKeyFile // "" | if . == "" then "rsa-private.pem" else . end') || return 1
+    case $name in
+        /*) file=$name ;;
+        *) file=$1/Config/$name ;;
+    esac
+    if [ -s "$file" ]; then return 0; fi
+    (cd "$1" && timeout 120 "./Plus Emulator" --generate-rsa-key "$file" < /dev/null) || return 1
+    [ -s "$file" ] || return 1
+    if id plusemu > /dev/null 2>&1; then chown plusemu:plusemu "$file"; fi
+}
+
+air_game_host() { # the address the AIR client connects to: game.<domain> once Cloudflare has its DNS-only record, otherwise the server's IPv4 address
+    if is_local; then
+        printf 127.0.0.1
+    elif [ -n "${AIR_GAME_HOST:-}" ]; then
+        printf '%s' "$AIR_GAME_HOST"
+    else
+        printf '%s' "$SERVER_IP"
+    fi
+}
+
+air_settings() { # air_settings <config.json>: the Flash listener, the handshake key and the AirClient section; every other setting stays
+    local site listen=0.0.0.0 gamedata=$HOTEL_ROOT/hotel-files/gamedata
+    site=$(site_url)
+    # A local hotel is for this PC only, so its game port stays private too.
+    if is_local; then listen=127.0.0.1; fi
+    sed '1s/^\xEF\xBB\xBF//' "$1" | jq --arg listen "$listen" --argjson port "$AIR_PORT" --arg site "$site" --arg host "$(air_game_host)" \
+        --arg texts "$gamedata/ExternalTexts.json" --arg products "$gamedata/ProductData.json" \
+        --arg version "${AIR_VERSION:-}" --arg client "${AIR_CLIENT_URL:-}" '
+        .Flash.Hostname = $listen | .Flash.Port = $port
+        | .Encryption.RsaPrivateKeyFile |= (if (. // "") == "" then "rsa-private.pem" else . end)
+        | .AirClient.UrlPrefix = $site
+        | .AirClient.ExternalVariablesFiles = (["air/external_variables.txt"] as $ours | $ours + ((.AirClient.ExternalVariablesFiles // []) - $ours))
+        | .AirClient.ExternalTextsFiles = (["air/external_flash_texts.txt", $texts] as $ours | $ours + ((.AirClient.ExternalTextsFiles // []) - $ours))
+        | .AirClient.ProductDataFile = $products
+        | .AirClient.Variables = ((.AirClient.Variables // {}) + {
+            "external.texts.txt": "\($site)/gamedata/external_flash_texts/1",
+            "external.override.texts.txt": "\($site)/gamedata/external_flash_texts/1",
+            "badge.image.path": "\($site)/hotel-files/c_images/album1584",
+            "image.library.catalogue.url": "\($site)/hotel-files/c_images/catalogue/"})
+        | .AirClient.GameHost = $host | .AirClient.GamePorts = ($port | tostring)
+        | if $client != "" then .AirClient.ClientUrl = $client | .AirClient.ClientVersion = $version else . end' > "$1.new"
+    # Writing over the file keeps its owner and permissions.
+    cat "$1.new" > "$1"
+    rm -f "$1.new"
+    language_emulator_config "$1"
+}
+
+air_texts() { # air_texts <emulator dir> <new|update>: Habbo's AIR texts; a new setup stops without them, an update keeps the old ones
+    if fetch_air_files "$1/Config"; then
+        ok "AIR client $AIR_VERSION: Habbo's AIR texts downloaded and checked"
+    elif air_files_present "$1/Config"; then
+        say "      ${yellow}$AIR_ERROR The AIR client keeps the texts it had. Try again later: sudo plusemu-update --with-air${reset}"
+    elif [ "$2" = update ]; then
+        say "      ${yellow}$AIR_ERROR The AIR client was not set up. Try again later: sudo plusemu-update --with-air${reset}"
+        return 1
+    else
+        die "$AIR_ERROR Check the server's internet connection, then run the installer again."
+    fi
+}
+
+prepare_air() { # sets AIR_READY=1 when the emulator can serve the AIR client
+    step "Preparing the AIR client"
+    local out=$HOTEL_ROOT/emulator
+    AIR_READY=0
+    if ! air_supported "$out"; then
+        say "      ${yellow}This PlusEMU version has no AIR client yet, so it was skipped. Run sudo plusemu-update: it installs the newest PlusEMU and sets up the AIR client.${reset}"
+        return
+    fi
+    air_texts "$out" new
+    air_key "$out" || die "Could not create the AIR client's handshake key. See $LOG"
+    AIR_READY=1
+    ok "Handshake key ready (an existing key is never replaced)"
+}
+
+air_refresh() { # air_refresh <staged emulator dir>: on an update, the newest AIR texts and client version; sets AIR_READY=1 when it serves the AIR client
+    AIR_READY=0
+    if ! air_supported "$1"; then
+        say "      ${yellow}This PlusEMU version has no AIR client yet, so the AIR client stays off.${reset}"
+        return 0
+    fi
+    if [ -z "${SERVER_IP:-}" ]; then derive_settings; fi
+    air_texts "$1" update || return 0
+    air_key "$1" || die "Could not create the AIR client's handshake key. Nothing was changed. See $LOG"
+    air_settings "$1/Config/config.json"
+    chown -R plusemu:plusemu "$1/Config"
+    AIR_READY=1
+}
+
+air_firewall() { # the game port is open to every address, because the AIR client connects directly, not through Cloudflare
+    if ! ufw show added | grep -qxF "ufw allow $AIR_PORT/tcp"; then ufw allow "$AIR_PORT/tcp" > /dev/null; fi
+}
+
+air_website() { # the website's "Open AIR client" button
+    local cms=$HOTEL_ROOT/cms
+    if grep -qx 'AIR_CLIENT_ENABLED="true"' "$cms/.env"; then return 0; fi
+    set_env "$cms/.env" AIR_CLIENT_ENABLED true
+    (cd "$cms" && php artisan optimize:clear && php artisan optimize) || return 1
+    chown -R www-data:www-data "$cms/storage" "$cms/bootstrap/cache"
+}
+
+air_server() { # on an installed hotel: the web routes, the firewall and the website button; AIR_ERROR says what failed
+    local site=$NGINX_DIR/sites-available/hotel.conf route=0
+    add_air_route || route=$?
+    if [ "$route" = 3 ]; then
+        say "      ${yellow}The AIR client blocks in $site were edited by hand, so they were left as they are.${reset}"
+        say "      ${yellow}Add these two lines yourself to each location block for /api/client/ and /gamedata/:${reset}"
+        say "      ${yellow}    proxy_set_header X-Real-IP \$remote_addr;${reset}"
+        say "      ${yellow}    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;${reset}"
+        say "      ${yellow}Then reload nginx: sudo nginx -t && sudo systemctl reload nginx${reset}"
+    elif [ "$route" != 0 ]; then
+        AIR_ERROR="Could not add the AIR client routes to $site. Nothing was changed there. See $LOG"
+        return 1
+    else
+        ok "nginx passes the AIR client's launcher and game data requests to the emulator"
+    fi
+    if ! is_local; then
+        air_firewall
+        ok "Firewall: port $AIR_PORT is open for the AIR client's game connection"
+    fi
+    if ! air_website; then
+        AIR_ERROR="Could not turn on the website's \"Open AIR client\" button. See $LOG"
+        return 1
+    fi
+    ok "The website shows the \"Open AIR client\" button (AIR_CLIENT_ENABLED=true)"
+}
+
+air_check() { # the launcher settings, the game data and the game port answer; AIR_ERROR says what does not
+    local name reason problems=''
+    for _ in $(seq 1 15); do
+        problems=''
+        for name in air_launcher air_gamedata air_port; do
+            if ! reason=$("health_$name" 2>&1); then problems+="$reason "; fi
+        done
+        if [ -z "$problems" ]; then return 0; fi
+        sleep 2
+    done
+    AIR_ERROR=${problems% }
+    return 1
+}
+
+check_air() { # the last install step: the game address Cloudflare may have just given, and a check from this server
+    step "Checking the AIR client"
+    if [ "${AIR_READY:-0}" != 1 ]; then
+        ok "Skipped: this PlusEMU version has no AIR client yet. Get it with: sudo plusemu-update"
+        return
+    fi
+    local config=$HOTEL_ROOT/emulator/Config/config.json
+    if [ "$(jq -r '.AirClient.GameHost // ""' "$config")" != "$(air_game_host)" ]; then
+        air_settings "$config"
+        systemctl restart plusemu
+        wait_for_emulator || die "The emulator didn't start. See: journalctl -u plusemu -n 100"
+        ok "The AIR client now connects to $(air_game_host)"
+    fi
+    if air_check; then
+        ok "air.json, the game data and port $AIR_PORT answer"
+    else
+        say "      ${yellow}The AIR client does not work yet: $AIR_ERROR See: journalctl -u plusemu -n 100${reset}"
+    fi
+}
+
+air_summary() {
+    local version
+    version=$(sed '1s/^\xEF\xBB\xBF//' "$HOTEL_ROOT/emulator/Config/config.json" | jq -r '.AirClient.ClientVersion // ""' 2> /dev/null || true)
+    say ""
+    say "  ${bold}The AIR client is on${reset} (client version ${version:-unknown}, game address $(air_game_host):$AIR_PORT). What players do:"
+    say "      1. Install HabboCustomLauncher: https://github.com/DennisObject/HabboCustomLauncher/releases"
+    say "      2. Open $(site_url), sign in and press \"Open AIR client\" (or type $DOMAIN as the hotel domain in the launcher)."
+    if ! is_local && [ -z "${AIR_GAME_HOST:-}" ]; then
+        say "  The AIR client connects to the server's IP address. To give it the name game.$DOMAIN in Cloudflare instead, run:"
+        say "      sudo PLUSEMU_CLOUDFLARE_TOKEN=<your token> plusemu-update --with-air"
+    fi
+}
+
+air_cloudflare() { # with PLUSEMU_CLOUDFLARE_TOKEN on an installed hotel: the game.<domain> DNS record; without it, players use the server's IP address
+    local trace=${-//[^x]/}
+    { set +x; } 2> /dev/null
+    CLOUDFLARE_TOKEN=$PLUSEMU_CLOUDFLARE_TOKEN
+    unset PLUSEMU_CLOUDFLARE_TOKEN
+    CF_ERROR=
+    if ! cf_api GET "/zones?name=$DOMAIN" || ! CF_ZONE=$(jq -r '.result[0].id // empty' <<< "$CF_BODY") || [ -z "$CF_ZONE" ] || ! cloudflare_game_dns; then
+        say "      ${yellow}Could not add game.$DOMAIN in Cloudflare (${CF_ERROR:-no site $DOMAIN for this token}). Players connect to $SERVER_IP instead.${reset}"
+    fi
+    unset CLOUDFLARE_TOKEN
+    if [ -n "$trace" ]; then set -x; fi
+}
+
+# ---------------------------------------------------------------- language
+
+language_name() { # language_name <code>
+    case $1 in
+        de) printf German ;;
+        nl) printf Dutch ;;
+        fr) printf French ;;
+        es) printf Spanish ;;
+        it) printf Italian ;;
+        fi) printf Finnish ;;
+        tr) printf Turkish ;;
+        br) printf 'Brazilian Portuguese' ;;
+        *) printf English ;;
+    esac
+}
+
+language_dir() { printf '%s/hotel-files/language' "$HOTEL_ROOT"; }
+
+language_active() { # the language the client shows: the chosen one once its pack is in place, English until then
+    local marker
+    marker=$(language_dir)/.language
+    if [ "${HOTEL_LANGUAGE:-en}" != en ] && [ "$(cat "$marker" 2> /dev/null)" = "$HOTEL_LANGUAGE" ]; then
+        printf '%s' "$HOTEL_LANGUAGE"
+    else
+        printf en
+    fi
+}
+
+fetch_language_pack() { # the chosen language's pack into hotel-files/language; on failure LANGUAGE_ERROR says why and the old files stay
+    local dir tmp url sum
+    dir=$(language_dir)
+    mkdir -p "$HOTEL_ROOT/hotel-files"
+    tmp=$(mktemp -d "$HOTEL_ROOT/hotel-files/.language.XXXXXX")
+    if ! curl -fsSL --retry 3 --max-time 60 "$LANGUAGE_MANIFEST_URL/$HOTEL_LANGUAGE.json" -o "$tmp/manifest.json" ||
+        ! jq -e --arg code "$HOTEL_LANGUAGE" '.language == $code and (.url | type == "string" and startswith("https://"))
+            and (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))' "$tmp/manifest.json" > /dev/null 2>&1; then
+        rm -rf "$tmp"
+        LANGUAGE_ERROR="Could not read the $(language_name "$HOTEL_LANGUAGE") language pack at $LANGUAGE_MANIFEST_URL/$HOTEL_LANGUAGE.json."
+        return 1
+    fi
+    url=$(jq -r .url "$tmp/manifest.json")
+    sum=$(jq -r .sha256 "$tmp/manifest.json")
+    mkdir "$tmp/pack"
+    if ! curl -fsSL --retry 3 --max-time 300 "$url" -o "$tmp/pack.tar.gz" || [ "$(sha256sum "$tmp/pack.tar.gz" | cut -d' ' -f1)" != "$sum" ] ||
+        ! tar xzf "$tmp/pack.tar.gz" --no-same-owner -C "$tmp/pack" ||
+        ! jq -e 'type == "object"' "$tmp/pack/ExternalTexts.json" "$tmp/pack/furni-names.json" "$tmp/pack/product-names.json" > /dev/null 2>&1; then
+        rm -rf "$tmp"
+        LANGUAGE_ERROR="The download of the $(language_name "$HOTEL_LANGUAGE") language pack failed, or it does not match its published checksum."
+        return 1
+    fi
+    printf '%s\n' "$HOTEL_LANGUAGE" > "$tmp/pack/.language"
+    rm -rf "$dir"
+    mv "$tmp/pack" "$dir"
+    rm -rf "$tmp"
+}
+
+language_product_data() { # hotel-files/language/ProductData.json: the stock products with the pack's names
+    local dir stock
+    dir=$(language_dir) stock=$HOTEL_ROOT/hotel-files/gamedata/ProductData.json
+    rm -f "$dir/ProductData.json"
+    [ -f "$stock" ] || return 0
+    if jq -c --slurpfile names "$dir/product-names.json" '.productdata.product |= map(. + ($names[0][.code | tostring] // {}))' "$stock" > "$dir/ProductData.json.new"; then
+        mv "$dir/ProductData.json.new" "$dir/ProductData.json"
+    else
+        rm -f "$dir/ProductData.json.new"
+    fi
+}
+
+language_client_config() { # language_client_config <renderer-config.json>: the client loads the active language's texts after the stock ones
+    local file=$1 dir on='' ui=false products=false
+    [ -f "$file" ] || return 0
+    dir=$(language_dir)
+    if [ "$(language_active)" != en ]; then on=1; fi
+    if [ -f "$dir/UITexts.jsonc" ]; then ui=true; fi
+    if [ -f "$dir/ProductData.json" ]; then products=true; fi
+    if ! jq --arg base "$(site_url)/hotel-files/language" --arg on "$on" --argjson ui "$ui" --argjson products "$products" '
+        def ours: test("/hotel-files/language/");
+        def after($pattern; $add): (reduce .[] as $url ([]; . + [$url] + (if ($url | test($pattern)) then $add else [] end))) as $list
+            | if ($list | length) == length then $list + $add else $list end;
+        .["external.texts.url"] |= ((. // []) | map(select(ours | not))
+            | if $on == "1" then after("/ExternalTexts[.]json"; ["\($base)/ExternalTexts.json?t=%timestamp%"])
+                | after("/UITexts[.]jsonc"; if $ui then ["\($base)/UITexts.jsonc?t=%timestamp%"] else [] end) else . end)
+        | .["productdata.url"] |= (if $on == "1" and $products then "\($base)/ProductData.json?t=%timestamp%"
+            elif (. // "" | ours) then "${gamedata.url}/ProductData.json?t=%timestamp%" else . end)' "$file" > "$file.new" 2> /dev/null; then
+        rm -f "$file.new"
+        say "      ${yellow}Kept configuration/renderer-config.json as it is: it is not plain JSON, so the client language was not set in it.${reset}"
+        return 0
+    fi
+    if [ "$(jq -S . "$file.new")" != "$(jq -S . "$file")" ]; then
+        # Writing over the file keeps its owner and permissions.
+        cat "$file.new" > "$file"
+    fi
+    rm -f "$file.new"
+}
+
+language_emulator_config() { # language_emulator_config <config.json>: the AIR client's texts and products in the active language
+    local file=$1 dir on='' products=false
+    sed '1s/^\xEF\xBB\xBF//' "$file" | jq -e 'has("AirClient")' > /dev/null 2>&1 || return 0
+    dir=$(language_dir)
+    if [ "$(language_active)" != en ]; then on=1; fi
+    if [ -f "$dir/ProductData.json" ]; then products=true; fi
+    sed '1s/^\xEF\xBB\xBF//' "$file" | jq --arg dir "$dir" --arg stock "$HOTEL_ROOT/hotel-files/gamedata/ProductData.json" \
+        --arg on "$on" --argjson products "$products" '
+        def ours: type == "string" and startswith($dir + "/");
+        .AirClient.ExternalTextsFiles = (((.AirClient.ExternalTextsFiles // []) | map(select(ours | not)))
+            + (if $on == "1" then [$dir + "/ExternalTexts.json"] else [] end))
+        | if $on == "1" and $products then .AirClient.ProductDataFile = $dir + "/ProductData.json"
+          elif (.AirClient.ProductDataFile | ours) then .AirClient.ProductDataFile = $stock else . end' > "$file.new"
+    cat "$file.new" > "$file"
+    rm -f "$file.new"
+}
+
+language_furni_names() { # the furniture table's names in the active language, only when it changed, so names the owner edited stay; sets NAMES_CHANGED=1
+    local active source filter statements
+    NAMES_CHANGED=0
+    active=$(language_active)
+    [ "${FURNI_LANGUAGE:-en}" != "$active" ] || return 0
+    if [ "$active" = en ]; then
+        source=$HOTEL_ROOT/hotel-files/gamedata/FurnitureData.json
+        filter='[.roomitemtypes.furnitype[]?, .wallitemtypes.furnitype[]?] | map(select(.classname | type == "string")
+            | {key: .classname, value: {name: (.name // ""), description: (.description // "")}}) | from_entries'
+    else
+        source=$(language_dir)/furni-names.json filter=.
+    fi
+    [ -f "$source" ] || return 0
+    statements=$(mktemp)
+    {
+        echo 'CREATE TEMPORARY TABLE language_furni_names (classname VARCHAR(255) NOT NULL PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL) CHARACTER SET utf8mb4;'
+        jq -r --arg q "'" "$filter"' | def sql: $q + (tostring | gsub("\\\\"; "\\\\") | gsub($q; $q + $q)) + $q;
+            to_entries | _nwise(500) | "INSERT IGNORE INTO language_furni_names VALUES "
+            + (map("(" + (.key | sql) + ", " + (.value.name | sql) + ", " + (.value.description | sql) + ")") | join(", ")) + ";"' "$source"
+        echo 'UPDATE furniture f INNER JOIN language_furni_names n ON n.classname = f.item_name SET f.name = LEFT(n.name, 255), f.description = LEFT(n.description, 1024);'
+    } > "$statements"
+    sql plus < "$statements"
+    rm -f "$statements"
+    FURNI_LANGUAGE=$active NAMES_CHANGED=1
+    save_state
+}
+
+language_website() { # the website's default language; a visitor still gets their browser's language when the website has it
+    local env=$HOTEL_ROOT/cms/.env
+    [ -f "$env" ] || return 0
+    if grep -qxF "APP_LOCALE=\"$HOTEL_LANGUAGE\"" "$env"; then return 0; fi
+    set_env "$env" APP_LOCALE "$HOTEL_LANGUAGE"
+    (cd "$HOTEL_ROOT/cms" && php artisan optimize:clear && php artisan optimize) || say "      ${yellow}The website reads its new language after: cd $HOTEL_ROOT/cms && sudo php artisan optimize${reset}"
+}
+
+language_apply() { # language_apply <restart>: the hotel in the chosen language; with restart=1 a running emulator restarts when its settings or names changed
+    local config=$HOTEL_ROOT/emulator/Config/config.json before changed=0 name
+    name=$(language_name "${HOTEL_LANGUAGE:-en}")
+    if [ "${HOTEL_LANGUAGE:-en}" = en ]; then
+        rm -rf "$(language_dir)"
+    elif fetch_language_pack; then
+        ok "$name language pack downloaded and checked"
+    elif [ "$(language_active)" = "$HOTEL_LANGUAGE" ]; then
+        say "      ${yellow}$LANGUAGE_ERROR The hotel keeps the $name texts it had. Try again later: sudo plusemu-update --language $HOTEL_LANGUAGE${reset}"
+    else
+        say "      ${yellow}$LANGUAGE_ERROR The client stays English for now. Try again later: sudo plusemu-update --language $HOTEL_LANGUAGE${reset}"
+    fi
+    if [ "$(language_active)" != en ]; then language_product_data; fi
+    language_client_config "$HOTEL_ROOT/client/configuration/renderer-config.json"
+    language_website
+    if [ -f "$config" ]; then
+        before=$(cat "$config")
+        language_emulator_config "$config"
+        if [ "$(cat "$config")" != "$before" ]; then changed=1; fi
+    fi
+    language_furni_names
+    if [ "$NAMES_CHANGED" = 1 ]; then
+        changed=1
+        ok "Furniture names are now $(language_name "$FURNI_LANGUAGE") (names you edited were replaced)"
+    fi
+    if [ "$1" = 1 ] && [ "$changed" = 1 ] && systemctl is-active --quiet plusemu; then
+        # The emulator reads these settings and builds the furniture data when it starts.
+        systemctl restart plusemu
+        wait_for_emulator || die "The emulator didn't start. See: journalctl -u plusemu -n 100"
+        ok "The emulator restarted with the new language (players were disconnected)"
+    fi
+}
+
+language_main() { # --language <code> on an installed hotel: switch its language and keep it in later updates
+    MODE=update
+    trap 'on_error $LINENO' ERR
+    preflight 1
+    if [ ! -f "$STATE_FILE" ] || [ ! -x "$HOTEL_ROOT/emulator/Plus Emulator" ]; then
+        die "No hotel from the PlusEMU installer was found on this server. Install one first."
+    fi
+    exec 9> "$LOCK_FILE"
+    flock -n 9 || die "An update or a backup is running. Try again in a few minutes."
+    exec >> "$LOG" 2>&1
+    local trace=${-//[^x]/}
+    { set +x; } 2> /dev/null
+    LOCAL=no AIR='' AIR_GAME_HOST='' REMOTE_DATABASE='' HOTEL_LANGUAGE='' FURNI_LANGUAGE=en
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+    if [ -n "$trace" ]; then set -x; fi
+    select_language "$HOTEL_LANGUAGE"
+    save_state
+    TOTAL_STEPS=1
+    step "Switching the hotel to $(language_name "$HOTEL_LANGUAGE")"
+    language_apply 1
+    say ""
+    if [ "$(language_active)" = "$HOTEL_LANGUAGE" ]; then
+        say "${green}${bold}✓ Your hotel is now $(language_name "$HOTEL_LANGUAGE").${reset} Players see it when they reload the hotel page."
+    else
+        say "${yellow}${bold}The language is saved as $(language_name "$HOTEL_LANGUAGE"), but the client texts are not in place yet.${reset}"
+    fi
+    say "  Updates keep this language. Catalogue pages and emulator messages stay as they are."
+}
+
+air_main() { # --with-air on an installed hotel: turn on the AIR client and keep it on in later updates
+    MODE=update
+    trap 'on_error $LINENO' ERR
+    preflight 1
+    if [ ! -f "$STATE_FILE" ] || [ ! -x "$HOTEL_ROOT/emulator/Plus Emulator" ]; then
+        die "No hotel from the PlusEMU installer was found on this server. Install one first."
+    fi
+    exec 9> "$LOCK_FILE"
+    flock -n 9 || die "An update or a backup is running. Try again in a few minutes."
+    exec >> "$LOG" 2>&1
+    local trace=${-//[^x]/} out=$HOTEL_ROOT/emulator config=$HOTEL_ROOT/emulator/Config/config.json before
+    { set +x; } 2> /dev/null
+    LOCAL=no AIR='' AIR_GAME_HOST='' REMOTE_DATABASE=
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+    if [ -n "$trace" ]; then set -x; fi
+    AIR=yes
+    save_state
+    if ! air_supported "$out"; then
+        die "Your PlusEMU version has no AIR client yet. The AIR client is now saved as on: run sudo plusemu-update, which installs the newest PlusEMU and sets up the AIR client."
+    fi
+    derive_settings
+    TOTAL_STEPS=3
+    sed -i '1s/^\xEF\xBB\xBF//' "$config"
+
+    step "Setting up the AIR client"
+    air_texts "$out" new
+    air_key "$out" || die "Could not create the AIR client's handshake key. See $LOG"
+    ok "Handshake key ready (an existing key is never replaced)"
+    if ! is_local && [ -n "${PLUSEMU_CLOUDFLARE_TOKEN:-}" ]; then air_cloudflare; fi
+    before=$(cat "$config")
+    air_settings "$config"
+    chown -R plusemu:plusemu "$out/Config"
+    if [ "$(cat "$config")" != "$before" ]; then
+        # The emulator reads these settings when it starts.
+        systemctl restart plusemu
+        wait_for_emulator || die "The emulator didn't start. See: journalctl -u plusemu -n 100"
+        ok "The emulator restarted with the AIR client settings (players were disconnected)"
+    fi
+
+    step "Opening the AIR client to players"
+    air_server || die "$AIR_ERROR"
+    HEALTH_ALERTS=off DISCORD_WEBHOOK_NEW=0
+    if [ -n "${DISCORD_WEBHOOK:-}" ]; then HEALTH_ALERTS=on; fi
+    install_health_check
+
+    step "Checking the AIR client"
+    air_check || die "The AIR client does not work yet: $AIR_ERROR See $LOG and: journalctl -u plusemu -n 100"
+    ok "air.json, the game data and port $AIR_PORT answer"
+    air_summary
+    say ""
+}
+
 # ---------------------------------------------------------------- health check
 
 # Each check: its name (the function health_<name>), what it checks, the command that shows more,
-# and "server" when only a server install has the thing it checks.
+# and "server" when only a server install has the thing it checks, or "air" when only a hotel with the AIR client has it.
 HEALTH_CHECKS=(
     "emulator|The emulator service|sudo journalctl -u plusemu -n 100"
     "game_port|The game connection (port 2096)|sudo journalctl -u plusemu -n 100"
@@ -2061,6 +2721,9 @@ HEALTH_CHECKS=(
     "backup|The nightly backup|sudo tail -n 20 $BACKUP_LOG"
     "certificate|The HTTPS certificate|sudo openssl x509 -in $SSL_DIR/cert.pem -noout -enddate|server"
     "cloudflare|The Cloudflare address refresh|sudo tail -n 20 $CLOUDFLARE_LOG|server"
+    "air_launcher|The AIR client settings (air.json)|sudo journalctl -u plusemu -n 100|air"
+    "air_gamedata|The AIR client game data|sudo journalctl -u plusemu -n 100|air"
+    "air_port|The AIR client game port ($AIR_PORT)|sudo journalctl -u plusemu -n 100|air"
 )
 
 port_answers() { # port_answers <port>: a program on this server accepts connections on that port
@@ -2127,6 +2790,26 @@ health_cloudflare() {
     fi
 }
 
+health_air_launcher() {
+    local out code
+    out=$(curl -s --max-time 10 -H "Host: $DOMAIN" -w '\n%{http_code}' http://127.0.0.1/api/client/air.json) || true
+    code=${out##*$'\n'}
+    if [ "$code" = 200 ] && jq -e '(.game.host // "" | length > 0) and (.rsa.modulus // "" | length > 0) and (.client.url // "" | length > 0)' \
+        <<< "${out%$'\n'*}" > /dev/null 2>&1; then
+        return 0
+    fi
+    echo "$(site_url)/api/client/air.json does not give the game address, handshake key and client (HTTP ${code:-000})."
+    return 1
+}
+
+health_air_gamedata() {
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H "Host: $DOMAIN" http://127.0.0.1/gamedata/hashes) || true
+    [ "$code" = 200 ] || { echo "$(site_url)/gamedata/hashes answers with HTTP ${code:-000}."; return 1; }
+}
+
+health_air_port() { port_answers 30000 || { echo "Nothing answers on port 30000."; return 1; }; }
+
 json_string() { # json_string <text>: the text as a JSON string
     local text
     text=$(printf '%s' "$1" | tr -d '\001-\010\013-\037')
@@ -2154,7 +2837,7 @@ discord_send() { # discord_send <webhook> <text>: prints the reason when Discord
 health_check() {
     local entry name label look scope reason now changes='' short='' count=0 sent=1 failed=()
     local -A was=()
-    DOMAIN='' HOTEL_NAME=PlusEMU DISCORD_WEBHOOK='' LOCAL=no
+    DOMAIN='' HOTEL_NAME=PlusEMU DISCORD_WEBHOOK='' LOCAL=no AIR=''
     # shellcheck disable=SC1090
     . "$STATE_FILE"
     now=$(date '+%F %T')
@@ -2169,6 +2852,7 @@ health_check() {
     for entry in "${HEALTH_CHECKS[@]}"; do
         IFS='|' read -r name label look scope <<< "$entry"
         if [ "$scope" = server ] && is_local; then continue; fi
+        if [ "$scope" = air ] && [ "$AIR" != yes ]; then continue; fi
         count=$((count + 1))
         if reason=$("health_$name" 2>&1); then
             if [ -n "${was[$name]:-}" ]; then changes+="✅ $label works again."$'\n' short+="✅ $label works again."$'\n'; fi
@@ -2399,6 +3083,33 @@ cloudflare_dns() {
         esac
     done
     ok "DNS: ${names[*]} point to $SERVER_IP through Cloudflare (proxied)"
+    if [ "${AIR_READY:-0}" = 1 ]; then cloudflare_game_dns || return 1; fi
+}
+
+# The AIR client's game connection is plain TCP, which Cloudflare's proxy does not carry, so this record is DNS only.
+cloudflare_game_dns() { # sets AIR_GAME_HOST to game.<domain> once its A record points to this server
+    local host=game.$DOMAIN record
+    cf_api GET "/zones/$CF_ZONE/dns_records?name=$host&per_page=100" || return 1
+    if jq -e '.result | any(.type == "CNAME")' <<< "$CF_BODY" > /dev/null; then
+        cloudflare_fail "$host has a CNAME record. Delete it in Cloudflare (DNS > Records) and run the installer again."
+        return 1
+    fi
+    case $(jq '[.result[] | select(.type == "A")] | length' <<< "$CF_BODY") in
+        0) cf_api POST "/zones/$CF_ZONE/dns_records" "$(jq -nc --arg name "$host" --arg ip "$SERVER_IP" '{type: "A", name: $name, content: $ip, proxied: false, ttl: 1}')" || return 1 ;;
+        1)
+            record=$(jq -c '.result[] | select(.type == "A")' <<< "$CF_BODY")
+            if [ "$(jq -r '"\(.content) \(.proxied)"' <<< "$record")" != "$SERVER_IP false" ]; then
+                cf_api PATCH "/zones/$CF_ZONE/dns_records/$(jq -r .id <<< "$record")" "$(jq -nc --arg ip "$SERVER_IP" '{content: $ip, proxied: false}')" || return 1
+            fi
+            ;;
+        *)
+            cloudflare_fail "$host has more than one A record. Keep only one in Cloudflare (DNS > Records) and run the installer again."
+            return 1
+            ;;
+    esac
+    AIR_GAME_HOST=$host
+    save_state
+    ok "DNS: $host points to $SERVER_IP without Cloudflare's proxy (the AIR client's game port)"
 }
 
 origin_certificate_valid() { # origin_certificate_valid <cert> <key> <Origin CA root>: signed by Cloudflare, for every hotel name, valid 30 more days
@@ -2703,17 +3414,8 @@ finish() {
     printf '      Password: %s\n' "$DB_PASSWORD" >&3
     say "      Connect locally: mariadb --host=127.0.0.1 --port=3306 --user=hotel --password plus"
     say "      Database root uses local socket authentication: sudo mariadb (no generated root password)."
-    if [ -n "${REMOTE_DATABASE:-}" ]; then
-        say ""
-        say "  Connect to the database from your PC (for example with HeidiSQL):"
-        say "      Network type: MariaDB or MySQL (TCP/IP)"
-        say "      Hostname / IP: $SERVER_IP    Port: 3306"
-        say "      User: hotel    Database: plus"
-        printf '      Password: %s\n' "$DB_PASSWORD" >&3
-        say "      Use the server's IP address, not your hotel's domain: Cloudflare does not pass database connections."
-        say "      Only ${REMOTE_DATABASE//,/, } can connect. When your PC's address changes, run the installer again with"
-        say "      --remote-database <new address>. Close the database again with --remote-database off."
-    fi
+    if [ -n "${REMOTE_DATABASE:-}" ]; then remote_database_summary; fi
+    if [ "${AIR_READY:-0}" = 1 ]; then air_summary; fi
     say ""
     say "  Retrieve saved passwords: sudo cat $STATE_FILE"
     say "  Update the emulator and the client later with: sudo plusemu-update"
@@ -2781,13 +3483,52 @@ keep_client_files() { # keep_client_files <installed dir> <new dir>
         fi
         if [ ! -f "$new/configuration/$file" ]; then
             cp "$rendered/$file" "$new/configuration/$file"
+        elif [ "$file" = renderer-config.json ] && [ "$(renderer_habbicons "$new/configuration/$file")" = invalid ]; then
+            say "      ${yellow}Kept configuration/$file as it is: it is not plain JSON, so no new settings were added.${reset}"
         elif jq -s '.[0] * .[1]' "$rendered/$file" "$new/configuration/$file" > "$rendered/$file.new" 2> /dev/null; then
+            if [ "$file" = renderer-config.json ]; then
+                cp --attributes-only --preserve=mode,ownership "$new/configuration/$file" "$rendered/$file.new"
+            fi
             mv "$rendered/$file.new" "$new/configuration/$file"
         else
             say "      ${yellow}Kept configuration/$file as it is: it is not plain JSON, so no new settings were added.${reset}"
         fi
     done
     rm -rf "$rendered"
+    use_current_habbicons "$new"
+}
+
+renderer_habbicons() { # renderer_habbicons <config> [set]: without a set, only validate the JSON
+    node - "$@" <<'JS'
+const fs = require('node:fs');
+const [file, set] = process.argv.slice(2);
+const bytes = fs.readFileSync(file);
+let settings;
+try {
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    settings = JSON.parse(text, (key, value, context) =>
+        typeof value === 'number' ? JSON.rawJSON(context.source) : value);
+} catch (error) {
+    if (!(error instanceof SyntaxError) && error.code !== 'ERR_ENCODING_INVALID_ENCODED_DATA') throw error;
+    console.log('invalid');
+    process.exit(0);
+}
+if (set && settings?.['habbicons.asset.hash'] === 'default') {
+    settings['habbicons.asset.hash'] = set;
+    fs.writeFileSync(file, JSON.stringify(settings, null, 4) + '\n');
+    console.log('updated');
+}
+JS
+}
+
+use_current_habbicons() {
+    local config=$1/configuration/renderer-config.json set=habbo-225e1f8a result
+    [ -d "$1/habbicons/$set" ] && [ -f "$config" ] || return 0
+    result=$(renderer_habbicons "$config" "$set") || return 0
+    case "$result" in
+        invalid) say "      ${yellow}Kept configuration/renderer-config.json as it is: it is not plain JSON, so the habbicon set was not checked.${reset}" ;;
+        updated) say "  Habbicons now use the $set set, which has the zombie icons." ;;
+    esac
 }
 
 create_snapshot() { # create_snapshot [with the hotel files: 0|1]: sets SNAPSHOT to a new backup
@@ -2961,7 +3702,9 @@ rollback_update() {
 update_main() {
     local check=0 rollback=0 assets_only=0 arg latest_emulator latest_client latest_assets
     local update_emulator=0 update_client=0 update_assets=0
-    for arg in "$@"; do
+    while [ "$#" -gt 0 ]; do
+        arg=$1
+        shift
         case "$arg" in
             --check) check=1 ;;
             --yes) PLUSEMU_YES=1 ;;
@@ -2972,7 +3715,19 @@ update_main() {
                 camera_main
                 return
                 ;;
-            *) die "Unknown option: $arg. Usage: plusemu-update [--check] [--yes] [--assets] [--rollback] [--install-camera]" ;;
+            --with-air)
+                air_main
+                return
+                ;;
+            --language=* | --language)
+                LANGUAGE_OPTION=${arg#--language}
+                LANGUAGE_OPTION=${LANGUAGE_OPTION#=}
+                if [ "$arg" = --language ]; then LANGUAGE_OPTION=${1:-}; fi
+                if [ -z "$LANGUAGE_OPTION" ]; then die "Usage: plusemu-update --language <code>, with code one of: $LANGUAGES"; fi
+                language_main
+                return
+                ;;
+            *) die "Unknown option: $arg. Usage: plusemu-update [--check] [--yes] [--assets] [--rollback] [--install-camera] [--with-air] [--language <code>]" ;;
         esac
     done
     MODE=update
@@ -2987,6 +3742,7 @@ update_main() {
     : > "$LOG"
     chmod 600 "$LOG"
     exec >> "$LOG" 2>&1
+    HOTEL_LANGUAGE=en FURNI_LANGUAGE=en
     # shellcheck disable=SC1090
     . "$STATE_FILE"
     EMULATOR_VERSION=unknown CLIENT_VERSION=unknown ASSETS_VERSION=unknown
@@ -3004,6 +3760,10 @@ update_main() {
     fi
     if [ "$assets_only" = 1 ]; then
         add_hotel_files "$check"
+        if [ "$check" = 0 ]; then
+            use_current_habbicons "$HOTEL_ROOT/client"
+            if [ "$HOTEL_LANGUAGE" != en ] || [ "$FURNI_LANGUAGE" != en ]; then language_apply 1; fi
+        fi
         return
     fi
 
@@ -3036,6 +3796,7 @@ update_main() {
     fi
     if [ "$update_emulator" = 0 ] && [ "$update_client" = 0 ] && [ "$update_assets" = 0 ]; then
         say ""
+        if [ "$check" = 0 ]; then use_current_habbicons "$HOTEL_ROOT/client"; fi
         say "  ${green}Everything is up to date.${reset}"
         return
     fi
@@ -3044,6 +3805,7 @@ update_main() {
         say "  Install the update with: sudo plusemu-update"
         return
     fi
+    if [ "$update_emulator" = 1 ]; then require_processor; fi
     say ""
     say "  Your settings and added files are kept, and a backup is made first."
     if [ "$update_assets" = 1 ]; then
@@ -3062,6 +3824,7 @@ update_main() {
         if [ "$update_assets" = 1 ]; then cp "$WORK/emulator/Config/figuredata.xml" "$WORK/figuredata.xml"; fi
         keep_emulator_files "$HOTEL_ROOT/emulator" "$WORK/emulator"
         camera_settings "$WORK/emulator/Config/config.json"
+        if air_on; then air_refresh "$WORK/emulator"; fi
         if [ "$update_assets" = 1 ]; then
             mv "$WORK/figuredata.xml" "$WORK/emulator/Config/figuredata.xml"
             chown plusemu:plusemu "$WORK/emulator/Config/figuredata.xml"
@@ -3123,7 +3886,15 @@ update_main() {
         # The camera draws photos with the client, so it loads the new one.
         if [ "$update_client" = 1 ]; then systemctl try-restart plusemu-camera; fi
     fi
+    if [ "$update_client" = 0 ]; then use_current_habbicons "$HOTEL_ROOT/client"; fi
     RESTORE_FROM=
+    # The update is done here, so a problem with the language pack never restores the previous version.
+    if [ "$HOTEL_LANGUAGE" != en ] || [ "$FURNI_LANGUAGE" != en ]; then language_apply 1; fi
+    # The update is done here, so a problem with the AIR client warns and never restores the previous version.
+    if [ "${AIR_READY:-0}" = 1 ]; then
+        if ! air_server; then say "      ${yellow}$AIR_ERROR${reset}"; fi
+        if air_check; then ok "The AIR client works"; else say "      ${yellow}The AIR client does not work yet: $AIR_ERROR See: journalctl -u plusemu -n 100${reset}"; fi
+    fi
     EMULATOR_VERSION=$latest_emulator CLIENT_VERSION=$latest_client
     if [ "$update_assets" = 1 ]; then ASSETS_VERSION=$latest_assets; fi
     save_versions
@@ -3150,7 +3921,7 @@ main() {
         case "$1" in
             --guide-mode)
                 if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
-                    die "Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off] [--setup-ssh] [--install-camera]"
+                    die "Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off] [--setup-ssh] [--install-camera] [--with-air] [--language <code>]"
                 fi
                 GUIDE_MODE_OPTION=$2
                 shift 2
@@ -3163,6 +3934,19 @@ main() {
                 SETUP_SSH_OPTION=1
                 shift
                 ;;
+            --with-air)
+                AIR_OPTION=1
+                shift
+                ;;
+            --language=*)
+                LANGUAGE_OPTION=${1#*=}
+                shift
+                ;;
+            --language)
+                if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then die "Usage: install.sh --language <code>, with code one of: $LANGUAGES"; fi
+                LANGUAGE_OPTION=$2
+                shift 2
+                ;;
             --install-camera)
                 camera_main
                 return
@@ -3174,12 +3958,17 @@ main() {
                 REMOTE_DATABASE_OPTION=$2
                 shift 2
                 ;;
-            *) die "Unknown option: $1. Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off] [--setup-ssh] [--install-camera]" ;;
+            *) die "Unknown option: $1. Usage: install.sh [--local] [--guide-mode simple|advanced] [--remote-database <addresses>|off] [--setup-ssh] [--install-camera] [--with-air] [--language <code>]" ;;
         esac
     done
+    if [ -n "${REMOTE_DATABASE_OPTION:-}" ] && [ -f "$STATE_FILE" ]; then
+        remote_database_main
+        return
+    fi
     select_guide_mode
     trap 'on_error $LINENO' ERR
     preflight
+    require_processor
     # Updates, backups and the health check wait for the installer.
     exec 9> "$LOCK_FILE"
     flock -n 9 || die "An update or a backup is running. Try again in a few minutes."
@@ -3204,20 +3993,24 @@ main() {
         TOTAL_STEPS=$((TOTAL_STEPS + 1))
         setup_ssh_key
     fi
+    if air_on; then TOTAL_STEPS=$((TOTAL_STEPS + 2)); fi
     install_packages
     install_toolchains
     download_releases
     setup_database
     download_hotel_files
+    if air_on; then prepare_air; fi
     start_emulator
     write_client_config
     install_camera
     install_cms
+    language_apply 1
     configure_web
     secure_server
     write_guide
     install_update_command
     if ! is_local; then connect_cloudflare; fi
+    if air_on; then check_air; fi
     finish
 }
 
