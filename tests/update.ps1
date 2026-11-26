@@ -44,6 +44,10 @@ $script:Calls = [Collections.Generic.List[string]]::new()
 
 # External programs and Windows-only steps are replaced; everything else is the real installer code.
 function Assert-Administrator { }
+function Run($Exe, $Argument) {
+    if ((Split-Path $Exe -Leaf) -ne 'Plus Emulator.exe' -or $Argument -ne '--check-runtime') { throw "Unexpected program: $Exe $Argument" }
+    if ($script:RuntimeFails) { throw 'Runtime startup failed' }
+}
 function Get-InstallerFiles { $script:Templates = Join-Path $root 'templates' }
 function Add-MachinePath($Dir) { $Calls.Add("path $Dir") }
 function Invoke-WebRequest { throw 'offline' }
@@ -51,6 +55,7 @@ function Sql([string]$Query, [string]$Database = '') { $Calls.Add("sql $Query");
 function Stop-EmulatorService { $Calls.Add('stop') }
 function Start-EmulatorService { $Calls.Add('start') }
 function Wait-Emulator { return $true }
+function Get-Service { }
 function Set-HotelPermissions { $Calls.Add('permissions') }
 # Windows does not allow moving a folder while a program uses a file in it; the first moves of a locked folder fail.
 $script:LockedMoves = @{}
@@ -111,6 +116,7 @@ function New-EmulatorRelease($Tag) {
     $release = Join-Path $Releases $Tag
     New-Item -ItemType Directory -Force (Join-Path $dir 'Config'), (Join-Path $dir 'Database'), $release | Out-Null
     Set-Content (Join-Path $dir 'Plus Emulator.exe') "emulator $Tag"
+    Set-Content (Join-Path $dir 'check-runtime.cmd') 'runtime check'
     Set-Content (Join-Path $dir "new-$Tag.dll") $Tag
     Write-Bom (Join-Path (Join-Path $dir 'Config') 'config.json') '{"Database": {"Password": "", "Port": 3306, "Timeout": 30}, "NewSection": {"Enabled": true}}'
     Set-Content (Join-Path (Join-Path $dir 'Config') 'nlog.config') 'default nlog'
@@ -119,10 +125,15 @@ function New-EmulatorRelease($Tag) {
     Compress-Archive -Path (Join-Path $dir '*') -DestinationPath (Join-Path $release 'plusemu-win-x64.zip') -Force
     Write-Sums $release 'plusemu-win-x64.zip'
 }
-function New-ClientRelease($Tag) {
+function New-ClientRelease($Tag, $HabbiconSet = '') {
     $dir = Join-Path (Join-Path $testDir 'build') $Tag
     $release = Join-Path $Releases $Tag
     New-Item -ItemType Directory -Force (Join-Path $dir 'assets'), (Join-Path $dir 'configuration'), (Join-Path $dir 'plugins'), $release | Out-Null
+    if ($HabbiconSet) {
+        $icons = Join-Path (Join-Path $dir 'habbicons') $HabbiconSet
+        New-Item -ItemType Directory -Force $icons | Out-Null
+        Set-Content (Join-Path $icons 'icons.png') 'icons'
+    }
     Set-Content (Join-Path $dir 'index.html') "client $Tag"
     Set-Content (Join-Path (Join-Path $dir 'assets') "index-$Tag.js") 'bundle'
     # The release ships its own default settings; the updater adds the ones a hotel lacks.
@@ -190,7 +201,9 @@ try {
     Set-Content (Join-Path (Join-Path $emulator 'backups') 'before-migration.sql') 'dump'
     Set-Content (Join-Path $client 'index.html') 'client old'
     Set-Content (Join-Path (Join-Path $client 'assets') 'index-old.js') 'old bundle'
-    Set-Content (Join-Path $clientConfig 'renderer-config.json') '{"socket.url": "wss://custom.example.com/game", "my.setting": 1}'
+    New-Item -ItemType Directory -Force (Join-Path $client 'habbicons/habbo-225e1f8a') | Out-Null
+    Set-Content (Join-Path $client 'habbicons/habbo-225e1f8a/icons.png') 'icons'
+    Set-Content (Join-Path $clientConfig 'renderer-config.json') '{"habbicons.asset.hash": "default", "socket.url": "wss://custom.example.com/game", "my.setting": 1}'
     Set-Content (Join-Path $clientConfig 'ui-config.json') '{"hotel.name": "Mine"}'
     Set-Content (Join-Path $clientConfig 'client-mode.json') '{"apiBaseUrl": "https://example.com"}'
     Set-Content (Join-Path $clientConfig 'UITexts_en.jsonc') '{"text": "mine"}'
@@ -220,6 +233,26 @@ try {
     Assert ((Get-Tree $HotelRoot) -ceq $original) 'A bad checksum changed the hotel'
     Assert ((Get-Snapshots).Count -eq 0 -and -not ($Calls -contains 'stop')) 'A bad checksum stopped the emulator or made a backup'
     Set-Content $sums $goodSums -NoNewline
+
+    $script:RuntimeFails = $true
+    Assert (Test-UpdateFails -Yes) 'An emulator that cannot start was accepted'
+    Assert ($LastError -like '*processor*') "Wrong runtime error: $LastError"
+    Assert ((Get-Tree $HotelRoot) -ceq $original) 'A failed runtime check changed the hotel'
+    Assert ((Get-Snapshots).Count -eq 0 -and -not ($Calls -contains 'stop')) 'A failed runtime check stopped the hotel or made a backup'
+    $script:RuntimeFails = $false
+
+    & {
+        $HotelRoot = Join-Path $testDir 'new hotel'
+        $VersionsFile = Join-Path $HotelRoot 'versions.json'
+        New-Item -ItemType Directory $HotelRoot | Out-Null
+        $script:RuntimeFails = $true
+        try { Get-EmulatorRelease; throw 'Accepted an incompatible new install' }
+        catch { Assert ("$_" -like '*x86-64-v2*') "Wrong install error: $_" }
+        Assert (-not (Get-ChildItem -Force $HotelRoot)) 'A failed install left a partial emulator or saved a version'
+        $script:RuntimeFails = $false
+        Get-EmulatorRelease
+        Assert ((Get-Versions).EmulatorVersion -eq 'v2.0.0') 'The install did not recover after the CPU check passed'
+    }
 
     # Only one update runs at a time.
     $lock = [IO.File]::Open($LockFile, 'OpenOrCreate', 'ReadWrite', 'None')
@@ -414,6 +447,124 @@ try {
     Assert ((Get-Versions).ClientVersion -eq 'v1.0.0') 'The lower client tag was not recorded'
     Invoke-TestUpdate -Yes
     Assert ($Terminal -match 'Everything is up to date') "The lower client tag was installed again: $Terminal"
+
+    # The stock habbicon set "default" lacks the zombie icons, so every run moves a hotel on it to the set its client ships.
+    $rendererFile = Join-Path $clientConfig 'renderer-config.json'
+    function Set-Habbicons($Set) {
+        $settings = Get-Json $rendererFile
+        $settings | Add-Member -NotePropertyName 'habbicons.asset.hash' -NotePropertyValue $Set -Force
+        Write-Utf8 $rendererFile ($settings | ConvertTo-Json -Depth 20)
+    }
+    function Get-Habbicons { return (Get-Json $rendererFile).'habbicons.asset.hash' }
+    Remove-Item (Join-Path $client 'habbicons') -Recurse -Force
+    Set-Habbicons 'default'
+    Invoke-TestUpdate -Yes
+    Assert ((Get-Habbicons) -eq 'default') 'The habbicon set changed although the client lacks the new set'
+    $setPath = Join-Path $client 'habbicons/habbo-225e1f8a'
+    New-Item -ItemType Directory -Force (Split-Path $setPath) | Out-Null
+    New-Item -ItemType File $setPath | Out-Null
+    Invoke-TestUpdate -Yes
+    Assert ((Get-Habbicons) -ceq 'default') 'A file was accepted as an icon directory'
+    Remove-Item $setPath
+    New-Item -ItemType Directory -Force (Join-Path (Join-Path $client 'habbicons') 'habbo-225e1f8a') | Out-Null
+    $before = Get-Content $rendererFile -Raw
+    Invoke-TestUpdate -Check
+    Assert ((Get-Content $rendererFile -Raw) -ceq $before) 'Check changed the habbicon set'
+    $Calls.Clear()
+    Invoke-TestUpdate -Yes
+    Assert ((Get-Habbicons) -eq 'habbo-225e1f8a') 'An up-to-date run kept the stock habbicon set'
+    $renderer = Get-Json $rendererFile
+    Assert ($renderer.'socket.url' -eq 'wss://custom.example.com/game' -and $renderer.'my.setting' -eq 1) 'Custom renderer settings were lost'
+    Assert ($Terminal.Contains('habbo-225e1f8a') -and $Terminal -match 'Everything is up to date') "The habbicon change or the up-to-date line is missing: $Terminal"
+    Assert (-not ($Calls -contains 'stop')) 'The habbicon change stopped the emulator'
+    Invoke-TestUpdate -Yes
+    Assert (-not $Terminal.Contains('habbo-225e1f8a')) "A current habbicon set was reported again: $Terminal"
+    # A set the owner chose stays.
+    Set-Habbicons 'my-icons'
+    Invoke-TestUpdate -Yes
+    Invoke-TestUpdate -Assets
+    Assert ((Get-Habbicons) -eq 'my-icons') 'The habbicon set the owner chose was replaced'
+    foreach ($value in @('DEFAULT', @('default'))) {
+        Set-Habbicons $value
+        $before = [IO.File]::ReadAllText($rendererFile)
+        Invoke-TestUpdate -Yes
+        Assert ([IO.File]::ReadAllText($rendererFile) -ceq $before) 'The updater replaced a custom habbicon value'
+    }
+    # -Assets moves the stock set too.
+    Set-Habbicons 'default'
+    Invoke-TestUpdate -Assets
+    Assert ((Get-Habbicons) -eq 'habbo-225e1f8a' -and $Terminal.Contains('habbo-225e1f8a')) "-Assets kept the stock habbicon set: $Terminal"
+    # A file that is not plain JSON is kept as it is, with a note.
+    $json = Get-Content $rendererFile -Raw
+    Set-Content $rendererFile '{"habbicons.asset.hash": "default",'
+    $before = Get-Content $rendererFile -Raw
+    Invoke-TestUpdate -Yes
+    Assert ((Get-Content $rendererFile -Raw) -ceq $before -and $Terminal.Contains('not plain JSON')) "A file that is not plain JSON was changed or not reported: $Terminal"
+    # A client update gives the same result, also when the installed client lacks the new set.
+    Write-Utf8 $rendererFile $json
+    Set-Habbicons 'default'
+    Remove-Item (Join-Path $client 'habbicons') -Recurse -Force
+    New-ClientRelease 'v1.1.0' 'habbo-225e1f8a'
+    $script:LatestClient = 'v1.1.0'
+    Invoke-TestUpdate -Yes
+    Assert ((Get-Text (Join-Path $client 'index.html')) -eq 'client v1.1.0') 'The client with the new habbicon set was not installed'
+    Assert ((Get-Habbicons) -eq 'habbo-225e1f8a' -and (Get-Json $rendererFile).'my.setting' -eq 1) 'A client update kept the stock habbicon set or lost a setting'
+
+    # A hotel with the AIR client keeps it on: an update brings the newest AIR texts and client, and keeps the handshake key.
+    $AirManifestUrl = 'https://assets.test/air/latest.json'
+    $AirPort = 30000
+    $script:ServerIp = '192.0.2.10'
+    $airFiles = Join-Path $testDir 'air'
+    New-Item -ItemType Directory -Force $airFiles | Out-Null
+    Set-Content (Join-Path $airFiles 'external_variables.txt') 'flash.client.url=40-1'
+    Set-Content (Join-Path $airFiles 'external_flash_texts.txt') 'texts=40-1'
+    function Get-Sha($Name) { return (Get-FileHash (Join-Path $airFiles $Name) -Algorithm SHA256).Hash.ToLower() }
+    Write-Utf8 (Join-Path $airFiles 'latest.json') (@{
+        version = '40-1'; client = @{ url = 'https://assets.test/air/client/40-1/HabboWin.zip' }
+        externalVariables = @{ url = 'https://assets.test/air/external_variables.txt'; sha256 = Get-Sha 'external_variables.txt' }
+        externalFlashTexts = @{ url = 'https://assets.test/air/external_flash_texts.txt'; sha256 = Get-Sha 'external_flash_texts.txt' }
+    } | ConvertTo-Json -Depth 5)
+    $releaseCurl = (Get-Item function:Invoke-Curl).ScriptBlock
+    function Invoke-Curl([string[]]$Arguments) {
+        $url = $Arguments | Where-Object { $_ -like 'https://assets.test/air/*' } | Select-Object -First 1
+        if (-not $url) { return & $releaseCurl $Arguments }
+        $file = Join-Path $airFiles ($url -replace '^.*/', '')
+        if (-not (Test-Path $file)) { return @{ Code = 22; Output = '' } }
+        Copy-Item $file $Arguments[[Array]::IndexOf($Arguments, '-o') + 1] -Force
+        return @{ Code = 0; Output = '' }
+    }
+    function Set-AirServer { $Calls.Add('air server') }
+    function Test-AirClient { $Calls.Add('air check'); return $null }
+    $saved = Get-Json $StateFile
+    $saved | Add-Member -NotePropertyName Air -NotePropertyValue $true -Force
+    $saved | Add-Member -NotePropertyName AirGameHost -NotePropertyValue 'game.example.com' -Force
+    # A hotel in another language gets its newest language pack after the update.
+    $saved | Add-Member -NotePropertyName Language -NotePropertyValue 'de' -Force
+    $saved | ConvertTo-Json | Set-Content $StateFile
+    function Set-HotelLanguage([switch]$Restart) { $Calls.Add("language $(Get-HotelLanguage) $Restart") }
+    $installedConfig = Join-Path $emulator 'Config'
+    New-Item -ItemType Directory -Force (Join-Path $installedConfig 'air') | Out-Null
+    Set-Content (Join-Path (Join-Path $installedConfig 'air') 'external_variables.txt') 'old'
+    Set-Content (Join-Path (Join-Path $installedConfig 'air') 'external_flash_texts.txt') 'old'
+    Set-Content (Join-Path $installedConfig 'rsa-private.pem') 'the hotel key'
+    New-EmulatorRelease 'v3.0.0'
+    $build = Join-Path (Join-Path $testDir 'build') 'v3.0.0'
+    Write-Bom (Join-Path (Join-Path $build 'Config') 'config.json') '{"Database": {"Password": ""}, "Flash": {"Hostname": "127.0.0.1", "Port": 1232}, "Encryption": {"RsaPrivateKeyFile": ""}, "AirClient": {"GameHost": "", "GamePorts": "30000"}}'
+    Compress-Archive -Path (Join-Path $build '*') -DestinationPath (Join-Path (Join-Path $Releases 'v3.0.0') 'plusemu-win-x64.zip') -Force
+    Write-Sums (Join-Path $Releases 'v3.0.0') 'plusemu-win-x64.zip'
+    $script:LatestEmulator = 'v3.0.0'
+    $Calls.Clear()
+    Invoke-TestUpdate -Yes
+    $updated = Get-Json (Join-Path $installedConfig 'config.json')
+    Assert ((Get-Text (Join-Path $emulator 'Plus Emulator.exe')) -eq 'emulator v3.0.0') 'The AIR hotel was not updated'
+    Assert ((Get-Text (Join-Path $installedConfig 'rsa-private.pem')) -eq 'the hotel key') 'The update replaced the handshake key'
+    Assert ((Get-Text (Join-Path (Join-Path $installedConfig 'air') 'external_flash_texts.txt')) -eq 'texts=40-1') 'The update kept old AIR texts'
+    Assert ($updated.Flash.Hostname -eq '0.0.0.0' -and $updated.Flash.Port -eq 30000) "Flash: $($updated.Flash | ConvertTo-Json -Compress)"
+    Assert ($updated.AirClient.GameHost -eq 'game.example.com' -and $updated.AirClient.ClientVersion -eq '40-1') "AirClient: $($updated.AirClient | ConvertTo-Json -Compress)"
+    Assert ($updated.Database.Password -eq 'database-secret') 'The update lost the database password'
+    Assert ($Calls -contains 'air server' -and $Calls -contains 'air check') "Calls: $($Calls -join '; ')"
+    Assert ((Get-Json $StateFile).Air -eq $true) 'The update turned the AIR client off'
+    Assert ($Calls -contains 'language de True') "Calls: $($Calls -join '; ')"
     Write-Host 'PowerShell update checks passed'
 } catch {
     Write-Host "Failed: $_" -ForegroundColor Red

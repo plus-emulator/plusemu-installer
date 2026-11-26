@@ -310,7 +310,7 @@ if grep -qi 'certificate\|cloudflare' "$HEALTH_LOG"; then echo 'the local health
 # ---------------------------------------------------------------- the whole run
 
 for step in preflight load_installer_files derive_settings install_packages install_toolchains download_releases setup_database \
-    download_hotel_files start_emulator write_client_config install_cms configure_web secure_server write_guide install_update_command \
+    download_hotel_files start_emulator write_client_config install_camera install_cms configure_web secure_server write_guide install_update_command \
     connect_cloudflare check_local_ports; do
     eval "$step() { echo '$step' >> \"\$FAKE_DIR/steps\"; }"
 done
@@ -322,7 +322,7 @@ rm "$STATE_FILE"
 grep -qx 'check_local_ports' "$FAKE_DIR/steps"
 grep -qx 'configure_web' "$FAKE_DIR/steps"
 absent -qx 'connect_cloudflare' "$FAKE_DIR/steps"
-grep -qx 'finish 10' "$FAKE_DIR/steps"
+grep -qx 'finish 11' "$FAKE_DIR/steps"
 [ "$(state LOCAL)" = yes ]
 # The port check comes before anything is installed.
 [ "$(grep -nx check_local_ports "$FAKE_DIR/steps" | cut -d: -f1)" -lt "$(grep -nx install_packages "$FAKE_DIR/steps" | cut -d: -f1)" ]
@@ -337,6 +337,6 @@ rm "$STATE_FILE"
 )
 grep -qx 'connect_cloudflare' "$FAKE_DIR/steps"
 absent -qx 'check_local_ports' "$FAKE_DIR/steps"
-grep -qx 'finish 11' "$FAKE_DIR/steps"
+grep -qx 'finish 12' "$FAKE_DIR/steps"
 
 printf 'Bash local install checks passed\n' >&4

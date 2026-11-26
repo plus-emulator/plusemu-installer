@@ -17,7 +17,7 @@ To try PlusEMU or to work on it on your own PC, use a [local install](#local-ins
 | | Linux | Windows |
 |---|---|---|
 | System | Debian 12/13 or Ubuntu 22.04/24.04/26.04 | Windows Server 2019/2022/2025 (Windows 10/11 for a [local install](#local-install)) |
-| Processor | 64-bit (x86_64 or arm64) | 64-bit |
+| Processor | 64-bit: arm64, or x86_64 at the x86-64-v2 level (SSE4.2 and POPCNT) | 64-bit at the x86-64-v2 level (SSE4.2 and POPCNT) |
 | Free disk space | 10 GB | 15 GB on `C:` |
 | Access | root (`sudo`) | PowerShell as Administrator |
 
@@ -53,6 +53,8 @@ The installer asks these questions. Press Enter to accept a suggested answer:
 7. Only with the advanced guide on Linux: whether to install CrowdSec (default no). See [CrowdSec](#crowdsec-advanced-guide-linux).
 
 After you confirm, the installer runs on its own in about 10 minutes. A [local install](#local-install) asks only questions 3 to 5.
+
+To let players also use Habbo's AIR desktop client, add `--with-air` (Linux) or `-WithAir` (Windows). See [Habbo AIR client](#habbo-air-client).
 
 ## Local install
 
@@ -199,30 +201,32 @@ Every step is logged. If a step fails, the installer shows the last lines of the
 4. Creates the `plus` database and imports the PlusEMU schema.
 5. Downloads the hotel files.
 6. Starts the emulator as the `plusemu` systemd service.
-7. Installs the Atom CMS website and creates your admin account.
-8. Configures nginx and the firewall:
+7. Starts the camera as the `plusemu-camera` systemd service. It draws the players' photos and room thumbnails with Chromium and the installed client. It listens on `127.0.0.1:3921` only. nginx serves the photos from `/var/www/hotel/camera` at `/camera/`. On Ubuntu 23.10 and newer, an AppArmor profile in `/etc/apparmor.d/plusemu-camera` lets Chromium use its sandbox. Where the sandbox cannot run at all, for example in some containers, the camera runs without it. An emulator release without the camera skips this step; `plusemu-update` adds the camera later.
+8. Installs the Atom CMS website and creates your admin account.
+9. Configures nginx and the firewall:
    - nginx starts with a temporary self-signed HTTPS certificate. The Cloudflare step or the setup guide replaces it with a Cloudflare Origin CA certificate for **Full (strict)**.
    - It restores visitors' real IPs from Cloudflare and passes the game's WebSocket through to the emulator. The game connection carries the visitor's address in the `X-Real-IP` and `X-Forwarded-For` headers, because the emulator sees nginx as the peer.
    - It limits each visitor: 5 login, registration or password reset attempts per minute (plus a burst of 5), 30 housekeeping pages per minute (plus a burst of 20), 50 open requests and 20 game connections (many players can share one address, for example at a school). Over the limit, nginx answers 429. The game client and the hotel files have no limits.
    - It drops slow connections after 10 seconds and sends the `Strict-Transport-Security` and `Permissions-Policy` headers. `Strict-Transport-Security` covers the hotel domain only, not its subdomains.
-   - The `ufw` firewall allows only SSH, HTTP and HTTPS. The database and the emulator stay private.
+   - The `ufw` firewall allows only SSH, HTTP and HTTPS. The database and the emulator stay private, unless you open the database with [`--remote-database`](#connect-from-your-pc-with-heidisql-linux-server).
    - HTTPS is accepted only from Cloudflare's addresses, so nobody can go around Cloudflare to reach the hotel. HTTP stays open for the setup guide and the redirects, but nginx answers the hotel's own names only for Cloudflare and this server. `plusemu-cloudflare-ips` downloads Cloudflare's address lists every Sunday at 03:00 and updates the firewall and nginx. When a download fails, it changes nothing. If the download fails during a new install, HTTPS stays open to every address until the next successful run, and the installer says so.
-9. Secures the server:
-   - `fail2ban` bans an address for 1 hour after 5 failed SSH logins in 10 minutes. When CrowdSec runs, CrowdSec bans SSH attackers instead and fail2ban is off (see [CrowdSec](#crowdsec-advanced-guide-linux)).
-   - Security updates from Debian or Ubuntu install every day at 05:00 server time with `unattended-upgrades`. The server restarts right after, but only when an update needs it. Unused packages are removed. The emulator, the client, the website and PHP are not touched: update them with `plusemu-update` and the PHP script below.
-   - Network settings in `/etc/sysctl.d/90-plusemu.conf` turn on SYN cookies and raise the queues for new connections, so a flood of connections does not stop the server.
-   - Installer, update, backup and Cloudflare address logs and the website log rotate daily and are kept for 14 days. The emulator logs to the system journal, which keeps 14 days and at most 1 GB.
-   - A nightly backup runs at 04:00 (see [Nightly backups](#nightly-backups)).
-   - A health check runs every 5 minutes (see [Health check and Discord alerts](#health-check-and-discord-alerts)).
-   - SSH lets root log in with a key only. SSH password login goes off only when your login uses an SSH key (this session, or the account that ran `sudo` has a key in `~/.ssh/authorized_keys`). Otherwise password login stays on, and the installer says so. The settings are in `/etc/ssh/sshd_config.d/10-plusemu.conf`.
-10. Writes your setup guide.
-11. Connects your hotel to Cloudflare when you paste an API token (see [Connect Cloudflare automatically](#connect-cloudflare-automatically)).
+10. Secures the server:
+    - `fail2ban` bans an address for 1 hour after 5 failed SSH logins in 10 minutes. When CrowdSec runs, CrowdSec bans SSH attackers instead and fail2ban is off (see [CrowdSec](#crowdsec-advanced-guide-linux)).
+    - Security updates from Debian or Ubuntu install every day at 05:00 server time with `unattended-upgrades`. The server restarts right after, but only when an update needs it. Unused packages are removed. The emulator, the client, the website and PHP are not touched: update them with `plusemu-update` and the PHP script below.
+    - Network settings in `/etc/sysctl.d/90-plusemu.conf` turn on SYN cookies and raise the queues for new connections, so a flood of connections does not stop the server.
+    - Installer, update, backup and Cloudflare address logs and the website log rotate daily and are kept for 14 days. The emulator logs to the system journal, which keeps 14 days and at most 1 GB.
+    - A nightly backup runs at 04:00 (see [Nightly backups](#nightly-backups)).
+    - A health check runs every 5 minutes (see [Health check and Discord alerts](#health-check-and-discord-alerts)).
+    - SSH lets root log in with a key only. SSH password login goes off only when your login uses an SSH key (this session, or the account that ran `sudo` has a key in `~/.ssh/authorized_keys`). Otherwise password login stays on, and the installer says so. To add your key and turn password login off, use [`--setup-ssh`](#ssh-key-login-only-linux-server). The settings are in `/etc/ssh/sshd_config.d/10-plusemu.conf`.
+11. Writes your setup guide.
+12. Connects your hotel to Cloudflare when you paste an API token (see [Connect Cloudflare automatically](#connect-cloudflare-automatically)).
 
 **Windows** (`install.ps1`) follows the same steps with Windows equivalents:
 
 - IIS with URL Rewrite, the reverse proxy and WebSockets. The game connection carries the visitor's address in the `X-Real-IP` header (from Cloudflare's `CF-Connecting-IP`), and the reverse proxy adds `X-Forwarded-For` without the port. On Windows 10 and 11, IIS comes from the optional Windows features.
 - MariaDB 11.4
 - The emulator as the `PlusEMU` Windows service
+- The camera as the `PlusEMUCamera` Windows service, in `C:\Hotel\camera-service`. IIS serves the photos from `C:\Hotel\camera` at `/camera/`.
 - Windows Firewall rules for the website: HTTP and HTTPS are accepted only from Cloudflare's addresses, so nobody can go around Cloudflare to reach the hotel. Windows needs no open HTTP port, because the setup guide is a file on the desktop. The *PlusEMU Cloudflare addresses* task updates the addresses every Sunday at 03:00. When a download fails, it changes nothing. If the download fails during a new install, the website stays open to every address until the next successful run, and the installer says so. The installer turns off the *World Wide Web Services* rules that IIS adds, because they let every address in. A rule that you add yourself for ports 80 or 443 also lets every address in.
 - An account lockout policy: an account locks for 10 minutes after 10 wrong passwords in 10 minutes, the default of new Windows versions. A lower limit would let an attacker keep the built-in Administrator locked out. RDP and SSH are not opened or changed.
 - The *PlusEMU log cleanup* task removes emulator, website and IIS logs older than 14 days, every day at 03:30. Windows has SYN flood protection built in and has no settings for it, so the installer changes nothing there.
@@ -255,6 +259,9 @@ The pages the installer generates, such as the setup guide and the client config
 | Refresh Cloudflare's addresses now | `sudo plusemu-cloudflare-ips` | `Start-ScheduledTask 'PlusEMU Cloudflare addresses'` |
 | Restart the emulator | `sudo systemctl restart plusemu` | `Restart-Service PlusEMU` |
 | Watch the emulator log | `sudo journalctl -u plusemu -f` | `Get-Content C:\Hotel\emulator\service\shawl_for_PlusEMU_rCURRENT.log -Tail 50 -Wait` |
+| Restart the camera | `sudo systemctl restart plusemu-camera` | `Restart-Service PlusEMUCamera` |
+| Watch the camera log | `sudo journalctl -u plusemu-camera -f` | `Get-Content C:\Hotel\camera-service\shawl_for_PlusEMUCamera_rCURRENT.log -Tail 50 -Wait` |
+| Camera photos | `/var/www/hotel/camera` | `C:\Hotel\camera` |
 | Setup guide | `/var/www/hotel/setup-guide/index.html`, at `http://<server IP>/<token>/` (local install: `http://localhost/<token>/`) | `C:\Hotel\setup-guide\index.html` and *Hotel setup guide* on the desktop |
 | Node.js of a local install | `/opt/plusemu-node` | `C:\ProgramData\PlusEMU\node` |
 
@@ -272,18 +279,65 @@ Use host `127.0.0.1`, port `3306`, database `plus`, username `hotel` and the dat
 mariadb --host=127.0.0.1 --port=3306 --user=hotel --password plus
 ```
 
-Enter the database password at the prompt. On Windows, use `mariadb.exe` from your MariaDB installation's `bin` folder. For a desktop database client, connect through an SSH tunnel to the server with destination `127.0.0.1:3306`; use your server's SSH address, not the Cloudflare-proxied hotel domain. Keep port 3306 private.
+Enter the database password at the prompt. On Windows, use `mariadb.exe` from your MariaDB installation's `bin` folder. For a desktop database client, connect through an SSH tunnel to the server with destination `127.0.0.1:3306`; use your server's SSH address, not the Cloudflare-proxied hotel domain. Without `--remote-database`, port 3306 stays private.
+
+### Connect from your PC with HeidiSQL (Linux server)
+
+You can let your own PC reach the database directly. Find your PC's public IPv4 address, for example on <https://api.ipify.org>. Then run the installer on the server with that address:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash -s -- --remote-database 203.0.113.7
+```
+
+Replace `203.0.113.7` with your address. On a hotel that is already installed, this changes only who can reach the database. The website, emulator and client stay as they are, so your own changes to them are kept. To allow more than one address, separate them with commas. A network such as `203.0.113.0/24` is allowed too, up to a `/8`. Only these addresses get through the firewall and have a database account. IPv6 addresses are not supported.
+
+In HeidiSQL, create a new session and fill in:
+
+| Field | Value |
+| --- | --- |
+| Network type | `MariaDB or MySQL (TCP/IP)` |
+| Hostname / IP | Your server's IP address. Not the hotel's domain: Cloudflare does not pass database connections. |
+| User | `hotel` |
+| Password | `DB_PASSWORD` from `sudo cat /etc/plusemu/hotel.env` |
+| Port | `3306` |
+| Databases | `plus` |
+
+The installer also prints these values when it finishes. Later runs keep the saved addresses. When your PC's address changes, run the installer again with `--remote-database <new address>`; the old address loses access. To close the database again, run it with `--remote-database off`.
+
+Opening or closing the database restarts MariaDB and the emulator, so players are disconnected for a moment. The connection is not encrypted unless your MariaDB has TLS (MariaDB 11.4 and newer turn it on by itself). The SSH tunnel above is the safer choice on a network you do not trust. A local install has no `--remote-database`: connect to `127.0.0.1` on that PC.
 
 Linux database root uses local socket authentication (`sudo mariadb`); no root password is generated. Windows database root uses the saved `DbRootPassword`.
 
 Change your initial admin password after logging in. The saved file still contains the initial value. Keep the file and terminal password summary private, and remove credentials before sharing logs or screenshots.
+
+### SSH key login only (Linux server)
+
+`--setup-ssh` adds your SSH key to the server and turns SSH password login off. After that, only your key can log in. Run it on a new server or on a hotel that is already installed:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash -s -- --setup-ssh
+```
+
+The installer asks for your public key first. It goes to the account that ran `sudo`, or to `root` when you are logged in as root. Make the key on your own PC, not on the server:
+
+1. Make a key, if you have none yet. Press Enter to accept the file name. A passphrase is optional; it protects the key if someone copies it.
+   - Windows (PowerShell): `ssh-keygen -t ed25519`
+   - Linux or macOS: `ssh-keygen -t ed25519`
+2. Show the public key and copy the whole line. It starts with `ssh-ed25519`.
+   - Windows (PowerShell): `Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub`
+   - Linux or macOS: `cat ~/.ssh/id_ed25519.pub`
+3. Paste the line into the installer. Never paste the file without `.pub`: that is your private key, and it must stay on your PC.
+
+Then the installer turns password login off and asks you to log in with your key in a new window, for example `ssh johndoe@203.0.113.10`. Keep the installer's window open while you try. When you answer yes, password login stays off. When you answer no, password login comes back on and the key is removed again, so you are never locked out. Later runs keep password login off.
+
+An unattended run takes the key from `PLUSEMU_SSH_KEY`. With `PLUSEMU_YES=1` it cannot ask you to test the key, so check the key before you use it. A local install has no `--setup-ssh`: it leaves the SSH settings of your PC alone.
 
 ## Nightly backups
 
 Every night at 04:00 server time, the installer's backup saves what a download cannot bring back. It keeps the newest 7 backups, each in its own folder named by its time (UTC):
 
 - `database.sql.gz`: the whole `plus` database.
-- `hotel.tar.gz`: the emulator's `Config` folder, the client's `configuration` folder, the website's `.env` file and uploads (`cms/storage/app`), and the hotel's texts (`hotel-files/gamedata`).
+- `hotel.tar.gz`: the emulator's `Config` folder, the client's `configuration` folder, the website's `.env` file and uploads (`cms/storage/app`), the hotel's texts (`hotel-files/gamedata`) and the camera photos (`camera`).
 - `settings.tar.gz`: the saved answers, passwords and versions. On Linux also the HTTPS certificate in `/etc/ssl/plusemu`. On Windows the certificate stays in the Windows certificate store; export it yourself if you need a copy.
 
 The backup leaves out what the installer or `plusemu-update` downloads again: the emulator and client programs and the stock hotel files. Furniture, clothes or badges that you added to `hotel-files` yourself are not in the backup, so keep your own copy of them. When an update is running, the backup waits for it. When the disk has less than 2 GB free plus the size of the database, it makes no backup and writes the reason in the backup log. The update backups (newest 3) stay separate.
@@ -354,6 +408,132 @@ To stop managing CrowdSec, run the installer again with `PLUSEMU_CROWDSEC=0`. fa
 
 **Windows:** the Windows installer does not install CrowdSec. CrowdSec reads the visitor's address from the web server log, and IIS logs the address that connects to it, which is always Cloudflare's. CrowdSec on Windows would ban Cloudflare instead of attackers, or with Cloudflare on its whitelist, it could never ban a website visitor.
 
+## Habbo AIR client
+
+With this option, players can play the hotel with Habbo's AIR desktop client through [HabboCustomLauncher](https://github.com/DennisObject/HabboCustomLauncher/releases). Volt keeps working as before. Without the option, the installer changes nothing about the AIR client.
+
+**New hotel or rerun:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash -s -- --with-air
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.ps1))) -WithAir
+```
+
+**Installed hotel:**
+
+```bash
+sudo plusemu-update --with-air
+```
+
+```powershell
+plusemu-update -WithAir
+```
+
+`PLUSEMU_AIR=1` does the same as the option. The choice is saved (`AIR='yes'` in `/etc/plusemu/hotel.env`, `"Air": true` in `C:\ProgramData\PlusEMU\hotel.json`), so every later rerun and `plusemu-update` keeps the AIR client on and installs the newest AIR client version with each new emulator.
+
+**What it sets up**
+- Downloads the AIR client list from `https://assets.plusemu.dev/air/latest.json`, then Habbo's AIR texts. It checks their SHA-256 and saves them in the emulator's `Config/air/` folder. When a download fails, a new setup stops; a hotel that already has the texts keeps them.
+- Creates the emulator's handshake key `Config/rsa-private.pem` once, with `"Plus Emulator" --generate-rsa-key`. It never replaces an existing key: players' clients carry its public part.
+- Sets `Flash` to `0.0.0.0:30000`, `Encryption.RsaPrivateKeyFile`, and the `AirClient` settings in `Config/config.json`: the website address, the texts, the hotel's `ExternalTexts.json` and `ProductData.json`, badge and catalogue images from `/hotel-files/c_images/`, the game address and port, and the client download. Your other settings stay.
+- Game address: with a Cloudflare token, the installer adds a DNS-only (not proxied) record `game.<domain>`, because Cloudflare's proxy does not carry the client's game connection. Without a token, the client connects to the server's IPv4 address. Add the name later with `sudo PLUSEMU_CLOUDFLARE_TOKEN=<token> plusemu-update --with-air` (Windows: `$env:PLUSEMU_CLOUDFLARE_TOKEN = '<token>'; plusemu-update -WithAir`).
+- Opens TCP port 30000 to every address (ufw on Linux, the `plusemu-air-30000` rule on Windows). The website itself still accepts HTTPS from Cloudflare only.
+- Passes `/api/client/air.json`, `/api/client/air-ticket`, `/api/client/air-launcher-token`, `/gamedata/hashes` and the four `/gamedata/<file>/<hash>` paths to the emulator (nginx `location` blocks, or the IIS rule `PlusEMU AIR client`).
+- Sets `AIR_CLIENT_ENABLED=true` for Atom CMS and refreshes its caches, so the website shows the **Open AIR client** button.
+- Checks that `air.json`, `/gamedata/hashes` and port 30000 answer, and adds these checks to the [health check](#health-check-and-discord-alerts).
+
+A [local install](#local-install) uses `127.0.0.1` for the game port and changes no firewall or DNS.
+
+**What players do**
+1. Install HabboCustomLauncher from https://github.com/DennisObject/HabboCustomLauncher/releases.
+2. Open the hotel's website, sign in and press **Open AIR client**. Or type the hotel's domain as the hotel domain in the launcher.
+
+### A new Habbo AIR client (maintainers)
+
+When Habbo releases a new AIR client, build the patched client and publish it with [`tools/patch-air-client.py`](tools/patch-air-client.py). Hotels get it with their next `plusemu-update`.
+
+```bash
+python3 tools/patch-air-client.py build --out dist
+CLOUDFLARE_API_TOKEN=... python3 tools/patch-air-client.py publish dist
+```
+
+Habbo blocks many data center addresses. When `build` fails with HTTP 403 or 463, download `HabboWin.zip` and the two text files yourself, and pass them in:
+
+```bash
+python3 tools/patch-air-client.py build --zip HabboWin.zip --habbo-version 38 --texts <folder with external_variables.txt and external_flash_texts.txt> --out dist
+```
+
+`python3 tools/patch-air-client.py check` tells whether the published client is Habbo's newest.
+
+## Hotel language
+
+The hotel is English by default. With `--language <code>`, the client texts, the furniture and product names and the website's default language come from that Habbo hotel instead.
+
+| Code | Language | Texts from |
+|---|---|---|
+| `en` | English (default) | the stock hotel files |
+| `de` | German | habbo.de |
+| `nl` | Dutch | habbo.nl |
+| `fr` | French | habbo.fr |
+| `es` | Spanish | habbo.es |
+| `it` | Italian | habbo.it |
+| `fi` | Finnish | habbo.fi |
+| `tr` | Turkish | habbo.com.tr |
+| `br` | Brazilian Portuguese | habbo.com.br |
+
+**New hotel or rerun:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash -s -- --language de
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.ps1))) -Language de
+```
+
+**Installed hotel:**
+
+```bash
+sudo plusemu-update --language de
+```
+
+```powershell
+plusemu-update -Language de
+```
+
+`PLUSEMU_LANGUAGE=de` does the same as the option on an install. The choice is saved (`HOTEL_LANGUAGE='de'` in `/etc/plusemu/hotel.env`, `"Language": "de"` in `C:\ProgramData\PlusEMU\hotel.json`), so reruns and `plusemu-update` keep it and download the newest pack. Go back to English with `--language en`.
+
+**What it sets up**
+- Downloads the language pack list from `https://assets.plusemu.dev/language/<code>.json`, then the pack. It checks the pack's SHA-256 and unpacks it into `hotel-files/language/`. When a download fails, a hotel that already has the pack keeps it; otherwise the client stays English until the next try.
+- Volt loads the pack's `ExternalTexts.json` right after the stock one, and its `UITexts.jsonc` right after the stock one, in `configuration/renderer-config.json`. The hotel's own text files (for example `hotel-texts.json`) still load later, so they still win. Volt has its own interface texts for `de`, `nl`, `fr`, `es` and `it`; the other languages keep Volt's English interface texts.
+- Builds `hotel-files/language/ProductData.json`: every stock product, with the name and description from the pack. Volt and the AIR client load this file.
+- The AIR client (with `--with-air`) gets the pack's texts after its other texts in `Config/config.json`.
+- Writes the furniture names and descriptions from the pack into the `furniture` table (`name` and `description`, matched by `item_name`). This only happens when the language changes, and it replaces names you edited. Going back to English writes the names from the stock `FurnitureData.json`.
+- Sets `APP_LOCALE` for Atom CMS. A visitor still gets their browser's language when the website has it.
+- Restarts the emulator when its settings or the furniture names changed (players are disconnected).
+
+**What stays as it is**
+- Catalogue page titles and texts: they live in the database, and Habbo does not publish them.
+- Emulator messages, such as command replies and alerts.
+- Badge names on the website.
+
+### Language packs (maintainers)
+
+Build and publish the packs with [`tools/language-pack.py`](tools/language-pack.py). It downloads each hotel's `external_flash_texts`, `furnidata_json` and `productdata_json`, and Volt's `UITexts_<code>.jsonc.example` when Volt has one. Hotels get a new pack with their next `plusemu-update`.
+
+```bash
+python3 tools/language-pack.py build --all --out dist
+CLOUDFLARE_API_TOKEN=... python3 tools/language-pack.py publish dist
+```
+
+Habbo blocks many data center addresses. When `build` fails with HTTP 403 or 463, run it from a home connection, or save the three files from a browser and pass them in:
+
+```bash
+python3 tools/language-pack.py build --language de --source <folder with external_flash_texts.txt, furnidata.json and productdata.json> --out dist
+```
+
 ## One-command updates
 
 Hotels set up with this installer update the emulator, the client and the hotel files in place, on Linux and on Windows.
@@ -384,15 +564,37 @@ plusemu-update
 - Installs the new versions and runs the database migrations.
 - Installs the newest hotel files pack (furniture, clothing, effects, badges, texts, icons, sounds, about 550 MB) whenever it changed, so the hotel never misses stock content. Files you added to `hotel-files` stay. The emulator's clothing data (`Config/figuredata.xml`) is replaced by the release's one that matches the pack.
 - Keeps your `Config/` and `configuration/` files and anything you added. New settings are added, your own values stay.
+- Sets up the camera when the new emulator release has it (see [Camera on an installed hotel](#camera-on-an-installed-hotel)).
+- With the [AIR client](#habbo-air-client) on: installs the newest AIR texts and client version, and keeps the handshake key.
+- With a [hotel language](#hotel-language) other than English: installs the newest language pack and keeps the hotel in that language.
 - Restores the backup automatically if any step fails.
 
 **Options** (Linux `--check`, Windows `-Check`, and so on)
 - `check`: show available updates, change nothing.
 - `yes`: update without the "Update now?" question.
+- `install-camera`: set up the camera only, without updating anything (see [Camera on an installed hotel](#camera-on-an-installed-hotel)).
+- `with-air`: turn on the AIR client, without updating anything. Later updates keep it on (see [Habbo AIR client](#habbo-air-client)).
+- `language <code>`: switch the hotel's language, without updating anything. Later updates keep it (see [Hotel language](#hotel-language)).
 - `rollback`: restore the last backup. The database goes back too, so progress since then is lost.
 - `assets`: hotel files only, without stopping the emulator. Adds every stock file the hotel lacks and leaves the files it already has as they are. Only the `gamedata` index (clothing, effects, products, texts) is replaced; the previous one is kept in the backups folder as `gamedata-<version>`. Run the full update afterwards when new clothing does not show: the emulator's clothing data comes with it.
 
 `--with-assets` is still accepted and does nothing: the hotel files are part of every update now.
+
+### Camera on an installed hotel
+
+Hotels installed before the camera came to the installer get it with one command. It needs a PlusEMU release that has the camera service; when yours has none yet, run `plusemu-update` instead, which sets up the camera too.
+
+```bash
+sudo plusemu-update --install-camera
+```
+
+```powershell
+plusemu-update -InstallCamera
+```
+
+Without `plusemu-update`, run the installer with the same option: `curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/main/install.sh | sudo bash -s -- --install-camera`.
+
+It gives the emulator its camera settings, starts the camera service and adds the `/camera/` route to your nginx site or IIS website. Your own changes to the nginx site stay. When the emulator settings change, the emulator restarts once, which disconnects the players for a moment. Running it again changes nothing.
 
 ### Examples
 ```bash
@@ -482,6 +684,9 @@ To install without questions, set the answers in environment variables:
 
 | Variable | Meaning |
 |---|---|
+| `PLUSEMU_SETUP_SSH=1` | Adds your SSH key and turns SSH password login off (the same as `--setup-ssh`). See [SSH key login only](#ssh-key-login-only-linux-server). |
+| `PLUSEMU_SSH_KEY=<public key>` | The public key for `PLUSEMU_SETUP_SSH=1`, so the installer does not ask for it. |
+| `PLUSEMU_REMOTE_DATABASE=<addresses>` | Lets these IPv4 addresses reach the database on port 3306 during a full install or rerun. `off` closes it again. To change only the database access of an installed hotel, use `--remote-database`. See [Connect from your PC with HeidiSQL](#connect-from-your-pc-with-heidisql-linux-server). |
 | `PLUSEMU_LOCAL=1` | [Local install](#local-install) on this PC at `http://localhost` (the same as `--local` or `-Local`). `PLUSEMU_LOCAL=0` asks for a server install. A saved install keeps its choice. |
 | `PLUSEMU_DOMAIN` | Hotel domain (required, except for a local install) |
 | `PLUSEMU_WS_URL` | WebSocket address (default `wss://<domain>/ws`) |
@@ -489,6 +694,8 @@ To install without questions, set the answers in environment variables:
 | `PLUSEMU_ADMIN_USER` | Admin username (default `admin`) |
 | `PLUSEMU_ADMIN_EMAIL` | Admin email (default `admin@<domain>`, or `admin@localhost.test` for a local install) |
 | `PLUSEMU_YES=1` | Skip the confirmation question |
+| `PLUSEMU_AIR=1` | Set up the [Habbo AIR client](#habbo-air-client) (the same as `--with-air` or `-WithAir`). Once on, it stays on. |
+| `PLUSEMU_LANGUAGE=<code>` | The [hotel language](#hotel-language) (the same as `--language` or `-Language`): `en`, `de`, `nl`, `fr`, `es`, `it`, `fi`, `tr` or `br`. |
 | `PLUSEMU_CLOUDFLARE_TOKEN` | Cloudflare API token for [Connect Cloudflare automatically](#connect-cloudflare-automatically). It is used once and never saved. Without it, `PLUSEMU_YES=1` skips that step. |
 
 ```bash
@@ -499,7 +706,7 @@ curl -fsSL https://raw.githubusercontent.com/plus-emulator/plusemu-installer/mai
 Advanced overrides:
 
 - `INSTALLER_REF` installs from another branch or tag of this repository.
-- `EMULATOR_URL`, `CLIENT_URL`, `ASSET_PACK_URL`, `ATOM_REPO` and `ATOM_REF` change where the components come from. A custom emulator or client URL is saved as version `custom`.
+- `EMULATOR_URL`, `CLIENT_URL`, `ASSET_PACK_URL`, `LANGUAGE_MANIFEST_URL`, `ATOM_REPO` and `ATOM_REF` change where the components come from. A custom emulator or client URL is saved as version `custom`.
 
 ## Troubleshooting
 
